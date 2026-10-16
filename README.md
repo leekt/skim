@@ -143,7 +143,7 @@ const { result } = await client.simulateContract({
 // answered locally in a few ms
 ```
 
-**Dashboard:** open **http://127.0.0.1:8545/dashboard** to see:
+**Dashboard:** your running node serves one at `/dashboard` on its RPC address (`--rpc`, default `127.0.0.1:8545`). It shows:
 - connected peers by client, with SNAP latency per peer
 - block arrival and RPC latency
 - which addresses your calls read, and which of them aren't pinned by a subscription (with a `skim.yaml` snippet to pin them)

@@ -1,6 +1,6 @@
 # skim dashboard
 
-`skim run` serves this page at **http://127.0.0.1:8545/dashboard** (the `--rpc` address). It polls `skim_dashboard` every 2 s.
+`skim run` serves this page at `/dashboard` on its RPC address (`--rpc`, default `127.0.0.1:8545`). It polls `skim_dashboard` every 2 s.
 
 <img src="../assets/dashboard-overview.png" alt="skim dashboard overview: head, block arrival, peers, pinned vs on-demand state" width="100%">
 

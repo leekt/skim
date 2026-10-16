@@ -74,7 +74,7 @@ curl -s localhost:8545 -H 'content-type: application/json' \
 [{"name":"my-pool","ready":true,"block":11919451,"required_keys":5,"missing_keys":0, …}]
 ```
 
-**Not sure what to subscribe?** Run your app against skim and open http://127.0.0.1:8545/dashboard → **Addresses**:
+**Not sure what to subscribe?** Run your app against skim and open `/dashboard` on skim's RPC address (default `127.0.0.1:8545`), tab **Addresses**:
 - It lists every contract your calls read, and whether a subscription pins it.
 - It shows how many keys had to be fetched from the network.
 - It suggests a `skim.yaml` block for the hot ones that aren't pinned.
