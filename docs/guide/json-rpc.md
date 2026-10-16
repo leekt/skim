@@ -25,7 +25,7 @@ skim serves standard Ethereum JSON-RPC over HTTP and WebSocket on the same addre
 | `eth_chainId`, `net_version`, `net_listening`, `eth_syncing`, `web3_clientVersion` | |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas` | Head base fee + 1 gwei tip, and the 1 gwei tip. |
 | `skim_subscriptionStatus` | Per subscription: `ready`, `block`, `required_keys`, `missing_keys`, `truncated`, `calls_ok`, `error`, `results` (for `on_block` calls). |
-| `skim_status` | Head, real store sizes (subscribed / on-demand keys, bytecode, refused admissions), peer counts, light-client status. |
+| `skim_status` | Head, real store sizes (subscribed / on-demand keys, bytecode, refused admissions), peer counts, light-client status, and `served`: what skim answered for other peers, per message type, plus the range it holds. |
 
 ## WebSocket subscriptions
 Every method works over WebSocket too. In addition, `eth_subscribe` / `eth_unsubscribe` support:

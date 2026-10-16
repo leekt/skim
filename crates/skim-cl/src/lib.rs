@@ -10,6 +10,7 @@ pub mod gossip;
 pub mod light;
 pub mod node;
 pub mod rpc;
+pub mod serve;
 pub mod ssz;
 pub mod verify;
 

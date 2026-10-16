@@ -24,7 +24,10 @@ use std::{
 use alloy_consensus::{
     Header, Transaction as _, TxReceipt, proofs::ordered_trie_root_with_encoder, transaction::SignerRecoverable,
 };
-use alloy_consensus::private::alloy_eips::eip2718::{Decodable2718, Encodable2718, Typed2718};
+use alloy_consensus::private::alloy_eips::{
+    eip2718::{Decodable2718, Encodable2718, Typed2718},
+    eip4895::{Withdrawal, Withdrawals},
+};
 use alloy_primitives::{Address, B256, Bytes, keccak256};
 use alloy_rpc_types_eth::{Filter, FilterBlockOption};
 use futures::StreamExt;
@@ -38,6 +41,8 @@ const HEADERS_MAX: usize = 8192;
 const TX_INDEX_BLOCKS: usize = 2048;
 /// Blocks whose receipts / raw transactions are cached.
 const BLOCK_CACHE: usize = 128;
+/// Blocks whose raw access lists are kept for serving (about 100 KB each on Sepolia).
+const SERVE_BALS: usize = 64;
 /// Re-broadcast interval and give-up time for sent transactions.
 const REBROADCAST: Duration = Duration::from_secs(12);
 const SENT_TTL: Duration = Duration::from_secs(30 * 60);
@@ -66,12 +71,28 @@ struct Sent {
 struct Inner {
     /// Canonical headers by number (hash cached).
     headers: BTreeMap<u64, (B256, Arc<Header>)>,
+    by_hash: HashMap<B256, u64>,
     /// Transaction hashes per block, from gossiped payloads or fetched bodies.
     txs: BTreeMap<u64, (B256, Arc<Vec<B256>>)>,
     tx_index: HashMap<B256, (u64, u32)>,
     /// Every address in a block's BAL, for blocks skim followed.
     touched: BTreeMap<u64, (B256, Arc<HashSet<Address>>)>,
     sent: HashMap<B256, Sent>,
+}
+
+impl Inner {
+    fn put_header(&mut self, hash: B256, h: Arc<Header>) {
+        if let Some((old, _)) = self.headers.insert(h.number, (hash, h.clone())) {
+            self.by_hash.remove(&old);
+        }
+        self.by_hash.insert(hash, h.number);
+    }
+
+    fn drop_header(&mut self, n: u64) {
+        if let Some((old, _)) = self.headers.remove(&n) {
+            self.by_hash.remove(&old);
+        }
+    }
 }
 
 /// A small insertion-ordered cache.
@@ -107,6 +128,10 @@ pub struct ChainData {
     bodies: Mutex<Cache<Arc<Vec<Bytes>>>>,
     /// Block access lists (verified) of recent blocks, for transaction replay.
     bals: Mutex<Cache<Arc<skim_bal::BlockAccessList>>>,
+    /// Withdrawals (checked against `withdrawals_root`) and raw BALs (as committed to by the
+    /// header) of recent blocks, kept to serve other peers.
+    withdrawals: Mutex<Cache<Arc<Vec<Withdrawal>>>>,
+    bal_raw: Mutex<Cache<Bytes>>,
     pub max_log_range: u64,
     rr: AtomicUsize,
 }
@@ -123,6 +148,8 @@ impl ChainData {
             receipts: Mutex::new(Cache::new(BLOCK_CACHE)),
             bodies: Mutex::new(Cache::new(BLOCK_CACHE)),
             bals: Mutex::new(Cache::new(32)),
+            withdrawals: Mutex::new(Cache::new(BLOCK_CACHE)),
+            bal_raw: Mutex::new(Cache::new(SERVE_BALS)),
             max_log_range,
             rr: AtomicUsize::new(0),
         });
@@ -147,7 +174,7 @@ impl ChainData {
         if g.headers.get(&h.number).is_some_and(|(x, _)| *x != hash) {
             let stale: Vec<u64> = g.headers.range(h.number..).map(|(n, _)| *n).collect();
             for n in stale {
-                g.headers.remove(&n);
+                g.drop_header(n);
                 if let Some((_, hs)) = g.txs.remove(&n) {
                     for t in hs.iter() {
                         g.tx_index.remove(t);
@@ -156,17 +183,31 @@ impl ChainData {
                 g.touched.remove(&n);
             }
         }
-        g.headers.insert(h.number, (hash, Arc::new(h.clone())));
+        g.put_header(hash, Arc::new(h.clone()));
         while g.headers.len() > HEADERS_MAX {
-            g.headers.pop_first();
+            let Some((&n, _)) = g.headers.first_key_value() else { break };
+            g.drop_header(n);
         }
     }
 
-    /// Transactions and BAL addresses of a verified gossiped payload.
-    pub fn note_payload(&self, number: u64, hash: B256, raw_txs: Vec<Bytes>, touched: HashSet<Address>, bal: Arc<skim_bal::BlockAccessList>) {
+    /// Transactions, withdrawals, BAL (decoded and raw) and BAL addresses of a verified gossiped
+    /// payload.
+    #[allow(clippy::too_many_arguments)]
+    pub fn note_payload(
+        &self,
+        number: u64,
+        hash: B256,
+        raw_txs: Vec<Bytes>,
+        withdrawals: Vec<Withdrawal>,
+        touched: HashSet<Address>,
+        bal: Arc<skim_bal::BlockAccessList>,
+        bal_raw: Bytes,
+    ) {
         let hashes = tx_hashes(&raw_txs);
         self.bodies.lock().put(hash, Arc::new(raw_txs));
+        self.withdrawals.lock().put(hash, Arc::new(withdrawals));
         self.bals.lock().put(hash, bal);
+        self.bal_raw.lock().put(hash, bal_raw);
         let mut g = self.inner.write();
         self.index_txs(&mut g, number, hash, hashes);
         g.touched.insert(number, (hash, Arc::new(touched)));
@@ -324,7 +365,7 @@ impl ChainData {
                     }
                     let mut g = self.inner.write();
                     for (hh, h) in ok {
-                        g.headers.insert(h.number, (hh, Arc::new(h)));
+                        g.put_header(hh, Arc::new(h));
                     }
                     done = true;
                     break;
@@ -366,6 +407,11 @@ impl ChainData {
                 }
                 let raw = Arc::new(raw);
                 self.bodies.lock().put(hash, raw.clone());
+                if let Some(w) = body.withdrawals
+                    && Some(alloy_consensus::proofs::calculate_withdrawals_root(&w)) == header.withdrawals_root
+                {
+                    self.withdrawals.lock().put(hash, Arc::new(w.into_inner()));
+                }
                 let mut g = self.inner.write();
                 self.index_txs(&mut g, header.number, hash, tx_hashes(&raw));
                 return Ok(raw);
@@ -423,6 +469,7 @@ impl ChainData {
                 if let Ok(bal) = skim_bal::decode_verified(&raw, header.block_access_list_hash.unwrap_or_default()) {
                     let bal = Arc::new(bal);
                     self.bals.lock().put(hash, bal.clone());
+                    self.bal_raw.lock().put(hash, raw);
                     return Ok(bal);
                 }
             }
@@ -726,7 +773,54 @@ impl ChainData {
         }
     }
 
+    // ---- serving other peers ---------------------------------------------------------------
+
+    /// A canonical header held in memory.
+    pub fn cached_header(&self, id: skim_el::serve::BlockHashOrNumber) -> Option<Header> {
+        let g = self.inner.read();
+        let n = match id {
+            skim_el::serve::BlockHashOrNumber::Number(n) => n,
+            skim_el::serve::BlockHashOrNumber::Hash(h) => *g.by_hash.get(&h)?,
+        };
+        g.headers.get(&n).map(|(_, h)| (**h).clone())
+    }
+
+    /// A block body held in memory (transactions and withdrawals both verified).
+    pub fn cached_body(&self, hash: B256) -> Option<skim_el::BlockBody> {
+        let w = self.withdrawals.lock().get(&hash)?;
+        let raw = self.bodies.lock().get(&hash)?;
+        let transactions = raw.iter().map(|t| SignedTx::decode_2718(&mut t.as_ref()).ok()).collect::<Option<Vec<_>>>()?;
+        Some(skim_el::BlockBody { transactions, ommers: vec![], withdrawals: Some(Withdrawals::new((*w).clone())) })
+    }
+
+    pub fn cached_receipts(&self, hash: B256) -> Option<Vec<Receipt>> {
+        if let Some(r) = self.receipts.lock().get(&hash) {
+            return Some((*r).clone());
+        }
+        let n = self.number_of(&hash)?;
+        let empty = self.inner.read().headers.get(&n).is_some_and(|(_, h)| h.receipts_root == alloy_consensus::EMPTY_ROOT_HASH);
+        empty.then(Vec::new)
+    }
+
+    pub fn cached_bal(&self, hash: B256) -> Option<Bytes> {
+        self.bal_raw.lock().get(&hash)
+    }
+
+    /// Oldest block from which header, body and BAL are all held, without gaps, up to the newest.
+    pub fn served_from(&self) -> Option<u64> {
+        let hashes: Vec<(u64, B256)> = self.inner.read().headers.iter().rev().take(SERVE_BALS + 1).map(|(n, (h, _))| (*n, *h)).collect();
+        let (bodies, wd, bals) = (self.bodies.lock(), self.withdrawals.lock(), self.bal_raw.lock());
+        let mut from = None;
+        for (i, (n, h)) in hashes.iter().enumerate() {
+            if i > 0 && hashes[i - 1].0 != n + 1 || !(bodies.map.contains_key(h) && wd.map.contains_key(h) && bals.map.contains_key(h)) {
+                break;
+            }
+            from = Some(*n);
+        }
+        from
+    }
+
     pub fn number_of(&self, hash: &B256) -> Option<u64> {
-        self.inner.read().headers.iter().rev().find(|(_, (h, _))| h == hash).map(|(n, _)| *n)
+        self.inner.read().by_hash.get(hash).copied()
     }
 }

@@ -81,6 +81,10 @@ pub struct Args {
     /// Don't cache `eth_call` results per (block, request) (measurements of raw execution).
     #[arg(long)]
     no_call_cache: bool,
+    /// Don't answer other peers' requests (EL headers/bodies/receipts/BALs/bytecode, CL payload
+    /// envelopes); requests get empty answers.
+    #[arg(long)]
+    no_serve: bool,
     /// Disable the learned-set pattern tier (A/B measurements).
     #[arg(long)]
     no_learned_patterns: bool,
@@ -270,6 +274,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let light = crate::light::Light::new(cl.clone(), persist.clone());
     light.start(args.checkpoint, args.checkpoint_url.clone());
     let chaindata = crate::chaindata::ChainData::new(net.clone(), args.max_logs_range);
+    if !args.no_serve {
+        net.serve(Arc::new(crate::serving::Served { chain: chaindata.clone(), store: store.clone() }));
+    }
     let (ws_events, _) = tokio::sync::broadcast::channel::<crate::rpc::WsEvent>(256);
     tokio::spawn(serve(Arc::new(Rpc {
         sim: sim.clone(),
@@ -280,6 +287,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         events: ws_events.clone(),
         call_cache: Default::default(),
         cache_calls: !args.no_call_cache,
+        cl_stats: Some(cl.stats.clone()),
     }), args.rpc));
     if store.archive().is_some() {
         spawn_archive_healer(store.clone(), net.clone(), args.archive_backfill);
@@ -336,15 +344,40 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             .map(|d| d.as_secs_f64() * 1e3 - v.header.timestamp as f64 * 1e3)
             .unwrap_or(f64::NAN);
         let writes = BlockWrites::from_bal(&bal);
+        let served = (!args.no_serve).then(|| {
+            (env.payload.slot_number, skim_cl::serve::Served {
+                root: env.beacon_block_root,
+                block_hash: v.computed_hash,
+                parent_hash: env.payload.parent_hash,
+                ssz: data.clone(),
+            })
+        });
         chaindata.note_payload(
             number,
             v.computed_hash,
             env.payload.transactions.iter().map(|t| alloy_primitives::Bytes::copy_from_slice(t)).collect(),
+            env.payload
+                .withdrawals
+                .iter()
+                .map(|w| alloy_consensus::private::alloy_eips::eip4895::Withdrawal {
+                    index: w.index,
+                    validator_index: w.validator_index,
+                    address: w.address,
+                    amount: w.amount_gwei,
+                })
+                .collect(),
             writes.touched.iter().copied().collect(),
             Arc::new(bal),
+            alloy_primitives::Bytes::copy_from_slice(env.payload.block_access_list),
         );
         match chain.place(v.header, Arc::new(writes)).await {
             Placed::Applied { ready, reorged_to, filled } => {
+                if let Some((slot, e)) = served {
+                    cl.serve_envelope(slot, e);
+                }
+                if let Some(h) = chaindata.cached_header(ready.block.number.into()) {
+                    net.set_head(&h);
+                }
                 tracing::info!(number, arrival_ms = arrival_ms as i64, changed = ready.changed_keys.len(), ?reorged_to, filled, "state ready");
                 light.on_block(&store);
                 let _ = ws_events.send(crate::rpc::WsEvent::NewHead(ready.block));

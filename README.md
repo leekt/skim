@@ -84,7 +84,7 @@ All numbers are from Sepolia, measured from one home connection over public peer
 | **Warm simulation** | Uniswap V3 quote over JSON-RPC: **0.25 ms** P50, 0.56 ms P99; ~8,500 calls/s at 50 in flight |
 | **Fetch reliability** | 298,084 SNAP jobs over public peers, **0 failed**, 126 disconnects absorbed ([soak](docs/experiments/m0-soak.md)) |
 | **Unseen inputs** | Background prefetch had **99.9%** of predicted keys ready at call time. Worst on-path fetch: 1.6 s ([P1](docs/experiments/m2-p0-miss-tail.md)). |
-| **Footprint** | ~120 MB RSS, ~0.25 CPU core. On disk: a restart snapshot of subscribed state (~1 MB for 2,400 keys; `--ephemeral` for none) |
+| **Footprint** | ~200 MB RSS with the default 256-block window (~100 MB with `--window 32`), ~0.25 CPU core. On disk: a restart snapshot of subscribed state (~1 MB for 2,400 keys; `--ephemeral` for none) |
 
 What skim is **not**: faster than an in-process full node on raw execution, or a trustless light client (yet). It saves *resources* while keeping simulation quality close to a node's. Part of the saving is work that public SNAP peers do on skim's behalf.
 
@@ -188,6 +188,7 @@ Consensus light-client verification is on the roadmap. Until then, skim trusts t
 - [x] **M5:** generalized learned patterns (exact args + amount buckets) with key/byte bounds. The V3 predictor is configurable in `skim run`: calls that needed the network fell from 51 to 19 out of 400. Added `eth_sendRawTransaction`, receipts and `eth_getLogs`, all identical to a reference node in every check ([M5](docs/experiments/m5-predictors-and-chain-data.md)).
 - [x] `storage: all`: a contract's whole storage, downloaded and verified against its storage root, then kept current from BALs (Uniswap V3 pool: 3,677 slots; 29/29 sampled slots identical to a reference node). WebSocket JSON-RPC: `newHeads`, `logs`, and `skim_subscriptions` pushes with every block's `on_block` results
 - [x] **M6: correctness and bounds.** Review fixes with regression tests. 2 h chaos soak (kills, restarts, key-set switches): 3,465 matches, 23 refusals, 0 wrong. Verified restart snapshots, warm `eth_call` 3× faster ([M6](docs/experiments/m6-correctness-and-bounds.md))
+- [x] Serving the network: recent headers, bodies, receipts and BALs (eth/69–71, snap/2), bytecode, and payload envelopes by range/root (consensus), each re-checked against its header before it is sent ([M6](docs/experiments/m6-correctness-and-bounds.md#serving-the-network))
 - [ ] Consensus light-client verification: implemented and unit-tested, waiting on consensus clients to serve Gloas light-client data
 - [ ] Mainnet once Glamsterdam ships there
 

@@ -4,6 +4,7 @@
 //! callers can measure per-peer latency and availability instead of going through reth's
 //! peer-selecting fetch client.
 
+pub mod serve;
 mod snap1;
 
 use std::{
@@ -39,6 +40,7 @@ use reth_storage_api::noop::NoopProvider;
 use tokio::sync::oneshot;
 
 pub use reth_network_api::PeerId as Peer;
+pub use serve::{ServeCounts, ServeSource};
 
 /// Fuzzing entry: decodes a raw snap/1 response as skim does for Geth peers (never panics).
 #[doc(hidden)]
@@ -91,6 +93,10 @@ pub struct ElNet {
     snap1: snap1::Snap1Peers,
     peers: Arc<RwLock<HashMap<PeerId, PeerInfo>>>,
     timeout: Duration,
+    serve: serve::Source,
+    serve_stats: Arc<serve::ServeStats>,
+    /// Set once the owner reports its own head ([`Self::set_head`]); the poller then stops.
+    external_head: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ElNet {
@@ -146,7 +152,10 @@ impl ElNet {
             .disable_tx_gossip(true)
             .set_head(head)
             .build(NoopProvider::eth(spec));
-        let manager = NetworkManager::eth(config).await?;
+        let mut manager = NetworkManager::eth(config).await?;
+        // Peers' requests come to skim's handler (answered from `serve`, or empty until it is set).
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(1024);
+        manager.set_eth_request_handler(req_tx);
         let handle = manager.handle().clone();
         tokio::spawn(manager);
 
@@ -156,7 +165,11 @@ impl ElNet {
             snap1,
             peers: Default::default(),
             timeout: Duration::from_secs(5),
+            serve: Default::default(),
+            serve_stats: Default::default(),
+            external_head: Default::default(),
         };
+        tokio::spawn(serve::run(req_rx, net.serve.clone(), net.serve_stats.clone()));
         net.spawn_tracker();
         net.spawn_head_follower();
         Ok(net)
@@ -217,6 +230,9 @@ impl ElNet {
             let mut rr = 0usize;
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
+                if net.external_head.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 let peers: Vec<_> = net.peers().into_iter().filter(|(_, p)| p.eth_version >= 69).collect();
                 if peers.is_empty() {
                     continue;
@@ -244,18 +260,43 @@ impl ElNet {
         });
     }
 
+    /// Reports the owner's verified head (e.g. the block it just applied): it is advertised to
+    /// peers from now on instead of the head polled from peers, so the advertised range is what
+    /// skim actually holds.
+    pub fn set_head(&self, h: &Header) {
+        self.external_head.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.advertise_head(h);
+        *self.head.write() = Some(h.clone());
+    }
+
     /// Latest followed head, if any.
     pub fn head(&self) -> Option<Header> {
         self.head.read().clone()
+    }
+
+    /// This node's enode URL.
+    pub fn enode(&self) -> String {
+        self.handle.local_node_record().to_string()
     }
 
     pub fn handle(&self) -> &NetworkHandle {
         &self.handle
     }
 
+    /// Answers peers' requests from `src` from now on.
+    pub fn serve(&self, src: Arc<dyn ServeSource>) {
+        *self.serve.write() = Some(src);
+    }
+
+    /// Requests answered so far.
+    pub fn serve_counts(&self) -> ServeCounts {
+        self.serve_stats.counts()
+    }
+
     /// Advertises `h` as our head: the eth Status for new handshakes and a `BlockRangeUpdate`
-    /// for live eth/69+ sessions. We serve no history, so the range is `[h, h]`. Peers that
-    /// evict "useless" peers see a synced node instead of one stuck at genesis (§6.3.1).
+    /// for live eth/69+ sessions. The range starts at the oldest block the serve source holds
+    /// without gaps (`[h, h]` without one). Peers that evict "useless" peers see a synced node
+    /// instead of one stuck at genesis (§6.3.1).
     pub fn advertise_head(&self, h: &Header) {
         let hash = h.hash_slow();
         self.handle.update_status(Head {
@@ -265,8 +306,9 @@ impl ElNet {
             difficulty: U256::ZERO,
             total_difficulty: U256::ZERO,
         });
+        let earliest = self.serve.read().as_ref().and_then(|s| s.earliest()).map_or(h.number, |e| e.min(h.number));
         self.handle.update_block_range(BlockRangeUpdate {
-            earliest: h.number,
+            earliest,
             latest: h.number,
             latest_hash: hash,
         });

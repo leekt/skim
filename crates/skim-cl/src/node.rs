@@ -165,6 +165,12 @@ pub struct NodeStats {
     pub metadata_served: u64,
     pub pings_served: u64,
     pub empty_served: u64,
+    /// `ExecutionPayloadEnvelopesByRange` / `ByRoot` requests answered, and envelopes sent.
+    pub envelope_range_reqs: u64,
+    pub envelope_root_reqs: u64,
+    pub envelopes_served: u64,
+    /// Oldest slot held for serving.
+    pub envelopes_from_slot: Option<u64>,
     pub goodbyes_received: u64,
     pub attestations: u64,
     pub best_status: Option<Status>,
@@ -184,6 +190,7 @@ struct Behaviour {
     goodbye: request_response::Behaviour<Codec>,
     empty: request_response::Behaviour<Codec>,
     envelopes: request_response::Behaviour<rpc::EnvelopesCodec>,
+    envelopes_by_root: request_response::Behaviour<rpc::EnvelopesCodec>,
     lc_bootstrap: request_response::Behaviour<rpc::EnvelopesCodec>,
 }
 
@@ -191,6 +198,8 @@ struct Behaviour {
 enum Cmd {
     Envelopes { start_slot: u64, count: u64, reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>> },
     Bootstrap { root: [u8; 32], reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>> },
+    Serve { slot: u64, env: crate::serve::Served },
+    EnvelopesByRoot { roots: Vec<B256>, reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>> },
 }
 
 struct PeerState {
@@ -219,6 +228,20 @@ impl ClNode {
         let count = count.min(rpc::MAX_REQUEST_PAYLOADS);
         self.cmd.send(Cmd::Envelopes { start_slot, count, reply }).await.map_err(|_| anyhow::anyhow!("CL node stopped"))?;
         tokio::time::timeout(Duration::from_secs(20), rx).await.map_err(|_| anyhow::anyhow!("envelopes request timed out"))??
+    }
+
+    /// `ExecutionPayloadEnvelopesByRoot(beacon block roots)` from one connected peer (SSZ,
+    /// unverified).
+    pub async fn envelopes_by_root(&self, roots: Vec<B256>) -> anyhow::Result<Vec<Vec<u8>>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.cmd.send(Cmd::EnvelopesByRoot { roots, reply }).await.map_err(|_| anyhow::anyhow!("CL node stopped"))?;
+        tokio::time::timeout(Duration::from_secs(20), rx).await.map_err(|_| anyhow::anyhow!("envelopes request timed out"))??
+    }
+
+    /// Offers a verified envelope (SSZ of `SignedExecutionPayloadEnvelope`) to peers' range/root
+    /// requests. Call only for envelopes whose payload was checked and applied.
+    pub fn serve_envelope(&self, slot: u64, env: crate::serve::Served) {
+        let _ = self.cmd.try_send(Cmd::Serve { slot, env });
     }
 
     /// `LightClientBootstrap(block_root)` from one connected peer (SSZ, unverified).
@@ -379,10 +402,16 @@ impl ClNode {
             ping: rr(&[rpc::PING_V1]),
             goodbye: rr(&[rpc::GOODBYE_V1]),
             empty: rr(&empty),
-            // Outbound only: inbound requests on this protocol go to `empty` (nothing served).
-            envelopes: request_response::Behaviour::new(
-                [(StreamProtocol::new(rpc::ENVELOPES_BY_RANGE), ProtocolSupport::Outbound)],
+            // Both directions: skim requests ranges on catch-up and answers from `served`.
+            envelopes: request_response::Behaviour::with_codec(
+                rpc::EnvelopesCodec { digest: cfg.fork_digest },
+                [(StreamProtocol::new(rpc::ENVELOPES_BY_RANGE), ProtocolSupport::Full)],
                 request_response::Config::default().with_request_timeout(Duration::from_secs(15)),
+            ),
+            envelopes_by_root: request_response::Behaviour::with_codec(
+                rpc::EnvelopesCodec { digest: cfg.fork_digest },
+                [(StreamProtocol::new(rpc::ENVELOPES_BY_ROOT), ProtocolSupport::Full)],
+                rr_config(),
             ),
             lc_bootstrap: request_response::Behaviour::new(
                 [(StreamProtocol::new(rpc::LIGHT_CLIENT_BOOTSTRAP), ProtocolSupport::Outbound)],
@@ -418,6 +447,7 @@ impl ClNode {
             cmd_rx,
             env_reqs: HashMap::new(),
             env_rr: 0,
+            served: Default::default(),
             cfg,
             swarm,
             discv5: Arc::new(discv5),
@@ -445,6 +475,7 @@ struct Runner {
     cmd_rx: mpsc::Receiver<Cmd>,
     env_reqs: HashMap<OutboundRequestId, tokio::sync::oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>>>,
     env_rr: usize,
+    served: crate::serve::EnvelopeCache,
     cfg: NodeConfig,
     swarm: Swarm<Behaviour>,
     discv5: Arc<Discv5>,
@@ -592,6 +623,23 @@ impl Runner {
                 ssz.extend_from_slice(&count.to_le_bytes());
                 let id = self.swarm.behaviour_mut().envelopes.send_request(&peer, ssz);
                 self.env_reqs.insert(id, reply);
+            }
+            Cmd::EnvelopesByRoot { roots, reply } => {
+                let mut cands: Vec<PeerId> = self.peers.iter().filter(|(_, p)| p.status.is_some()).map(|(id, _)| *id).collect();
+                if cands.is_empty() {
+                    let _ = reply.send(Err(anyhow::anyhow!("no CL peers yet")));
+                    return;
+                }
+                cands.sort();
+                self.env_rr = self.env_rr.wrapping_add(1);
+                let peer = cands[self.env_rr % cands.len()];
+                let req: Vec<u8> = roots.iter().take(rpc::MAX_REQUEST_PAYLOADS as usize).flat_map(|r| r.0).collect();
+                let id = self.swarm.behaviour_mut().envelopes_by_root.send_request(&peer, req);
+                self.env_reqs.insert(id, reply);
+            }
+            Cmd::Serve { slot, env } => {
+                self.served.insert(slot, env);
+                self.stats.lock().unwrap().envelopes_from_slot = self.served.oldest_slot();
             }
             Cmd::Bootstrap { root, reply } => {
                 let mut cands: Vec<PeerId> = self.peers.iter().filter(|(_, p)| p.status.is_some()).map(|(id, _)| *id).collect();
@@ -879,12 +927,40 @@ impl Runner {
                 }
                 tracing::debug!(%peer, ?reason, "goodbye");
             }
+            BehaviourEvent::Envelopes(R::Message { message: M::Request { request, channel, .. }, .. }) => {
+                let out: Vec<Vec<u8>> = self.served.range(&request).iter().map(|e| e.to_vec()).collect();
+                {
+                    let mut s = self.stats.lock().unwrap();
+                    s.envelope_range_reqs += 1;
+                    s.envelopes_served += out.len() as u64;
+                }
+                let _ = self.swarm.behaviour_mut().envelopes.send_response(channel, out);
+            }
+            BehaviourEvent::EnvelopesByRoot(R::Message { message: M::Request { request, channel, .. }, .. }) => {
+                let out: Vec<Vec<u8>> = self.served.by_root(&request).iter().map(|e| e.to_vec()).collect();
+                {
+                    let mut s = self.stats.lock().unwrap();
+                    s.envelope_root_reqs += 1;
+                    s.envelopes_served += out.len() as u64;
+                }
+                let _ = self.swarm.behaviour_mut().envelopes_by_root.send_response(channel, out);
+            }
             BehaviourEvent::Envelopes(R::Message { message: M::Response { request_id, response }, .. }) => {
                 if let Some(reply) = self.env_reqs.remove(&request_id) {
                     let _ = reply.send(Ok(response));
                 }
             }
             BehaviourEvent::Envelopes(R::OutboundFailure { request_id, error, .. }) => {
+                if let Some(reply) = self.env_reqs.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("envelopes request failed: {error}")));
+                }
+            }
+            BehaviourEvent::EnvelopesByRoot(R::Message { message: M::Response { request_id, response }, .. }) => {
+                if let Some(reply) = self.env_reqs.remove(&request_id) {
+                    let _ = reply.send(Ok(response));
+                }
+            }
+            BehaviourEvent::EnvelopesByRoot(R::OutboundFailure { request_id, error, .. }) => {
                 if let Some(reply) = self.env_reqs.remove(&request_id) {
                     let _ = reply.send(Err(anyhow::anyhow!("envelopes request failed: {error}")));
                 }

@@ -63,13 +63,32 @@ Calls run in [revm](https://github.com/bluealloy/revm) with Amsterdam rules, aga
   - for blocks skim followed live, a block is also skipped when no filtered address is in its BAL, because an emitting contract always is
   - fetches and verifies receipts only for the remaining blocks
 
+## 7. What skim serves back
+skim answers other peers' requests from recent data it has already verified against block headers. It doesn't pass on anything it hasn't verified.
+
+| Protocol | Request | Served from |
+|---|---|---|
+| eth/69–71 | `GetBlockHeaders` | canonical headers skim followed (rising, falling, skip) |
+| eth/69–71 | `GetBlockBodies` | gossiped payloads: transactions and withdrawals, both checked against the header (last 128 blocks) |
+| eth/69–71 | `GetReceipts` (all versions) | receipts skim fetched and verified for its own users (`receiptsRoot`) |
+| eth/71 | `GetBlockAccessLists` | raw BALs of the last 64 blocks, re-checked against `block_access_list_hash` before sending |
+| snap/2 | `GetByteCodes`, `GetBlockAccessLists` | bytecode skim holds (hash checked); BALs as above |
+| snap/2 | `GetAccountRange`, `GetStorageRanges` | empty ("not available"): skim holds no state tries |
+| CL | `ExecutionPayloadEnvelopesByRange` / `ByRoot` | verified envelopes of the last 64 slots, only those on the chain skim applied |
+
+- **Unknown items:** anything skim doesn't hold gets the protocol's "don't have it" answer right away (a shorter or empty response), so the peer doesn't wait for a timeout.
+- **Advertised range:** eth/69+ peers are told the range skim holds without gaps (`BlockRangeUpdate`), ending at the block skim last applied.
+- **Counters:** `skim_status.served` shows requests and items per message type.
+- **Opting out:** `--no-serve` turns serving off.
+
 ## What skim keeps
 | Data | Where | Size |
 |---|---|---|
 | Tracked state | memory, multi-version for `--window` blocks | ~10–100 MB for typical app state |
 | Contract code | memory, only for tracked accounts | per contract |
 | Headers, tx hashes, BAL addresses | memory, last 2,048–8,192 blocks | a few MB |
+| Recent blocks and envelopes for serving | memory: BALs of the last 64 blocks, bodies of 128, envelopes of 64 slots | ~10–25 MB |
 | Restart snapshot | `redb` file in `--data-dir` (default `~/.skim/sepolia`): subscribed values, node key, peers | ~1 MB for 2,400 keys |
 | Archived history (optional) | `redb` file, only for `retention: archive` subscriptions | versions only on change |
 
-Measured: ~120 MB RSS and ~0.25 CPU core following Sepolia with Uniswap subscriptions. On disk: the restart snapshot (about 1 MB), plus the archive if you enable one. `--ephemeral` keeps nothing on disk.
+Measured with the Uniswap V3 config: ~200 MB RSS once the default 256-block window has filled (about 42 MB of it is the recent-BAL index), ~0.25 CPU core. `--window 32` keeps it near 100 MB. On disk: the restart snapshot (about 1 MB), plus the archive if you enable one. `--ephemeral` keeps nothing on disk.

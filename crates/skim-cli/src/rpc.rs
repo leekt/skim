@@ -169,6 +169,8 @@ pub struct Rpc {
     /// hit this. Only fully resolved outcomes (results and reverts) are cached.
     pub call_cache: parking_lot::Mutex<CallCache>,
     pub cache_calls: bool,
+    /// Consensus node counters (envelopes served to peers).
+    pub cl_stats: Option<Arc<std::sync::Mutex<skim_cl::NodeStats>>>,
 }
 
 #[derive(Default)]
@@ -663,6 +665,7 @@ impl Rpc {
                     "light_client": self.light.as_ref().map(|l| l.status()),
                     "el_peers": peers.len(),
                     "snap_peers": peers.iter().filter(|(_, p)| p.snap1 || p.snap2).count(),
+                    "served": self.served_json(),
                 }))
             }
             "skim_subscriptionStatus" => Ok(serde_json::to_value(self.subs.as_ref().map(|s| s.status()).unwrap_or_default()).unwrap()),
@@ -694,6 +697,33 @@ impl Rpc {
 }
 
 impl Rpc {
+    /// Requests skim answered for other peers.
+    fn served_json(&self) -> Value {
+        let c = self.sim.sched.transport().net.serve_counts();
+        json!({
+            "el_enode": self.sim.sched.transport().net.enode(),
+            "cl_peer_id": self.cl_stats.as_ref().map(|s| s.lock().unwrap().peer_id.clone()),
+            "el": {
+                "headers": {"requests": c.header_reqs, "items": c.headers},
+                "bodies": {"requests": c.body_reqs, "items": c.bodies},
+                "receipts": {"requests": c.receipt_reqs, "items": c.receipts},
+                "bals": {"requests": c.bal_reqs, "items": c.bals},
+                "snap": {"requests": c.snap_reqs, "bytecodes": c.codes},
+                "other_requests": c.other_reqs,
+                "served_from": self.chain.as_ref().and_then(|c| c.served_from()),
+            },
+            "cl": self.cl_stats.as_ref().map(|s| {
+                let s = s.lock().unwrap();
+                json!({
+                    "envelopes_by_range": {"requests": s.envelope_range_reqs},
+                    "envelopes_by_root": {"requests": s.envelope_root_reqs},
+                    "envelopes": s.envelopes_served,
+                    "served_from_slot": s.envelopes_from_slot,
+                })
+            }),
+        })
+    }
+
     /// The block `latest` means for this request (the head, or the verified head).
     fn latest(&self) -> Option<BlockRef> {
         if self.require_verified {

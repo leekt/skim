@@ -1,6 +1,7 @@
 //! eth2 req/resp (`ssz_snappy` encoding) for the handful of messages a listener needs:
-//! Status v1/v2, MetaData v2/v3, Ping, Goodbye. Range/root protocols are registered too, but only
-//! ever answered with an empty response (zero chunks), which is a valid "nothing to serve".
+//! Status v1/v2, MetaData v2/v3, Ping, Goodbye, and payload envelopes by range/root (recent ones,
+//! see `serve`). Other range/root protocols are registered too, but only ever answered with an
+//! empty response (zero chunks), which is a valid "nothing to serve".
 //!
 //! Wire format (phase0 p2p-interface, "Encoding strategies"):
 //! - request:  `varint(len(ssz)) ++ snappy_frames(ssz)`; empty requests (MetaData) send nothing.
@@ -33,8 +34,6 @@ pub const EMPTY_SERVED: &[&str] = &[
     "/eth2/beacon_chain/req/blob_sidecars_by_root/1/ssz_snappy",
     "/eth2/beacon_chain/req/data_column_sidecars_by_range/1/ssz_snappy",
     "/eth2/beacon_chain/req/data_column_sidecars_by_root/1/ssz_snappy",
-    "/eth2/beacon_chain/req/execution_payload_envelopes_by_range/1/ssz_snappy",
-    "/eth2/beacon_chain/req/execution_payload_envelopes_by_root/1/ssz_snappy",
 ];
 
 /// Goodbye reasons (phase0 + client conventions).
@@ -258,17 +257,20 @@ impl request_response::Codec for Codec {
 }
 
 pub const ENVELOPES_BY_RANGE: &str = "/eth2/beacon_chain/req/execution_payload_envelopes_by_range/1/ssz_snappy";
+pub const ENVELOPES_BY_ROOT: &str = "/eth2/beacon_chain/req/execution_payload_envelopes_by_root/1/ssz_snappy";
 pub const LIGHT_CLIENT_BOOTSTRAP: &str = "/eth2/beacon_chain/req/light_client_bootstrap/1/ssz_snappy";
 /// Spec limit per request (`MAX_REQUEST_PAYLOADS`).
 pub const MAX_REQUEST_PAYLOADS: u64 = 128;
 const MAX_ENVELOPE_RESPONSE_BYTES: u64 = 256 << 20;
 
-/// Requester for chunked SSZ protocols (`ExecutionPayloadEnvelopesByRange`,
-/// `LightClientBootstrap`): request is raw SSZ, response the
-/// SSZ of each `SignedExecutionPayloadEnvelope` chunk (context bytes checked by the caller via
-/// the envelope itself; the digest is skipped here).
+/// Chunked SSZ protocols (`ExecutionPayloadEnvelopesByRange/ByRoot`, `LightClientBootstrap`):
+/// request is raw SSZ, response the SSZ of each chunk. Read: context bytes are skipped (callers
+/// check the envelope itself). Write: every chunk carries `digest` (all served envelopes are
+/// from the current fork).
 #[derive(Clone, Default)]
-pub struct EnvelopesCodec;
+pub struct EnvelopesCodec {
+    pub digest: [u8; 4],
+}
 
 /// Decodes one `varint(len) ++ snappy_frames` payload from the start of `b`, returning it and
 /// how many input bytes it used (responses carry several chunks back to back).
@@ -310,11 +312,15 @@ impl request_response::Codec for EnvelopesCodec {
     type Request = Vec<u8>;
     type Response = Vec<Vec<u8>>;
 
-    async fn read_request<T>(&mut self, _p: &StreamProtocol, _io: &mut T) -> io::Result<Vec<u8>>
+    async fn read_request<T>(&mut self, _p: &StreamProtocol, io: &mut T) -> io::Result<Vec<u8>>
     where
         T: AsyncRead + Unpin + Send,
     {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "envelopes are not served"))
+        // ByRange is 16 bytes, ByRoot at most 128 roots.
+        let mut buf = Vec::new();
+        io.take(8 << 10).read_to_end(&mut buf).await?;
+        let (ssz, _) = decode_payload_len(&buf, (MAX_REQUEST_PAYLOADS * 32).max(16))?;
+        Ok(ssz)
     }
 
     async fn read_response<T>(&mut self, _p: &StreamProtocol, io: &mut T) -> io::Result<Vec<Vec<u8>>>
@@ -334,11 +340,17 @@ impl request_response::Codec for EnvelopesCodec {
         io.flush().await
     }
 
-    async fn write_response<T>(&mut self, _p: &StreamProtocol, _io: &mut T, _res: Vec<Vec<u8>>) -> io::Result<()>
+    async fn write_response<T>(&mut self, _p: &StreamProtocol, io: &mut T, res: Vec<Vec<u8>>) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "envelopes are not served"))
+        for ssz in res {
+            let mut b = vec![0u8];
+            b.extend_from_slice(&self.digest);
+            b.extend_from_slice(&encode_payload(&ssz));
+            io.write_all(&b).await?;
+        }
+        io.flush().await
     }
 }
 
@@ -383,6 +395,28 @@ mod tests {
         assert_eq!(enc[0], 92); // varint of the uncompressed length
         assert_eq!(&enc[1..5], &[0xff, 0x06, 0x00, 0x00]); // snappy stream identifier
         assert_eq!(decode_payload(&enc).unwrap(), ssz);
+    }
+
+    #[test]
+    fn served_envelopes_roundtrip_through_the_codec() {
+        use request_response::Codec as _;
+        let p = StreamProtocol::new(ENVELOPES_BY_RANGE);
+        let mut c = EnvelopesCodec { digest: [0x66, 0x9e, 0x6c, 0x11] };
+        futures::executor::block_on(async {
+            let mut wire = futures::io::Cursor::new(Vec::new());
+            let req = [5u64.to_le_bytes(), 3u64.to_le_bytes()].concat();
+            c.write_request(&p, &mut wire, req.clone()).await.unwrap();
+            let got = c.read_request(&p, &mut futures::io::Cursor::new(wire.into_inner())).await.unwrap();
+            assert_eq!(got, req);
+
+            let chunks = vec![vec![1u8; 300_000], vec![2u8; 7]];
+            let mut wire = futures::io::Cursor::new(Vec::new());
+            c.write_response(&p, &mut wire, chunks.clone()).await.unwrap();
+            let raw = wire.into_inner();
+            assert_eq!(&raw[1..5], &[0x66, 0x9e, 0x6c, 0x11], "context bytes = fork digest");
+            let back = c.read_response(&p, &mut futures::io::Cursor::new(raw)).await.unwrap();
+            assert_eq!(back, chunks);
+        });
     }
 
     #[test]

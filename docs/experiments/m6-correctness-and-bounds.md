@@ -120,3 +120,37 @@ The median per-block difference between the two was −17 ms (new earlier in 56%
 - The next soak runs with the corrected classifier.
 
 Reorgs are covered by the deterministic store tests, not by the live soak.
+
+## Serving the network
+Until now skim only took from the network: inbound eth requests were dropped, and consensus range/root requests got empty answers. It now answers from data it has already verified (see [how it works §7](../guide/how-it-works.md#7-what-skim-serves-back)):
+- **Execution layer:** headers, bodies, receipts and eth/71 BALs, plus snap/2 bytecode and BALs.
+- **Consensus layer:** payload envelopes by range and by root.
+
+Every item is re-checked against its header before it is sent, and envelopes are served only from the chain skim applied.
+
+**Probe** (`skim probe-serve`): a separate process connects to one skim node only (EL as its sole trusted peer, CL as an explicit peer), then requests and verifies everything independently:
+
+| Request | Result |
+|---|---|
+| `GetBlockHeaders` (falling from the advertised head) | 13 / 13, hash-linked (all blocks the node had followed) |
+| `GetBlockAccessLists` | 13 verified against `block_access_list_hash`, 0 wrong |
+| `GetBlockBodies` | 13 verified (transactions root and withdrawals root), 0 wrong |
+| `GetReceipts` | blocks the node had fetched for an RPC user: verified against `receiptsRoot`; others: "not held" |
+| snap `GetByteCodes` (one held hash plus one unknown) | 1 returned, matching its hash |
+| `ExecutionPayloadEnvelopesByRange` (16 slots) | 11 returned (the other slots were empty or before the node started), all verified and on the EL chain |
+| `ExecutionPayloadEnvelopesByRoot` (one known root plus one unknown) | 1 returned, verified |
+
+**Fixed along the way:** the EL handshake advertised a head about 100 blocks behind, taken from a peer-polling loop left over from the probes, so peers asked for blocks skim didn't hold. skim now advertises the block it last applied, and `BlockRangeUpdate` covers the range it holds without gaps.
+
+**Real peers** (35 min on Sepolia, 4–10 EL peers): few requests arrived, because few public peers speak eth/71 and consensus clients range-sync from peers that advertise history (skim's status still advertises none). One consensus peer fetched an envelope by root, and a few EL peers asked for headers. The serving path matters most for other skim instances, which fetch BALs, headers and bodies over eth/71 when they restart or miss gossip.
+
+**Cost:** about 10–13 MB of RSS. Two instances with the Uniswap V3 config ran side by side, one with `--no-serve`, and were compared at the same age:
+
+| Age | Serving | `--no-serve` |
+|---|---|---|
+| ~9 min | 113 MB | 100 MB |
+| 24 min | 151 MB | 141 MB |
+
+The caches are bounded: BALs of 64 blocks, bodies of 128, and envelopes of 64 slots.
+
+**What memory grows with:** both instances grew about 2 MB per minute until the 256-block `--window` filled (51 min; the recent-BAL index alone was about 42 MB). After that, growth slowed to about 0.3 MB per minute (202 MB at 71 min), as the bounded header and transaction indexes keep filling. `--window 32` keeps a node near 100 MB (chaos soak above).

@@ -83,6 +83,7 @@ With no cap, memory grows with the contract: about 100 bytes per slot, so a cont
 | `--checkpoint <root>` | none | trusted beacon block root for the light client (default: last finalized root verified in a previous run, else `--checkpoint-url`) |
 | `--checkpoint-url <url>` | ethpandaops Sepolia | checkpoint-sync endpoint for the light client's starting root |
 | `--require-verified` | off | `latest` = highest block the sync committee signed off on (~1–2 slots behind) |
+| `--no-serve` | off | don't answer peers' requests for headers, bodies, receipts, BALs, bytecode and payload envelopes (they get empty answers) |
 | `--no-learned-patterns` | off | disable the similar-input learned tier (for A/B measurements) |
 
 **Logging:** set `RUST_LOG`, e.g. `RUST_LOG=info,skim::rpc=debug`. That logs every RPC with its latency, and each `eth_call`'s fetch waves.
@@ -101,6 +102,6 @@ Anything that doesn't check out (a reorg while skim was down, a gap over 8,192 b
   - **Contract code:** freed with its accounts.
   - **The recent-BAL index:** every write of the last `--window` blocks, needed to replay fetched values to the head. This part scales with chain activity, not with your keys. `skim_status.store.recent_bal_bytes` shows it; lower `--window` to shrink it.
 
-  There is no single "total memory" cap. Measured: ~120 MB RSS for a few pools, tokens and quotes, following Sepolia.
+  There is no single "total memory" cap. Measured: ~200 MB RSS for a few pools, tokens and quotes, following Sepolia with the default 256-block `--window` (~100 MB with `--window 32`).
 - **Network and CPU:** skim receives and checks every block's full payload and BAL, so this part follows the whole chain's activity, not just your keys. What scales with your app is the state it keeps and the fetches it makes.
 - **Disk:** none, unless `--archive`.
