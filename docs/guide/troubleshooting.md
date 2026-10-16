@@ -1,7 +1,11 @@
 # Troubleshooting
 
-### `-32002` "no SNAP state peers connected yet"
-SNAP-serving EL peers take **1–4 minutes** to connect on public Sepolia after a cold start. Consensus gossip makes the head ready within seconds, so skim already answers from subscribed state. State it hasn't seen can't be fetched yet: such reads fail after 3 s with this message. Retry shortly. Watch for log lines like:
+### Slow first calls, or `-32002` "no SNAP state peers connected"
+SNAP-serving EL peers take **1–4 minutes** to connect on public Sepolia after a cold start. Consensus gossip makes the head ready within seconds, so skim already answers from subscribed state.
+
+State skim hasn't seen comes only from SNAP peers: gossip carries each block's writes, not untouched state. A request that needs such state **waits for a SNAP peer** (up to `--state-wait`, default 60 s), then fetches and answers. It fails with this error only if no peer arrives in time.
+
+HTTP clients have their own timeouts (viem: 10 s by default), so the first calls after a cold start can time out on the client side. Retry, or raise the client timeout. Watch for log lines like:
 ```text
 INFO skim_el: session peer=… client=Geth/… snap2=false
 INFO skim_el: session peer=… client=Nethermind/… snap2=true

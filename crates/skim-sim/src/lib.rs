@@ -59,6 +59,9 @@ pub enum SimError {
     StateUnavailable(usize),
     #[error("state still incomplete after {0} fetch rounds")]
     Incomplete(usize),
+    /// State is served only by SNAP peers (gossip carries writes, not untouched state).
+    #[error("no SNAP state peers connected after waiting {0} s; skim is still finding execution-layer peers, retry shortly")]
+    NoStatePeers(u64),
     #[error(transparent)]
     State(#[from] StateError),
     #[error("no header for block {0}")]
@@ -98,6 +101,9 @@ pub struct Simulator {
     /// Retention for state fetched on demand (unsubscribed): `Ttl(n)` keeps it current for n
     /// blocks, then evicts it. `Subscribed` keeps everything ever read (pre-M3 behaviour).
     pub on_demand: RwLock<Retention>,
+    /// How long an interactive request waits for a SNAP peer when none is connected, before
+    /// giving up (`--state-wait`).
+    pub state_wait: RwLock<std::time::Duration>,
 }
 
 impl Simulator {
@@ -110,7 +116,23 @@ impl Simulator {
             code_cache: RwLock::default(),
             miss_at_parent: true,
             on_demand: RwLock::new(Retention::Ttl(4)),
+            state_wait: RwLock::new(std::time::Duration::from_secs(60)),
         })
+    }
+
+    /// Before an interactive fetch wave: if no SNAP peer is connected (e.g. right after a cold
+    /// start), waits for one instead of failing, up to `state_wait`.
+    pub async fn await_state_peers(&self) -> Result<(), SimError> {
+        use skim_snap::Transport as _;
+        let wait = *self.state_wait.read();
+        let until = std::time::Instant::now() + wait;
+        while self.sched.transport().snap_peers().is_empty() {
+            if std::time::Instant::now() >= until {
+                return Err(SimError::NoStatePeers(wait.as_secs()));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        Ok(())
     }
 
     /// Keeps the header of an applied block (execution env, BLOCKHASH). Pruned with the store
@@ -226,6 +248,7 @@ impl Simulator {
                 if let Some(&lowest) = access.miss_block_hashes.first() {
                     self.resolve_block_hashes(lowest).await;
                 }
+                self.await_state_peers().await?;
                 predicted = Some(
                     prefetch::resolve_retained(&self.store, &self.sched, &at, &accts, &slots, &access.miss_code, Priority::High, retention)
                         .await,
@@ -263,6 +286,7 @@ impl Simulator {
             slots.extend(unknown_split(&snap, &extra).1);
             slots.sort();
             slots.dedup();
+            self.await_state_peers().await?;
             rounds.push(
                 prefetch::resolve_retained(
                     &self.store,
@@ -317,6 +341,7 @@ impl Simulator {
         }
         let at = self.fetch_at(b);
         let ret = *self.on_demand.read();
+        self.await_state_peers().await?;
         let r = match key {
             StateKey::Storage(a, s) => {
                 prefetch::resolve_retained(&self.store, &self.sched, &at, &[], &[(a, s)], &[], Priority::High, ret).await
@@ -340,6 +365,7 @@ impl Simulator {
         if let Some(c) = self.store.code(&h) {
             return Ok(c);
         }
+        self.await_state_peers().await?;
         prefetch::resolve(&self.store, &self.sched, &self.fetch_at(b), &[], &[], &[h]).await;
         self.store.code(&h).ok_or(SimError::Incomplete(1))
     }

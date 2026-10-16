@@ -466,6 +466,7 @@ impl Simulator {
             if let Some(&lowest) = access.miss_block_hashes.first() {
                 self.resolve_block_hashes(lowest).await;
             }
+            self.await_state_peers().await?;
             prefetch::resolve_retained(&self.store, &self.sched, &at, &access.miss_accounts, &access.miss_storage, &access.miss_code, Priority::High, retention)
                 .await;
         }
@@ -563,6 +564,9 @@ impl Simulator {
         let (accts, slots) = crate::unknown_split(&snap, &keys);
         if !accts.is_empty() || !slots.is_empty() {
             let retention = *self.on_demand.read();
+            if self.await_state_peers().await.is_err() {
+                return;
+            }
             prefetch::resolve_retained(&self.store, &self.sched, &at, &accts, &slots, &[], Priority::High, retention).await;
         }
     }
@@ -610,6 +614,7 @@ impl Simulator {
             if let Some(&lowest) = access.miss_block_hashes.first() {
                 self.resolve_block_hashes(lowest).await;
             }
+            self.await_state_peers().await?;
             prefetch::resolve_retained(&self.store, &self.sched, &at, &access.miss_accounts, &access.miss_storage, &access.miss_code, Priority::High, retention)
                 .await;
         }

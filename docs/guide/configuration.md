@@ -83,6 +83,7 @@ With no cap, memory grows with the contract: about 100 bytes per slot, so a cont
 | `--checkpoint <root>` | none | trusted beacon block root for the light client (default: last finalized root verified in a previous run, else `--checkpoint-url`) |
 | `--checkpoint-url <url>` | ethpandaops Sepolia | checkpoint-sync endpoint for the light client's starting root |
 | `--require-verified` | off | `latest` = highest block the sync committee signed off on (~1–2 slots behind) |
+| `--state-wait <s>` | `60` | how long a request needing unheld state waits for a SNAP peer when none is connected (first minutes after a cold start) |
 | `--no-serve` | off | don't answer peers' requests for headers, bodies, receipts, BALs, bytecode and payload envelopes (they get empty answers) |
 | `--no-learned-patterns` | off | disable the similar-input learned tier (for A/B measurements) |
 

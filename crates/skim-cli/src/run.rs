@@ -81,6 +81,10 @@ pub struct Args {
     /// Don't cache `eth_call` results per (block, request) (measurements of raw execution).
     #[arg(long)]
     no_call_cache: bool,
+    /// How long a request that needs state skim doesn't hold waits for a SNAP peer when none is
+    /// connected (the first minutes after a cold start), before answering -32002.
+    #[arg(long, default_value_t = 60)]
+    state_wait: u64,
     /// Don't answer other peers' requests (EL headers/bodies/receipts/BALs/bytecode, CL payload
     /// envelopes); requests get empty answers.
     #[arg(long)]
@@ -224,7 +228,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 "SNAP answers rejected by verification");
         }
     });
-    let sched = Scheduler::new(transport, skim_snap::Config::default());
+    let sched = Scheduler::new(
+        transport,
+        skim_snap::Config { no_peer_wait: std::time::Duration::from_secs(args.state_wait), ..Default::default() },
+    );
     let store = match &args.archive {
         Some(p) => {
             let ar = skim_state::archive::Archive::open(p)?;
@@ -247,6 +254,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             reach: Default::default(),
         },
     );
+    *sim.state_wait.write() = std::time::Duration::from_secs(args.state_wait);
     let cfg: Config = match &args.config {
         Some(p) => serde_yaml_ng::from_str(&std::fs::read_to_string(p)?)?,
         None => Config::default(),
