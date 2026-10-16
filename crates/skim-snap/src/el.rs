@@ -72,7 +72,77 @@ pub enum StorageAll {
     Unavailable,
 }
 
+/// An EIP-1186 proof assembled from SNAP answers and verified against the state root.
+#[derive(Debug, Clone)]
+pub struct AccountProof {
+    /// `None` if the account is proven absent.
+    pub account: Option<AccountState>,
+    pub account_proof: Vec<Bytes>,
+    /// (slot, value, proof) per requested slot.
+    pub storage: Vec<(U256, U256, Vec<Bytes>)>,
+}
+
 impl ElTransport {
+    /// `eth_getProof` from one peer at `root`: the account and each slot, every value checked
+    /// against the root (or the account's storage root) before it is returned. `Ok(None)` if the
+    /// peer couldn't serve or prove it.
+    pub async fn get_proof(&self, peer: PeerId, root: B256, address: Address, slots: &[U256]) -> Result<Option<AccountProof>, TransportError> {
+        let ah = keccak256(address);
+        let m = self.net.account_range(peer, root, ah, 512).await.0.map_err(map_err)?;
+        if m.proof.is_empty() {
+            return Ok(None);
+        }
+        let (leaf, account_proof) = match proof::lookup_path(root, ah, &m.proof) {
+            Ok(x) => x,
+            Err(_) => return Ok(None),
+        };
+        let account = match leaf {
+            None => None,
+            Some(l) => match TrieAccount::decode(&mut l.as_slice()) {
+                Ok(a) => Some(AccountState { nonce: a.nonce, balance: a.balance, storage_root: a.storage_root, code_hash: a.code_hash }),
+                Err(_) => return Ok(None),
+            },
+        };
+        let mut storage = Vec::with_capacity(slots.len());
+        for slot in slots {
+            let storage_root = match &account {
+                Some(a) if a.storage_root != EMPTY_ROOT_HASH => a.storage_root,
+                _ => {
+                    storage.push((*slot, U256::ZERO, Vec::new())); // proven absent / empty trie
+                    continue;
+                }
+            };
+            let sh = keccak256(slot.to_be_bytes::<32>());
+            let m = self.net.storage_range(peer, root, ah, sh, 512).await.0.map_err(map_err)?;
+            let page = m.slots.into_iter().next().unwrap_or_default();
+            let (value, proof_nodes) = if m.proof.is_empty() {
+                // A whole small trie without proof: it must rebuild the storage root; then the
+                // proof for this slot is built from it.
+                let leaves: Vec<(B256, Bytes)> = page.iter().map(|d| (d.hash, d.data.clone())).collect();
+                if leaves.is_empty() || proof::root_of(leaves.clone()) != Some(storage_root) {
+                    return Ok(None);
+                }
+                let built = proof::proof_from_leaves(leaves.clone(), sh);
+                let v = leaves.iter().find(|(h, _)| *h == sh).map(|(_, d)| d.clone());
+                (v, built)
+            } else {
+                match proof::lookup_path(storage_root, sh, &m.proof) {
+                    Ok((v, path)) => (v.map(Bytes::from), path),
+                    Err(_) => return Ok(None),
+                }
+            };
+            let value = match value {
+                None => U256::ZERO,
+                Some(v) => match U256::decode(&mut v.as_ref()) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(None),
+                },
+            };
+            storage.push((*slot, value, proof_nodes));
+        }
+        Ok(Some(AccountProof { account, account_proof, storage }))
+    }
+
     /// Downloads a contract's entire storage at `root` from one peer, page by page, and accepts
     /// it only if all leaves together rebuild the account's (proven) storage root. Pages are not
     /// trusted individually; the end-to-end root check covers them all.

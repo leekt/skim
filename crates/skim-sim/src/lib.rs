@@ -69,6 +69,9 @@ pub enum SimError {
     Evm(String),
     #[error("not supported: {0}")]
     Unsupported(&'static str),
+    /// A simulated transaction failed validation (`eth_simulateV1` error codes).
+    #[error("{message}")]
+    Invalid { code: i64, message: String },
 }
 
 #[derive(Debug)]

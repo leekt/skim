@@ -7417,6 +7417,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-types-eth",
  "alloy-rpc-types-trace",
+ "alloy-trie",
  "anyhow",
  "axum",
  "clap",

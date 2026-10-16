@@ -17,6 +17,7 @@ skim-el.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-rlp.workspace = true
+alloy-trie.workspace = true
 reth-eth-wire-types.workspace = true
 tokio.workspace = true
 futures.workspace = true

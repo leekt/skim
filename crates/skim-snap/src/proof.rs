@@ -27,6 +27,38 @@ pub enum ProofError {
 }
 
 pub fn lookup(root: B256, key: B256, proof: &[Bytes]) -> Result<Option<Vec<u8>>, ProofError> {
+    lookup_path(root, key, proof).map(|(v, _)| v)
+}
+
+/// [`lookup`], also returning the path it walked: every hash-referenced node from the root
+/// toward `key`, in order (the EIP-1186 `eth_getProof` proof for this key).
+pub fn lookup_path(root: B256, key: B256, proof: &[Bytes]) -> Result<(Option<Vec<u8>>, Vec<Bytes>), ProofError> {
+    let mut walked: Vec<Bytes> = Vec::new();
+    let r = lookup_inner(root, key, proof, &mut walked)?;
+    Ok((r, walked))
+}
+
+/// The proof for `key` in a trie we hold completely (`leaves`, hashed keys + RLP values), e.g.
+/// a small storage trie a peer returned whole. Callers check the root first ([`root_of`]).
+pub fn proof_from_leaves(mut leaves: Vec<(B256, Bytes)>, key: B256) -> Vec<Bytes> {
+    use alloy_trie::proof::ProofRetainer;
+    leaves.sort_by(|a, b| a.0.cmp(&b.0));
+    leaves.dedup_by(|a, b| a.0 == b.0);
+    let target = Nibbles::unpack(key);
+    let mut hb = HashBuilder::default().with_proof_retainer(ProofRetainer::new(vec![target.clone()]));
+    for (k, v) in &leaves {
+        hb.add_leaf(Nibbles::unpack(k), v);
+    }
+    let _ = hb.root();
+    hb.take_proof_nodes()
+        .into_nodes_sorted()
+        .into_iter()
+        .filter(|(path, _)| target.starts_with(path))
+        .map(|(_, node)| node)
+        .collect()
+}
+
+fn lookup_inner(root: B256, key: B256, proof: &[Bytes], walked: &mut Vec<Bytes>) -> Result<Option<Vec<u8>>, ProofError> {
     if root == EMPTY_ROOT_HASH {
         return Ok(None);
     }
@@ -34,10 +66,15 @@ pub fn lookup(root: B256, key: B256, proof: &[Bytes]) -> Result<Option<Vec<u8>>,
     let path = Nibbles::unpack(key);
     let mut pos = 0usize;
     let mut cur: Vec<u8> = nodes.get(&root).ok_or(ProofError::MissingNode(root))?.to_vec();
-    let resolve = |child: &RlpNode| -> Result<Vec<u8>, ProofError> {
+    walked.push(Bytes::copy_from_slice(&cur));
+    let mut resolve = |child: &RlpNode| -> Result<Vec<u8>, ProofError> {
         match child.as_hash() {
-            Some(h) => nodes.get(&h).map(|n| n.to_vec()).ok_or(ProofError::MissingNode(h)),
-            None => Ok(child.to_vec()), // inlined node (< 32 bytes)
+            Some(h) => {
+                let n = nodes.get(&h).map(|n| n.to_vec()).ok_or(ProofError::MissingNode(h))?;
+                walked.push(Bytes::copy_from_slice(&n));
+                Ok(n)
+            }
+            None => Ok(child.to_vec()), // inlined node (< 32 bytes): part of its parent
         }
     };
     loop {
@@ -168,5 +205,20 @@ mod tests {
         let k = keccak256([1u8]);
         let leaves = vec![(k, Bytes::from_static(&[0x01])), (k, Bytes::from_static(&[0x02]))];
         assert_eq!(root_of(leaves), None);
+    }
+
+    #[test]
+    fn proof_paths_are_ordered_and_self_verifying() {
+        let keys: Vec<B256> = (1..=40u64).map(|i| keccak256(U256::from(i).to_be_bytes::<32>())).collect();
+        let (root, leaves, proof) = trie(40, &keys[..1]);
+        let (v, path) = lookup_path(root, keys[0], &proof).unwrap();
+        assert!(v.is_some());
+        assert_eq!(keccak256(&path[0]), root); // starts at the root
+        // The ordered path alone (no extra nodes) proves the key again.
+        assert_eq!(lookup(root, keys[0], &path).unwrap(), v);
+        // Built from the whole trie: same answer.
+        let built = proof_from_leaves(leaves, keys[0]);
+        assert_eq!(keccak256(&built[0]), root);
+        assert_eq!(lookup(root, keys[0], &built).unwrap(), v);
     }
 }

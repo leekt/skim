@@ -6,8 +6,12 @@ skim serves standard Ethereum JSON-RPC over HTTP and WebSocket on the same addre
 | Method | Notes |
 |---|---|
 | `eth_call` | Local revm. Unknown state is fetched (verified) first. Honours `gasPrice` / `maxFeePerGas` / `maxPriorityFeePerGas` (0 if omitted, as nodes do), `accessList`, `authorizationList` (EIP-7702) and **state overrides** (`balance`, `nonce`, `code`, `state`, `stateDiff`). Blob fields are rejected (`-32602`), never ignored. |
-| `eth_simulateV1` | Sequences of calls across simulated blocks (each call sees earlier calls' writes), with per-block `blockOverrides` (number, time, gas limit, fee recipient, base fee, prevrandao) and `stateOverrides`. Per call: `status`, `returnData`, `gasUsed`, `logs`, `error`. Not yet: `validation: true`, `traceTransfers`. |
-| `debug_traceCall` | geth tracers: default (struct logs), `callTracer`, `prestateTracer`, `noopTracer`, with `stateOverrides`. Not yet: `blockOverrides`, other tracers. |
+| `eth_simulateV1` | Sequences of calls across simulated blocks (each call sees earlier calls' writes), with per-block `blockOverrides` (number, time, gas limit, fee recipient, base fee, prevrandao) and `stateOverrides`. Per call: `status`, `returnData`, `gasUsed`, `logs`, `error`. `validation: true` checks nonces, balances and EIP-1559 base fees (simulated blocks get proper base fees) with the spec's error codes (e.g. `-38012`). `traceTransfers`: on Glamsterdam, ETH transfers already emit native EIP-7708 logs, so these are what you get. |
+| `debug_traceCall` | geth tracers: default (struct logs), `callTracer`, `prestateTracer`, `4byteTracer`, `muxTracer`, `noopTracer`, with `stateOverrides` and `blockOverrides`. Not yet: `flatCallTracer`, JS tracers. |
+| `eth_createAccessList` | geth's algorithm (iterate until the list is stable; gas is measured with the final list). |
+| `eth_getProof` | EIP-1186 proofs assembled from SNAP answers and verified against the block's state root before they're returned. Only for recent blocks, because peers serve only recent state roots. |
+| `eth_feeHistory` | Base fees (including the next block's) and gas-used ratios from headers; reward percentiles with geth's algorithm, from verified bodies and receipts. Blob fee fields are omitted (the blob-parameter schedule isn't tracked yet). |
+| `eth_getBlockReceipts`, `eth_getTransactionByBlock{Number,Hash}AndIndex`, `eth_getBlockTransactionCountBy{Number,Hash}`, `eth_getUncle*` | From verified bodies and receipts; uncles are always empty. |
 | `eth_estimateGas` | Binary search on local execution, once the first run made the state local. |
 | `eth_getBalance`, `eth_getCode`, `eth_getStorageAt` | Tracked: local. Untracked: one verified fetch. |
 | `eth_getTransactionCount` | `pending` adds transactions sent through this skim and not yet included (gap-free nonces only). |
@@ -15,7 +19,7 @@ skim serves standard Ethereum JSON-RPC over HTTP and WebSocket on the same addre
 | `eth_getTransactionByHash` | Transactions sent through skim (pending or included), and any transaction in the last 2,048 indexed blocks. |
 | `eth_getTransactionReceipt` | `null` until included. Then built from the block's receipts, fetched from peers and checked against `receiptsRoot`. |
 | `eth_getLogs` | Address / topics / `fromBlock`–`toBlock` / `blockHash`. Range ≤ `--max-logs-range` (2,048). Only blocks whose bloom (and, for followed blocks, BAL) can match have their receipts fetched; receipts are verified. |
-| `eth_getBlockByNumber`, `eth_getBlockByHash` | Header fields, plus transaction **hashes** when skim indexed the block. Full transaction objects: not yet. |
+| `eth_getBlockByNumber`, `eth_getBlockByHash` | Header fields plus transaction hashes, or full transaction objects with `true`. Bodies are verified against `transactionsRoot`. |
 | `eth_blockNumber` | The latest **state-ready** block. |
 | `eth_chainId`, `net_version`, `net_listening`, `eth_syncing`, `web3_clientVersion` | |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas` | Head base fee + 1 gwei tip, and the 1 gwei tip. |
@@ -56,10 +60,13 @@ viem's `watch*` helpers use these automatically with `webSocket(...)`.
 | `-32602` / `-32601` | Bad params / unknown method. |
 
 ## Not yet
-`eth_createAccessList`, `eth_feeHistory`, `eth_getProof`, `debug_traceTransaction`, full transactions in blocks, `newPendingTransactions`.
+`debug_traceTransaction`, `flatCallTracer`, JS tracers, `newPendingTransactions`, blob fee fields in `eth_feeHistory`.
 
 ## Compatibility notes
-- **Checked against a reference:** state overrides, `eth_simulateV1` and the three tracers were checked against Nethermind at the same block. All were identical (`docs/experiments/tools/sim_trace_check.py`).
+- **Checked against references:** state overrides, `eth_simulateV1` (including validation), all tracers, block data, receipts, `eth_getProof`, `eth_feeHistory` and `eth_createAccessList` were checked against Nethermind and geth (Infura) at the same block. Everything was identical (`sim_trace_check.py`, `rpc_gaps_check.py`).
+- **Where the clients disagree, skim follows geth:**
+  - `eth_feeHistory` rewards: Nethermind computes them differently, and `eth_createAccessList` returned no list on Nethermind.
+  - `muxTracer`: Nethermind doesn't implement it. skim's mux output equals its standalone tracers.
 - **Calls without `gas`:** skim uses the block gas limit; nodes differ here (Nethermind: 100M).
 - **EIP-8037 gas breakdown in `callTracer`:** the field names aren't standardized across clients yet. skim says `executionGasUsed`, Nethermind `regularGasUsed`.
 - **Fee recipient in `prestateTracer`:** it is included, as geth and Nethermind do, even though skim's calls charge no fees.

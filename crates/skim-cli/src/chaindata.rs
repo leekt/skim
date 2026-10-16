@@ -462,15 +462,22 @@ impl ChainData {
         let Some((n, bh, h, i)) = self.locate(&hash) else { return Ok(Value::Null) };
         let receipts = self.block_receipts(bh, &h).await?;
         let raw = self.block_txs(bh, &h).await?;
-        let r = receipts.get(i as usize).ok_or_else(|| DataError::Unavailable("receipt index out of range".into()))?;
-        let (tx, from) = Self::decode_any(&raw[i as usize])?;
-        let prev = if i == 0 { 0 } else { receipts[i as usize - 1].cumulative_gas_used };
-        let first_log: u64 = receipts[..i as usize].iter().map(|r| r.logs.len() as u64).sum();
+        Self::receipt_json(n, bh, &h, i as usize, &receipts, &raw)
+    }
+
+    /// Receipt `i` of a block, in the shape nodes return.
+    fn receipt_json(n: u64, bh: B256, h: &Header, i: usize, receipts: &[Receipt], raw: &[Bytes]) -> Result<Value, DataError> {
+        let r = receipts.get(i).ok_or_else(|| DataError::Unavailable("receipt index out of range".into()))?;
+        let rawtx = raw.get(i).ok_or_else(|| DataError::Unavailable("transaction index out of range".into()))?;
+        let hash = keccak256(rawtx);
+        let (tx, from) = Self::decode_any(rawtx)?;
+        let prev = if i == 0 { 0 } else { receipts[i - 1].cumulative_gas_used };
+        let first_log: u64 = receipts[..i].iter().map(|r| r.logs.len() as u64).sum();
         let logs: Vec<Value> = r
             .logs
             .iter()
             .enumerate()
-            .map(|(k, l)| Self::log_json(l, bh, n, h.timestamp, hash, i, first_log + k as u64))
+            .map(|(k, l)| Self::log_json(l, bh, n, h.timestamp, hash, i as u32, first_log + k as u64))
             .collect();
         let contract = tx.to().is_none().then(|| from.create(tx.nonce()));
         Ok(json!({
@@ -483,6 +490,109 @@ impl ChainData {
             "logs": logs, "logsBloom": r.bloom(),
             "type": format!("{:#x}", tx.ty()), "status": if r.success { "0x1" } else { "0x0" },
         }))
+    }
+
+    /// `eth_getBlockReceipts`: every receipt of a block (verified against `receiptsRoot`).
+    pub async fn block_receipts_json(&self, n: u64, bh: B256, h: &Header) -> Result<Value, DataError> {
+        let receipts = self.block_receipts(bh, h).await?;
+        let raw = self.block_txs(bh, h).await?;
+        (0..raw.len()).map(|i| Self::receipt_json(n, bh, h, i, &receipts, &raw)).collect::<Result<Vec<_>, _>>().map(Value::Array)
+    }
+
+    /// A block's transactions: hashes, or full objects (body verified against `transactionsRoot`).
+    pub async fn block_transactions_json(&self, n: u64, bh: B256, h: &Header, full: bool) -> Result<Vec<Value>, DataError> {
+        if h.transactions_root == alloy_consensus::EMPTY_ROOT_HASH {
+            return Ok(Vec::new());
+        }
+        if !full && let Some(hs) = self.block_tx_hashes(n, bh) {
+            return Ok(hs.iter().map(|x| json!(x)).collect());
+        }
+        let raw = self.block_txs(bh, h).await?;
+        if !full {
+            return Ok(raw.iter().map(|r| json!(keccak256(r))).collect());
+        }
+        raw.iter()
+            .enumerate()
+            .map(|(i, r)| Self::decode_any(r).map(|(tx, from)| Self::tx_json(&tx, from, Some((n, bh, h, i as u32)))))
+            .collect()
+    }
+
+    /// `eth_feeHistory` for `count` blocks ending at `newest` (resolved). Base fees and gas ratios
+    /// come from headers; reward percentiles need the blocks' transactions and receipts, fetched
+    /// (verified) only when percentiles are asked for. Blob fee fields are omitted: they depend on
+    /// the network's blob-parameter schedule, which skim doesn't track yet.
+    pub async fn fee_history(&self, count: u64, newest: u64, percentiles: &[f64]) -> Result<Value, DataError> {
+        if count == 0 {
+            return Ok(json!({"oldestBlock": "0x0", "baseFeePerGas": [], "gasUsedRatio": []}));
+        }
+        if percentiles.iter().any(|p| !(0.0..=100.0).contains(p)) || percentiles.windows(2).any(|w| w[0] > w[1]) {
+            return Err(DataError::Invalid("reward percentiles must be ascending, within 0..=100".into()));
+        }
+        let count = count.min(1024).min(newest + 1);
+        let oldest = newest + 1 - count;
+        self.ensure_headers(oldest).await?;
+        let headers: Vec<(B256, Arc<Header>)> = {
+            let g = self.inner.read();
+            (oldest..=newest)
+                .map(|n| g.headers.get(&n).cloned().ok_or_else(|| DataError::Unavailable(format!("no header for block {n}"))))
+                .collect::<Result<_, _>>()?
+        };
+        let mut base_fees: Vec<Value> = headers.iter().map(|(_, h)| json!(format!("{:#x}", h.base_fee_per_gas.unwrap_or_default()))).collect();
+        let last = &headers.last().expect("count >= 1").1;
+        let next = last.next_block_base_fee(alloy_consensus::private::alloy_eips::eip1559::BaseFeeParams::ethereum()).unwrap_or_default();
+        base_fees.push(json!(format!("{next:#x}")));
+        let ratios: Vec<Value> = headers.iter().map(|(_, h)| json!(if h.gas_limit == 0 { 0.0 } else { h.gas_used as f64 / h.gas_limit as f64 })).collect();
+        let mut out = json!({"oldestBlock": format!("{oldest:#x}"), "baseFeePerGas": base_fees, "gasUsedRatio": ratios});
+        if !percentiles.is_empty() {
+            let rewards: Vec<Result<Value, DataError>> = futures::stream::iter(headers.iter().cloned())
+                .map(|(bh, h)| async move {
+                    let base = h.base_fee_per_gas.unwrap_or_default();
+                    if h.gas_used == 0 || h.transactions_root == alloy_consensus::EMPTY_ROOT_HASH {
+                        return Ok(json!(percentiles.iter().map(|_| "0x0").collect::<Vec<_>>()));
+                    }
+                    let raw = self.block_txs(bh, &h).await?;
+                    let receipts = self.block_receipts(bh, &h).await?;
+                    // (effective tip, gas used) per transaction, ordered by tip (as geth does).
+                    let mut txs: Vec<(u128, u64)> = Vec::with_capacity(raw.len());
+                    let mut prev = 0u64;
+                    for (r, rec) in raw.iter().zip(receipts.iter()) {
+                        let (tx, _) = Self::decode_any(r)?;
+                        let tip = tx.effective_tip_per_gas(base).unwrap_or_default();
+                        txs.push((tip, rec.cumulative_gas_used - prev));
+                        prev = rec.cumulative_gas_used;
+                    }
+                    txs.sort_by_key(|t| t.0);
+                    let total = h.gas_used; // geth's threshold basis: the header's gas used
+                    let mut out = Vec::with_capacity(percentiles.len());
+                    let (mut i, mut acc) = (0usize, txs.first().map_or(0, |t| t.1));
+                    for p in percentiles {
+                        let threshold = (total as f64 * p / 100.0) as u64;
+                        while acc < threshold && i + 1 < txs.len() {
+                            i += 1;
+                            acc += txs[i].1;
+                        }
+                        out.push(format!("{:#x}", txs.get(i).map_or(0, |t| t.0)));
+                    }
+                    Ok(json!(out))
+                })
+                .buffered(8)
+                .collect()
+                .await;
+            out["reward"] = Value::Array(rewards.into_iter().collect::<Result<Vec<_>, _>>()?);
+        }
+        Ok(out)
+    }
+
+    /// Transaction `i` of a block, or `null` if there is none.
+    pub async fn transaction_at(&self, n: u64, bh: B256, h: &Header, i: usize) -> Result<Value, DataError> {
+        if h.transactions_root == alloy_consensus::EMPTY_ROOT_HASH {
+            return Ok(Value::Null);
+        }
+        let raw = self.block_txs(bh, h).await?;
+        match raw.get(i) {
+            Some(r) => Self::decode_any(r).map(|(tx, from)| Self::tx_json(&tx, from, Some((n, bh, h, i as u32)))),
+            None => Ok(Value::Null),
+        }
     }
 
     /// Transaction hashes of an indexed block (for `eth_getBlockBy*`).

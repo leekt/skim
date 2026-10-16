@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use alloy_consensus::Header;
 use alloy_primitives::{Address, B256, Bytes, U256};
-use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag, BlockTransactions, TransactionRequest};
+use alloy_rpc_types_eth::{BlockId, BlockNumberOrTag, TransactionRequest};
 use axum::{Json, Router, extract::State, routing::post};
 use revm::{
     context::{TxEnv, result::ExecutionResult},
@@ -59,6 +59,7 @@ impl From<SimError> for RpcError {
         match e {
             SimError::Evm(m) => Self::new(-32000, m),
             SimError::Unsupported(m) => Self::params(format!("not supported: {m}")),
+            SimError::Invalid { code, message } => Self::new(code, message),
             other => Self::unavailable(other.to_string()),
         }
     }
@@ -218,6 +219,7 @@ impl Rpc {
             .data(data)
             .value(req.value.unwrap_or_default())
             .gas_limit(gas)
+            .nonce(req.nonce.unwrap_or_default())
             .chain_id(Some(skim_sim::env::SEPOLIA_CHAIN_ID));
         // Fees: as nodes do for eth_call, 0 unless given (GASPRICE then sees the given price).
         b = match (req.gas_price, req.max_fee_per_gas, req.max_priority_fee_per_gas) {
@@ -270,17 +272,57 @@ impl Rpc {
                     Err(e) => return Err(e),
                 };
                 let h = self.header(&b)?;
-                let block: Block<alloy_rpc_types_eth::Transaction> = Block {
-                    header: alloy_rpc_types_eth::Header::new((*h).clone()),
-                    uncles: vec![],
-                    // Hashes when skim indexed the block's transactions (gossip or a fetched body).
-                    transactions: BlockTransactions::Hashes(
-                        self.chain.as_ref().and_then(|c| c.block_tx_hashes(b.number, b.hash)).map(|v| v.to_vec()).unwrap_or_default(),
-                    ),
-                    withdrawals: None,
+                let full: bool = param(params, 1)?.unwrap_or(false);
+                let mut v = serde_json::to_value(alloy_rpc_types_eth::Header::new((*h).clone())).unwrap();
+                let txs = match &self.chain {
+                    Some(c) => c.block_transactions_json(b.number, b.hash, &h, full).await?,
+                    None => Vec::new(),
                 };
-                Ok(serde_json::to_value(block).unwrap())
+                v["transactions"] = Value::Array(txs);
+                v["uncles"] = json!([]);
+                Ok(v)
             }
+            "eth_feeHistory" => {
+                let count: alloy_primitives::U64 = need(params, 0)?;
+                let newest = self.resolve_block(Some(BlockId::Number(need::<BlockNumberOrTag>(params, 1)?)), latest)?;
+                let percentiles: Vec<f64> = param(params, 2)?.unwrap_or_default();
+                Ok(self.chain()?.fee_history(count.to(), newest.number, &percentiles).await?)
+            }
+            "eth_getBlockReceipts" => {
+                let id: BlockId = need(params, 0)?;
+                let b = match self.resolve_block(Some(id), latest) {
+                    Ok(b) => b,
+                    Err(e) if e.code == -32002 => return Ok(Value::Null),
+                    Err(e) => return Err(e),
+                };
+                let h = self.header(&b)?;
+                Ok(self.chain()?.block_receipts_json(b.number, b.hash, &h).await?)
+            }
+            "eth_getTransactionByBlockNumberAndIndex" | "eth_getTransactionByBlockHashAndIndex" => {
+                let id: BlockId = if method.ends_with("HashAndIndex") {
+                    BlockId::from(need::<B256>(params, 0)?)
+                } else {
+                    BlockId::Number(need::<BlockNumberOrTag>(params, 0)?)
+                };
+                let i: alloy_primitives::U64 = need(params, 1)?;
+                let Ok(b) = self.resolve_block(Some(id), latest) else { return Ok(Value::Null) };
+                let h = self.header(&b)?;
+                Ok(self.chain()?.transaction_at(b.number, b.hash, &h, i.to::<usize>()).await?)
+            }
+            "eth_getBlockTransactionCountByNumber" | "eth_getBlockTransactionCountByHash" => {
+                let id: BlockId = if method.ends_with("ByHash") {
+                    BlockId::from(need::<B256>(params, 0)?)
+                } else {
+                    BlockId::Number(need::<BlockNumberOrTag>(params, 0)?)
+                };
+                let Ok(b) = self.resolve_block(Some(id), latest) else { return Ok(Value::Null) };
+                let h = self.header(&b)?;
+                let n = self.chain()?.block_transactions_json(b.number, b.hash, &h, false).await?.len();
+                Ok(hex_u64(n as u64))
+            }
+            // Post-merge blocks have no uncles.
+            "eth_getUncleCountByBlockNumber" | "eth_getUncleCountByBlockHash" => Ok(hex_u64(0)),
+            "eth_getUncleByBlockNumberAndIndex" | "eth_getUncleByBlockHashAndIndex" => Ok(Value::Null),
             "eth_getBalance" | "eth_getTransactionCount" | "eth_getCode" => {
                 let a: Address = need(params, 0)?;
                 let b = self.resolve_block(param(params, 1)?, latest)?;
@@ -310,7 +352,7 @@ impl Rpc {
                 let header = self.header(&b)?;
                 if let Some(overrides) = param::<alloy_rpc_types_eth::state::StateOverride>(params, 2)? {
                     // State overrides: the call runs on an overlay; the store is never modified.
-                    let blocks = [skim_sim::multi::SimBlock { block: None, state: Some(overrides), calls: vec![self.tx_env(req, &header)?] }];
+                    let blocks = [skim_sim::multi::SimBlock { block: None, state: Some(overrides), calls: vec![self.tx_env(req, &header)?.into()] }];
                     let out = sim.simulate(&b, &blocks, skim_sim::multi::Placement::SameBlock).await?;
                     return Self::exec_result(&out[0].calls[0]);
                 }
@@ -384,35 +426,89 @@ impl Rpc {
             }
             "eth_simulateV1" => {
                 let payload: alloy_rpc_types_eth::simulate::SimulatePayload = need(params, 0)?;
-                if payload.validation {
-                    return Err(RpcError::params("validation: true is not supported (simulations run without nonce/balance/fee checks)"));
-                }
-                if payload.trace_transfers {
-                    return Err(RpcError::params("traceTransfers is not supported yet"));
-                }
                 let b = self.resolve_block(param(params, 1)?, latest)?;
                 let header = self.header(&b)?;
                 let mut blocks = Vec::with_capacity(payload.block_state_calls.len());
                 for blk in payload.block_state_calls {
                     let mut calls = Vec::with_capacity(blk.calls.len());
                     for c in blk.calls {
-                        calls.push(self.tx_env(c, &header)?);
+                        let auto_nonce = c.nonce.is_none();
+                        let auto_fee = c.gas_price.is_none() && c.max_fee_per_gas.is_none() && c.max_priority_fee_per_gas.is_none();
+                        let auto_gas = c.gas.is_none();
+                        calls.push(skim_sim::multi::SimCall { tx: self.tx_env(c, &header)?, auto_nonce, auto_fee, auto_gas });
                     }
                     blocks.push(skim_sim::multi::SimBlock { block: blk.block_overrides, state: blk.state_overrides, calls });
                 }
-                let out = sim.simulate(&b, &blocks, skim_sim::multi::Placement::NextBlocks).await?;
+                let opts = skim_sim::multi::SimOptions { validation: payload.validation, trace_transfers: payload.trace_transfers };
+                let out = sim.simulate_with(&b, &blocks, skim_sim::multi::Placement::NextBlocks, opts).await?;
                 Ok(Value::Array(out.iter().map(simulated_block_json).collect()))
+            }
+            "eth_getProof" => {
+                let a: Address = need(params, 0)?;
+                // Storage keys may be short hex ("0x0"), and are echoed back exactly as given.
+                let raw_keys: Vec<String> = need(params, 1)?;
+                let keys: Vec<B256> = raw_keys
+                    .iter()
+                    .map(|k| k.parse::<U256>().map(|v| B256::from(v.to_be_bytes::<32>())).map_err(|e| RpcError::params(format!("storage key {k}: {e}"))))
+                    .collect::<Result<_, _>>()?;
+                let b = self.resolve_block(param(params, 2)?, latest)?;
+                let slots: Vec<U256> = keys.iter().map(|k| U256::from_be_bytes(k.0)).collect();
+                // Peers serve proofs only for recent state roots; the newest block may not be
+                // served for a second or two after it arrives.
+                let tr = sim.sched.transport();
+                for attempt in 0..6 {
+                    let peers: Vec<_> = tr.net.peers().into_iter().filter(|(_, p)| p.snap1 || p.snap2).map(|(id, _)| id).collect();
+                    for peer in peers.into_iter().take(4) {
+                        if let Ok(Some(p)) = tr.get_proof(peer, b.state_root, a, &slots).await {
+                            // An absent account reports zero hashes (as geth and Nethermind do).
+                            let (balance, nonce, code_hash, storage_hash) = match &p.account {
+                                Some(acc) => (acc.balance, acc.nonce, acc.code_hash, acc.storage_root),
+                                None => (U256::ZERO, 0, B256::ZERO, B256::ZERO),
+                            };
+                            let storage: Vec<Value> = raw_keys
+                                .iter()
+                                .zip(p.storage.iter())
+                                .map(|(k, (_, v, proof))| json!({"key": k, "value": v, "proof": proof}))
+                                .collect();
+                            return Ok(json!({"address": a, "accountProof": p.account_proof, "balance": balance, "codeHash": code_hash,
+                                "nonce": hex_u64(nonce), "storageHash": storage_hash, "storageProof": storage}));
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt + 1))).await;
+                }
+                Err(RpcError::unavailable(format!("no peer served a proof for block {} (peers keep only recent state roots)", b.number)))
+            }
+            "eth_createAccessList" => {
+                let req: TransactionRequest = need(params, 0)?;
+                let b = self.resolve_block(param(params, 1)?, latest)?;
+                let overrides: Option<alloy_rpc_types_eth::state::StateOverride> = param(params, 2)?;
+                let header = self.header(&b)?;
+                let out = sim.create_access_list(&b, self.tx_env(req, &header)?, overrides).await?;
+                let mut v = json!({"accessList": out.access_list, "gasUsed": hex_u64(out.gas_used)});
+                match &out.result {
+                    ExecutionResult::Revert { .. } => v["error"] = json!("execution reverted"),
+                    ExecutionResult::Halt { reason, .. } => v["error"] = json!(format!("{reason:?}")),
+                    ExecutionResult::Success { .. } => {}
+                }
+                Ok(v)
             }
             "debug_traceCall" => {
                 let req: TransactionRequest = need(params, 0)?;
                 let b = self.resolve_block(param(params, 1)?, latest)?;
-                let opts: alloy_rpc_types_trace::geth::GethDebugTracingCallOptions = param(params, 2)?.unwrap_or_default();
-                if opts.block_overrides.is_some() {
-                    return Err(RpcError::params("blockOverrides in debug_traceCall are not supported yet"));
+                let mut raw_opts = params.get(2).cloned().unwrap_or(Value::Null);
+                // muxTracer: tracers that take no config (4byte, noop) are often given `{}`.
+                if let Some(cfg) = raw_opts.get_mut("tracerConfig").and_then(Value::as_object_mut) {
+                    for (k, v) in cfg.iter_mut() {
+                        if matches!(k.as_str(), "4byteTracer" | "noopTracer") && v.as_object().is_some_and(|o| o.is_empty()) {
+                            *v = Value::Null;
+                        }
+                    }
                 }
+                let opts: alloy_rpc_types_trace::geth::GethDebugTracingCallOptions =
+                    if raw_opts.is_null() { Default::default() } else { serde_json::from_value(raw_opts).map_err(|e| RpcError::params(format!("param 2: {e}")))? };
                 let header = self.header(&b)?;
                 let tx = self.tx_env(req, &header)?;
-                let trace = sim.trace_call(&b, tx, opts.state_overrides, opts.tracing_options).await?;
+                let trace = sim.trace_call(&b, tx, opts.state_overrides, opts.block_overrides, opts.tracing_options).await?;
                 Ok(serde_json::to_value(trace).unwrap())
             }
             "skim_status" => {

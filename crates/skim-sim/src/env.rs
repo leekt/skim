@@ -41,3 +41,11 @@ pub fn call_cfg() -> CfgEnv {
     cfg.tx_chain_id_check = false;
     cfg
 }
+
+/// `eth_simulateV1` with `validation: true`: nonce, balance, base-fee and sender checks on, fees
+/// charged (to the block's fee recipient), as a block builder would.
+pub fn validating_cfg() -> CfgEnv {
+    let mut cfg = CfgEnv::new_with_spec(SPEC);
+    cfg.chain_id = SEPOLIA_CHAIN_ID;
+    cfg
+}
