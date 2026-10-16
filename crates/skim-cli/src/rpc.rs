@@ -666,6 +666,13 @@ impl Rpc {
                     "el_peers": peers.len(),
                     "snap_peers": peers.iter().filter(|(_, p)| p.snap1 || p.snap2).count(),
                     "served": self.served_json(),
+                    "snap_fetch": {
+                        "stats": sim.sched.stats(),
+                        "peers": sim.sched.peer_stats().into_iter().map(|(id, p)| {
+                            let client = peers.iter().find(|(x, _)| *x == id).map(|(_, i)| i.client.clone());
+                            json!({"client": client, "ok": p.ok, "errors": p.errors, "ewma_ms": p.ewma_ms, "inflight": p.inflight, "limit": p.limit})
+                        }).collect::<Vec<_>>(),
+                    },
                 }))
             }
             "skim_subscriptionStatus" => Ok(serde_json::to_value(self.subs.as_ref().map(|s| s.status()).unwrap_or_default()).unwrap()),
@@ -681,7 +688,16 @@ impl Rpc {
         };
         let params = req.get("params").cloned().unwrap_or(json!([]));
         let t = std::time::Instant::now();
-        let res = self.dispatch(method, &params, latest).await;
+        let mut res = self.dispatch(method, &params, latest).await;
+        // State that needed fetching while no state peer is connected yet (the first minute or
+        // so after a cold start): say so instead of "incomplete".
+        if let Err(e) = &mut res
+            && e.code == -32002
+            && e.message.starts_with("state still incomplete")
+            && skim_snap::Transport::snap_peers(self.sim.sched.transport()).is_empty()
+        {
+            e.message = "no SNAP state peers connected yet: skim is still finding execution-layer peers (up to a minute or two after a cold start); retry shortly".into();
+        }
         tracing::debug!(method, ms = t.elapsed().as_secs_f64() * 1e3, ok = res.is_ok(), "rpc");
         match res {
             Ok(v) => json!({"jsonrpc": "2.0", "id": id, "result": v}),

@@ -70,6 +70,8 @@ pub enum FetchError {
     Exhausted(u32),
     #[error("deadline exceeded")]
     Deadline,
+    #[error("no SNAP peers connected")]
+    NoPeers,
 }
 
 /// A peer's answer to a point lookup.
@@ -135,6 +137,9 @@ pub struct Config {
     /// Send one duplicate to another peer if no answer after this long.
     pub hedge_after: Duration,
     pub deadline: Duration,
+    /// How long an interactive job waits while no SNAP peer is connected at all (e.g. the first
+    /// minute after a cold start) before failing with [`FetchError::NoPeers`].
+    pub no_peer_wait: Duration,
     pub code_batch: usize,
     /// Use only the N peers with the best latency (experiments; `None` = all).
     pub max_peers: Option<usize>,
@@ -149,6 +154,7 @@ impl Default for Config {
             max_attempts: 8,
             hedge_after: Duration::from_millis(1200),
             deadline: Duration::from_secs(15),
+            no_peer_wait: Duration::from_secs(3),
             code_batch: 32,
             max_peers: None,
         }
@@ -494,13 +500,22 @@ impl<T: Transport> Inner<T> {
         // Deadlines and hedges.
         let now = Instant::now();
         let mut expired = Vec::new();
+        let mut no_peers = Vec::new();
         let mut hedge = Vec::new();
         for (k, j) in &st.jobs {
             // Waiting for peer capacity is not failure: the deadline runs from the first send,
-            // or from creation only while there are no peers at all.
+            // or from creation only while there are no peers at all (shorter for interactive
+            // jobs, so a caller hears "no peers" instead of waiting out the full deadline).
             let overdue = match j.first_sent {
                 Some(t) => now.duration_since(t) > self.cfg.deadline,
-                None => st.peers.is_empty() && now.duration_since(j.created) > self.cfg.deadline,
+                None if st.peers.is_empty() => {
+                    let wait = if j.low { self.cfg.deadline } else { self.cfg.no_peer_wait };
+                    if now.duration_since(j.created) > wait {
+                        no_peers.push(*k);
+                    }
+                    false
+                }
+                None => false,
             };
             if overdue {
                 expired.push(*k);
@@ -515,6 +530,9 @@ impl<T: Transport> Inner<T> {
         }
         for k in expired {
             Self::finish(&mut st, &k, Err(FetchError::Deadline));
+        }
+        for k in no_peers {
+            Self::finish(&mut st, &k, Err(FetchError::NoPeers));
         }
         for k in hedge {
             let j = st.jobs.get_mut(&k).unwrap();

@@ -195,7 +195,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let saved = match &persist {
         Some(p) => {
-            net.add_peers(&crate::persist::load_peers(p));
+            let known = crate::persist::load_peers(p);
+            tracing::info!(n = known.len(), "dialing saved EL peers");
+            net.add_peers(&known);
             crate::persist::spawn_peer_saver(p.clone(), net.clone());
             p.load().unwrap_or_else(|e| {
                 tracing::warn!("restart snapshot unreadable, starting empty: {e}");

@@ -29,6 +29,8 @@ pub fn node_key(p: &Persist) -> anyhow::Result<[u8; 32]> {
     Ok(k)
 }
 
+const MAX_SAVED_PEERS: usize = 64;
+
 pub fn load_peers(p: &Persist) -> Vec<(Peer, std::net::SocketAddr)> {
     let Ok(Some(raw)) = p.get_meta("peers") else { return Vec::new() };
     String::from_utf8_lossy(&raw)
@@ -48,7 +50,16 @@ pub fn spawn_peer_saver(p: Arc<Persist>, net: ElNet) {
             if peers.is_empty() {
                 continue;
             }
-            let text: String = peers.iter().map(|(id, a)| format!("{id}@{a}\n")).collect();
+            // This run's peers first, then the previously saved ones (peers that were full today
+            // may have room next time), up to MAX_SAVED_PEERS.
+            let mut seen = std::collections::HashSet::new();
+            let text: String = peers
+                .into_iter()
+                .chain(load_peers(&p))
+                .filter(|(id, _)| seen.insert(*id))
+                .take(MAX_SAVED_PEERS)
+                .map(|(id, a)| format!("{id}@{a}\n"))
+                .collect();
             if let Err(e) = p.set_meta("peers", text.as_bytes()) {
                 tracing::warn!("saving peers: {e}");
             }

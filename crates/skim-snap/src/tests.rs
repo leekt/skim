@@ -209,8 +209,10 @@ async fn exhausts_when_every_peer_fails() {
 #[tokio::test]
 async fn waits_for_peers_then_deadline() {
     let m = Mock::new(&[]);
-    let s = Scheduler::new(m, Config { deadline: Duration::from_millis(200), ..cfg() });
-    assert_eq!(s.fetch(&[slot(1)]).await[0], Err(FetchError::Deadline));
+    let s = Scheduler::new(m, Config { deadline: Duration::from_millis(200), no_peer_wait: Duration::from_millis(50), ..cfg() });
+    let t = std::time::Instant::now();
+    assert_eq!(s.fetch(&[slot(1)]).await[0], Err(FetchError::NoPeers));
+    assert!(t.elapsed() < Duration::from_millis(190), "interactive jobs give up early when no peer exists");
 }
 
 #[tokio::test]

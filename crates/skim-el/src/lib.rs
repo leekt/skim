@@ -95,6 +95,9 @@ pub struct ElNet {
     timeout: Duration,
     serve: serve::Source,
     serve_stats: Arc<serve::ServeStats>,
+    /// Peers seen this run that we dialed (so the address is their listen address) and that
+    /// speak eth/69+: (address, offers SNAP). Saved for the next start.
+    dialable: Arc<RwLock<HashMap<PeerId, (std::net::SocketAddr, bool)>>>,
     /// Set once the owner reports its own head ([`Self::set_head`]); the poller then stops.
     external_head: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -168,6 +171,7 @@ impl ElNet {
             serve: Default::default(),
             serve_stats: Default::default(),
             external_head: Default::default(),
+            dialable: Default::default(),
         };
         tokio::spawn(serve::run(req_rx, net.serve.clone(), net.serve_stats.clone()));
         net.spawn_tracker();
@@ -177,6 +181,7 @@ impl ElNet {
 
     fn spawn_tracker(&self) {
         let peers = self.peers.clone();
+        let (handle, dialable) = (self.handle.clone(), self.dialable.clone());
         let mut events = self.handle.event_listener();
         tokio::spawn(async move {
             while let Some(ev) = events.next().await {
@@ -195,6 +200,19 @@ impl ElNet {
                             .collect();
                         tracing::info!(peer = %info.peer_id, client = %info.client_version,
                             eth = %info.version, snap2, caps = caps.join(","), "session");
+                        if info.version as u8 >= 69 && !info.client_version.starts_with("enrscout") {
+                            // Only outgoing sessions show the peer's listen address.
+                            let snap = caps.iter().any(|c| c.starts_with("snap/"));
+                            let (handle, dialable, id) = (handle.clone(), dialable.clone(), info.peer_id);
+                            tokio::spawn(async move {
+                                use reth_network_api::Peers;
+                                if let Ok(Some(p)) = handle.get_peer_by_id(id).await
+                                    && !p.direction.is_incoming()
+                                {
+                                    dialable.write().insert(id, (p.remote_addr, snap));
+                                }
+                            });
+                        }
                         peers.write().insert(
                             info.peer_id,
                             PeerInfo {
@@ -539,13 +557,11 @@ impl ElNet {
 
     /// Connected peers worth reconnecting to after a restart (real clients on eth/69+):
     /// `(node id, address)`.
+    /// eth/69+ peers seen this run at a dialable address, SNAP-capable ones first.
     pub fn good_peers(&self) -> Vec<(PeerId, std::net::SocketAddr)> {
-        self.peers
-            .read()
-            .iter()
-            .filter(|(_, p)| p.eth_version >= 69 && !p.client.starts_with("enrscout"))
-            .map(|(id, p)| (*id, p.remote_addr))
-            .collect()
+        let mut v: Vec<_> = self.dialable.read().iter().map(|(id, (a, snap))| (!*snap, *id, *a)).collect();
+        v.sort();
+        v.into_iter().map(|(_, id, a)| (id, a)).collect()
     }
 
     /// Dials previously good peers (their addresses may be stale; failed dials are harmless).

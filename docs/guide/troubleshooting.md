@@ -1,12 +1,17 @@
 # Troubleshooting
 
-### `-32002` on reads right after starting
-SNAP-serving EL peers take **1–4 minutes** to connect on public Sepolia. Until then, state skim hasn't seen can't be fetched. Watch for log lines like:
+### `-32002` "no SNAP state peers connected yet"
+SNAP-serving EL peers take **1–4 minutes** to connect on public Sepolia after a cold start. Consensus gossip makes the head ready within seconds, so skim already answers from subscribed state. State it hasn't seen can't be fetched yet: such reads fail after 3 s with this message. Retry shortly. Watch for log lines like:
 ```text
 INFO skim_el: session peer=… client=Geth/… snap2=false
 INFO skim_el: session peer=… client=Nethermind/… snap2=true
 ```
-Subscribed state shows `ready: false` with `missing_keys > 0` in `skim_subscriptionStatus` until then. Open `--el-port` (TCP + UDP) to get peers faster.
+Subscribed state shows `ready: false` with `missing_keys > 0` in `skim_subscriptionStatus` until then. `skim_status.snap_peers` and `skim_status.snap_fetch` show the state peers and their fetch counters.
+
+To get peers faster:
+- **Open `--el-port`** (TCP + UDP).
+- **Keep `--data-dir`** (the default; not `--ephemeral`). skim saves the peers it dialed and re-dials them on start, SNAP-capable ones first. Those peers are often full, though, so this sometimes saves minutes and sometimes doesn't.
+- **Pin a peer you run** with `--trusted-peer`.
 
 ### No `state ready` lines
 skim isn't receiving consensus gossip. Check:

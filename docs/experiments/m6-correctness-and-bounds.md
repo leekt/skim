@@ -154,3 +154,24 @@ Every item is re-checked against its header before it is sent, and envelopes are
 The caches are bounded: BALs of 64 blocks, bodies of 128, and envelopes of 64 slots.
 
 **What memory grows with:** both instances grew about 2 MB per minute until the 256-block `--window` filled (51 min; the recent-BAL index alone was about 42 MB). After that, growth slowed to about 0.3 MB per minute (202 MB at 71 min), as the bounded header and transaction indexes keep filling. `--window 32` keeps a node near 100 MB (chaos soak above).
+
+## On-demand reads right after start
+**Symptom:** `eth_getCode` (and every other read of state skim doesn't track) failed with `-32002 state still incomplete after 1 fetch rounds`, after exactly 15 s. This happened for about the first 1–2 minutes after start.
+
+**Cause:** no SNAP peer was connected yet. Consensus gossip makes the head ready within seconds, but on public Sepolia the first SNAP-serving EL peer took 65 s and 2:08 on two cold starts. Each fetch waited out the scheduler's 15 s deadline, then reported a generic failure.
+
+**Fixes:**
+- Interactive fetches give up after 3 s while no SNAP peer exists (`no_peer_wait`), and RPC says *"no SNAP state peers connected yet … retry shortly"*. Background work keeps the full deadline.
+- `skim_status.snap_fetch` exposes the scheduler's counters and per-peer stats.
+- **Saved peers fixed:** before, only the peers connected at save time were kept (often one), at their *connection* address. For a peer that had dialed in, that is an ephemeral port, which can't be dialed back. Now skim saves every eth/69+ peer it dialed during the run, SNAP-capable first, merged with the previous list (up to 64).
+
+**Restart timing with saved peers:**
+
+| Restart | Saved peers | First SNAP peer |
+|---|---|---|
+| 1 | 10 | 17 s |
+| 2 | 12 | 2:33 (the saved SNAP peers were full) |
+
+Subscribed state didn't wait in either restart: the snapshot replayed from consensus peers in about 2 s.
+
+Once a SNAP peer was connected, cold reads of four unsubscribed contracts (code and balance) answered in 0.26–1.26 s.
