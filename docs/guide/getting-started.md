@@ -16,7 +16,7 @@ The binary is `./target/release/skim`. Nothing else is needed: no node, no datab
 
 | Port | Protocol | What |
 |---|---|---|
-| `127.0.0.1:8545` | HTTP | JSON-RPC (`--rpc`) |
+| `127.0.0.1:8545` | HTTP | JSON-RPC (`--rpc`), and the dashboard at `/dashboard` |
 | `9130` TCP + UDP, `9131` UDP | libp2p / discv5 / QUIC | consensus-layer gossip (`--cl-port`) |
 | `30388` TCP + UDP | RLPx / discv4 | execution-layer peers (`--el-port`) |
 
@@ -73,6 +73,11 @@ curl -s localhost:8545 -H 'content-type: application/json' \
 ```json
 [{"name":"my-pool","ready":true,"block":11919451,"required_keys":5,"missing_keys":0, …}]
 ```
+
+**Not sure what to subscribe?** Run your app against skim and open http://127.0.0.1:8545/dashboard → **Addresses**:
+- It lists every contract your calls read, and whether a subscription pins it.
+- It shows how many keys had to be fetched from the network.
+- It suggests a `skim.yaml` block for the hot ones that aren't pinned.
 
 ## Next
 - [Uniswap V3 and V4 examples (viem)](../../examples): complete, runnable configs and scripts

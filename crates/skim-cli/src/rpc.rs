@@ -169,23 +169,28 @@ pub struct Rpc {
     /// hit this. Only fully resolved outcomes (results and reverts) are cached.
     pub call_cache: parking_lot::Mutex<CallCache>,
     pub cache_calls: bool,
+    /// Usage and latency history for `/dashboard`.
+    pub dash: Arc<crate::dashboard::Dashboard>,
     /// Consensus node counters (envelopes served to peers).
     pub cl_stats: Option<Arc<std::sync::Mutex<skim_cl::NodeStats>>>,
 }
 
+/// Addresses a call read (kept with cached results so cache hits still count as usage).
+type Reads = Arc<[Address]>;
+
 #[derive(Default)]
 pub struct CallCache {
-    map: alloy_primitives::map::HashMap<(B256, B256), Result<Value, (i64, String, Option<Value>)>>,
+    map: alloy_primitives::map::HashMap<(B256, B256), (Result<Value, (i64, String, Option<Value>)>, Reads)>,
 }
 
 impl CallCache {
     const MAX: usize = 20_000;
 
-    fn get(&self, k: &(B256, B256)) -> Option<R> {
-        self.map.get(k).map(|r| r.clone().map_err(|(code, message, data)| RpcError { code, message, data }))
+    fn get(&self, k: &(B256, B256)) -> Option<(R, Reads)> {
+        self.map.get(k).map(|(r, a)| (r.clone().map_err(|(code, message, data)| RpcError { code, message, data }), a.clone()))
     }
 
-    fn put(&mut self, k: (B256, B256), r: &R) {
+    fn put(&mut self, k: (B256, B256), r: &R, reads: Reads) {
         let v = match r {
             Ok(v) => Ok(v.clone()),
             Err(e) if e.code == 3 => Err((e.code, e.message.clone(), e.data.clone())),
@@ -194,7 +199,7 @@ impl CallCache {
         if self.map.len() >= Self::MAX {
             self.map.clear();
         }
-        self.map.insert(k, v);
+        self.map.insert(k, (v, reads));
     }
 }
 
@@ -301,21 +306,36 @@ impl Rpc {
     }
 
     /// `eth_call` without the result cache.
-    async fn eth_call_uncached(&self, params: &Value, b: &BlockRef) -> R {
+    /// The result, and the addresses the call read (for usage counts).
+    async fn eth_call_uncached(&self, params: &Value, b: &BlockRef) -> (R, Reads) {
+        match self.eth_call_inner(params, b).await {
+            Ok((r, reads)) => (r, reads),
+            Err(e) => (Err(e), Arc::from([])),
+        }
+    }
+
+    async fn eth_call_inner(&self, params: &Value, b: &BlockRef) -> Result<(R, Reads), RpcError> {
         let sim = &self.sim;
         let req: TransactionRequest = need(params, 0)?;
         let header = self.header(b)?;
         if let Some(overrides) = param::<alloy_rpc_types_eth::state::StateOverride>(params, 2)? {
             // State overrides: the call runs on an overlay; the store is never modified.
+            let to: Reads = req.to.and_then(|k| k.to().copied()).into_iter().collect();
             let blocks = [skim_sim::multi::SimBlock { block: None, state: Some(overrides), calls: vec![self.tx_env(req, &header)?.into()] }];
             let out = sim.simulate(b, &blocks, skim_sim::multi::Placement::SameBlock).await?;
-            return Self::exec_result(&out[0].calls[0]);
+            self.dash.record_hit(b.number, &to);
+            return Ok((Self::exec_result(&out[0].calls[0]), to));
         }
         let out = sim.call(b, self.tx_env(req, &header)?, Mode::Resolve { max_rounds: 8 }).await?;
+        self.dash.record_call(b.number, &out.access, &out.fetched_accounts, &out.fetched_storage);
+        let mut reads: Vec<Address> = out.access.accounts.clone();
+        reads.extend(out.access.storage.iter().map(|(a, _)| *a));
+        reads.sort();
+        reads.dedup();
         tracing::debug!(number = b.number, predicted_keys = out.predicted.as_ref().map_or(0, |p| p.keys),
             predicted_ms = out.predicted.as_ref().map_or(0.0, |p| p.wall_ms), rounds = out.rounds.len(),
             round_keys = out.rounds.iter().map(|r| r.keys).sum::<usize>(), "eth_call fetches");
-        Self::exec_result(&out.result)
+        Ok((Self::exec_result(&out.result), reads.into()))
     }
 
     fn chain(&self) -> Result<&Arc<ChainData>, RpcError> {
@@ -475,13 +495,15 @@ impl Rpc {
                 let b = self.resolve_block(param(params, 1)?, latest)?;
                 let key = (b.hash, alloy_primitives::keccak256(format!("{}|{}", params.get(0).unwrap_or(&Value::Null), params.get(2).unwrap_or(&Value::Null))));
                 if !self.cache_calls {
-                    return self.eth_call_uncached(params, &b).await;
+                    return self.eth_call_uncached(params, &b).await.0;
                 }
-                if let Some(r) = self.call_cache.lock().get(&key) {
+                let hit = self.call_cache.lock().get(&key);
+                if let Some((r, reads)) = hit {
+                    self.dash.record_hit(b.number, &reads);
                     return r;
                 }
-                let r = self.eth_call_uncached(params, &b).await;
-                self.call_cache.lock().put(key, &r);
+                let (r, reads) = self.eth_call_uncached(params, &b).await;
+                self.call_cache.lock().put(key, &r, reads);
                 r
             }
             "eth_estimateGas" => {
@@ -675,6 +697,7 @@ impl Rpc {
                     },
                 }))
             }
+            "skim_dashboard" => Ok(self.dashboard_json()),
             "skim_subscriptionStatus" => Ok(serde_json::to_value(self.subs.as_ref().map(|s| s.status()).unwrap_or_default()).unwrap()),
             m if OUT_OF_SCOPE.contains(&m) => Err(RpcError::unsupported(m)),
             m => Err(RpcError::new(-32601, format!("method {m} not found"))),
@@ -689,7 +712,11 @@ impl Rpc {
         let params = req.get("params").cloned().unwrap_or(json!([]));
         let t = std::time::Instant::now();
         let res = self.dispatch(method, &params, latest).await;
-        tracing::debug!(method, ms = t.elapsed().as_secs_f64() * 1e3, ok = res.is_ok(), "rpc");
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        tracing::debug!(method, ms, ok = res.is_ok(), "rpc");
+        if method != "skim_dashboard" {
+            self.dash.record_method(method, ms, res.is_ok());
+        }
         match res {
             Ok(v) => json!({"jsonrpc": "2.0", "id": id, "result": v}),
             Err(e) => {
@@ -704,6 +731,97 @@ impl Rpc {
 }
 
 impl Rpc {
+    /// Everything `/dashboard` shows, in one document.
+    fn dashboard_json(&self) -> Value {
+        use crate::dashboard::{by_kind, client_kind, round2};
+        let sim = &self.sim;
+        let head = sim.store.head();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let peers = sim.sched.transport().net.peers();
+        let fetch = sim.sched.peer_stats();
+        let mut el: Vec<Value> = peers
+            .iter()
+            .map(|(id, p)| {
+                let f = fetch.get(id);
+                json!({
+                    "id": format!("{:.10}", id.to_string()),
+                    "client": client_kind(&p.client),
+                    "version": p.client.split('/').nth(1).unwrap_or(""),
+                    "eth": format!("eth/{}", p.eth_version),
+                    "snap": if p.snap2 { "snap/2" } else if p.snap1 { "snap/1" } else { "none" },
+                    "age_min": round2(p.connected_at.elapsed().as_secs_f64() / 60.0),
+                    "snap_ok": f.map_or(0, |f| f.ok),
+                    "snap_errors": f.map_or(0, |f| f.errors),
+                    "ewma_ms": f.map_or(Value::Null, |f| json!(round2(f.ewma_ms))),
+                    "min_ms": f.map_or(Value::Null, |f| json!(round2(f.min_ms))),
+                    "inflight": f.map_or(0, |f| f.inflight),
+                })
+            })
+            .collect();
+        el.sort_by(|a, b| (a["snap"] == "none").cmp(&(b["snap"] == "none")).then(b["snap_ok"].as_u64().cmp(&a["snap_ok"].as_u64())));
+        let (cl, cl_mesh) = match &self.cl_stats {
+            Some(s) => {
+                let s = s.lock().unwrap();
+                let mut v: Vec<Value> = s
+                    .peer_list
+                    .iter()
+                    .map(|p| {
+                        let agent = p.agent.clone().unwrap_or_default();
+                        json!({
+                            "id": format!("{:.12}", p.id),
+                            "client": client_kind(&agent),
+                            "version": agent.split('/').nth(1).unwrap_or(""),
+                            "direction": if p.outbound { "outbound" } else { "inbound" },
+                            "age_min": round2(p.age_s / 60.0),
+                            "gossip_first": p.gossip_first,
+                            "head_slot": p.head_slot,
+                        })
+                    })
+                    .collect();
+                v.sort_by(|a, b| b["gossip_first"].as_u64().cmp(&a["gossip_first"].as_u64()));
+                (v, json!(s.mesh))
+            }
+            None => (vec![], json!({})),
+        };
+        let blocks = self.dash.blocks();
+        let mut arrivals: Vec<f64> = blocks.iter().map(|b| b.arrival_ms).filter(|x| x.is_finite()).collect();
+        arrivals.sort_by(f64::total_cmp);
+        let q = |p: f64| arrivals.get(((arrivals.len() as f64 - 1.0) * p).round() as usize).copied().map(round2);
+        let labels = self.subs.as_ref().map(|s| s.labels()).unwrap_or_default();
+        let addresses = self.dash.addresses_json(&sim.store, &labels);
+        let unpinned = addresses.iter().filter(|a| a["status"] != "pinned").count();
+        let z = sim.store.sizes();
+        let el_kinds: Vec<&str> = peers.iter().map(|(_, p)| p.client.as_str()).collect();
+        json!({
+            "updated": now,
+            "summary": {
+                "head": head.map(|h| h.number),
+                "head_age_s": head.map(|h| round2(now - h.timestamp as f64)),
+                "uptime_min": self.dash.uptime_s() / 60,
+                "el_peers": peers.len(),
+                "snap_peers": peers.iter().filter(|(_, p)| p.snap1 || p.snap2).count(),
+                "cl_peers": cl.len(),
+                "subscribed_keys": z.watched_keys,
+                "on_demand_keys": z.temp_keys,
+                "addresses_used": addresses.len(),
+                "addresses_not_pinned": unpinned,
+                "arrival_p50_ms": q(0.5),
+                "arrival_p90_ms": q(0.9),
+            },
+            "el": { "peers": el, "clients": by_kind(el_kinds.into_iter()) },
+            "cl": { "peers": cl.clone(), "clients": by_kind(cl.iter().map(|p| p["client"].as_str().unwrap_or(""))), "mesh": cl_mesh },
+            "blocks": {
+                "numbers": blocks.iter().map(|b| b.number).collect::<Vec<_>>(),
+                "arrival_ms": blocks.iter().map(|b| if b.arrival_ms.is_finite() { json!(round2(b.arrival_ms)) } else { Value::Null }).collect::<Vec<_>>(),
+                "changed": blocks.iter().map(|b| b.changed).collect::<Vec<_>>(),
+            },
+            "rpc": self.dash.methods_json(),
+            "addresses": addresses,
+            "suggestion": self.dash.suggestion(&sim.store),
+            "served": self.served_json(),
+        })
+    }
+
     /// Requests skim answered for other peers.
     fn served_json(&self) -> Value {
         let c = self.sim.sched.transport().net.serve_counts();
@@ -757,7 +875,19 @@ async fn handle(State(rpc): State<Arc<Rpc>>, Json(body): Json<Value>) -> Json<Va
 
 pub async fn serve(rpc: Arc<Rpc>, addr: std::net::SocketAddr) -> anyhow::Result<()> {
     // HTTP POST and WebSocket on the same address.
-    let app = Router::new().route("/", post(handle).get(ws_upgrade)).with_state(rpc);
+    let app = Router::new()
+        .route("/", post(handle).get(ws_upgrade))
+        .route(
+            "/dashboard",
+            axum::routing::get(|| async {
+                use axum::http::header;
+                (
+                    [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CONTENT_ENCODING, "gzip")],
+                    crate::dashboard::PAGE_GZ,
+                )
+            }),
+        )
+        .with_state(rpc);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "JSON-RPC listening (HTTP and WebSocket)");
     axum::serve(listener, app).await?;

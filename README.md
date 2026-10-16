@@ -143,6 +143,15 @@ const { result } = await client.simulateContract({
 // answered locally in a few ms
 ```
 
+**Dashboard:** open **http://127.0.0.1:8545/dashboard** to see:
+- connected peers by client, with SNAP latency per peer
+- block arrival and RPC latency
+- which addresses your calls read, and which of them aren't pinned by a subscription (with a `skim.yaml` snippet to pin them)
+
+It's built from stock [Kumo](https://www.npmjs.com/package/@cloudflare/kumo) components, and its layout is a JSON config ([dashboard/](dashboard)).
+
+<img src="assets/dashboard-addresses.png" alt="skim dashboard: addresses read by eth_call, pinned or on demand, with a suggested skim.yaml" width="100%">
+
 **Next steps:**
 - **[Examples](examples):** Uniswap V3, Uniswap V4 and sending transactions, all with viem.
 - **[Docs](docs):** [getting started](docs/guide/getting-started.md), [how it works](docs/guide/how-it-works.md), [configuration](docs/guide/configuration.md), [JSON-RPC](docs/guide/json-rpc.md), [archive](docs/guide/archive.md), [trust](docs/guide/trust-and-correctness.md), [troubleshooting](docs/guide/troubleshooting.md).
@@ -152,7 +161,7 @@ const { result } = await client.simulateContract({
 - Transactions: `eth_sendRawTransaction` (gossiped straight to EL peers), `eth_getTransactionByHash`, `eth_getTransactionReceipt`
 - Logs: `eth_getLogs`. Receipts are fetched only for blocks whose bloom and BAL match, and checked against `receiptsRoot`.
 - Blocks and chain: `eth_getBlockByNumber` / `eth_getBlockByHash` (full transactions), `eth_getBlockReceipts`, `eth_feeHistory`, `eth_blockNumber`, `eth_chainId`, `net_version`, `eth_syncing`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `web3_clientVersion`
-- `skim_subscriptionStatus`, `skim_status`
+- `skim_subscriptionStatus`, `skim_status`, `skim_dashboard`
 - WebSocket on the same port: `eth_subscribe` for `newHeads`, `logs` and `skim_subscriptions`
 
 **Errors:**

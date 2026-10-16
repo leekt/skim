@@ -8,3 +8,4 @@ fuzz/target/
 fuzz/artifacts/
 fuzz/coverage/
 fuzz/corpus/
+dashboard/dist/

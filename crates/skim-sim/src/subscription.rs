@@ -193,6 +193,25 @@ impl Subscriptions {
         self.required.read().values().map(HashSet::len).sum()
     }
 
+    /// Subscription name per address it pins (declared addresses first, then addresses of
+    /// keys learned from its calls).
+    pub fn labels(&self) -> std::collections::HashMap<Address, String> {
+        let mut m = std::collections::HashMap::new();
+        for sp in &self.specs {
+            if let Some(a) = sp.address {
+                m.entry(a).or_insert_with(|| sp.name.clone());
+            }
+        }
+        for (name, keys) in self.required.read().iter() {
+            for k in keys {
+                m.entry(match *k {
+                    StateKey::Balance(a) | StateKey::Nonce(a) | StateKey::CodeHash(a) | StateKey::Storage(a, _) => a,
+                }).or_insert_with(|| name.clone());
+            }
+        }
+        m
+    }
+
     pub fn status(&self) -> Vec<Status> {
         self.status.read().values().cloned().collect()
     }

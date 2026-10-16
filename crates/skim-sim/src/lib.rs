@@ -87,6 +87,9 @@ pub struct CallOutcome {
     pub rounds: Vec<Resolve>,
     /// Total local execution time over all runs.
     pub exec_us: f64,
+    /// Keys the call had to fetch from the network (misses of every run).
+    pub fetched_accounts: Vec<Address>,
+    pub fetched_storage: Vec<(Address, U256)>,
 }
 
 pub struct Simulator {
@@ -206,10 +209,13 @@ impl Simulator {
         let mut predicted = None;
         let mut rounds = Vec::new();
         let mut exec_us = 0.0;
+        let (mut fetched_accounts, mut fetched_storage) = (Vec::new(), Vec::new());
         loop {
             let t = Instant::now();
             let (result, access) = self.execute(&snap, &header, tx.clone())?;
             exec_us += t.elapsed().as_secs_f64() * 1e6;
+            fetched_accounts.extend_from_slice(&access.miss_accounts);
+            fetched_storage.extend_from_slice(&access.miss_storage);
             if !access.has_misses() {
                 // Learn only from runs that had to fetch: a fully local run teaches nothing new
                 // and recording it on every call costs allocations on the hot path.
@@ -226,7 +232,7 @@ impl Simulator {
                     }
                     self.store.touch_ttl(&keys, n);
                 }
-                return Ok(CallOutcome { result, access, predicted, rounds, exec_us });
+                return Ok(CallOutcome { result, access, predicted, rounds, exec_us, fetched_accounts, fetched_storage });
             }
             if let (Mode::Resolve { .. }, Some(input), None) = (mode, &input, &predicted) {
                 let (keys, _) = self.predictor.lock().predict(input, &snap);

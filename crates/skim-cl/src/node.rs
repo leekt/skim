@@ -143,6 +143,20 @@ pub struct SessionEnd {
     pub gossip_first: u64,
 }
 
+/// One connected consensus peer.
+#[derive(Debug, Clone)]
+pub struct ClPeer {
+    pub id: String,
+    /// libp2p identify agent, e.g. "Lighthouse/v8.3.0-…".
+    pub agent: Option<String>,
+    /// We dialed it (else it dialed us).
+    pub outbound: bool,
+    pub age_s: f64,
+    /// Gossip messages it delivered to us first.
+    pub gossip_first: u64,
+    pub head_slot: Option<u64>,
+}
+
 /// Counters readable while the node runs.
 #[derive(Debug, Default, Clone)]
 pub struct NodeStats {
@@ -171,6 +185,8 @@ pub struct NodeStats {
     pub envelopes_served: u64,
     /// Oldest slot held for serving.
     pub envelopes_from_slot: Option<u64>,
+    /// Connected peers (refreshed every 2 s).
+    pub peer_list: Vec<ClPeer>,
     pub goodbyes_received: u64,
     pub attestations: u64,
     pub best_status: Option<Status>,
@@ -720,6 +736,18 @@ impl Runner {
         s.mesh = mesh;
         s.topic_peers = topic_peers;
         s.connected_ages_s = self.peers.values().map(|p| p.since.elapsed().as_secs_f64()).collect();
+        s.peer_list = self
+            .peers
+            .iter()
+            .map(|(id, p)| ClPeer {
+                id: id.to_string(),
+                agent: p.agent.clone(),
+                outbound: p.dialer,
+                age_s: p.since.elapsed().as_secs_f64(),
+                gossip_first: p.gossip_first,
+                head_slot: p.status.map(|s| s.head_slot),
+            })
+            .collect();
     }
 
     fn send_goodbye(&mut self, peer: PeerId, reason: u64) {

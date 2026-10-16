@@ -14,4 +14,4 @@ pub mod serve;
 pub mod ssz;
 pub mod verify;
 
-pub use node::{ClEvent, ClNode, NodeConfig, NodeStats, SessionEnd};
+pub use node::{ClEvent, ClNode, ClPeer, NodeConfig, NodeStats, SessionEnd};

@@ -284,6 +284,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let light = crate::light::Light::new(cl.clone(), persist.clone());
     light.start(args.checkpoint, args.checkpoint_url.clone());
     let chaindata = crate::chaindata::ChainData::new(net.clone(), args.max_logs_range);
+    let dash = Arc::new(crate::dashboard::Dashboard::default());
     if !args.no_serve {
         net.serve(Arc::new(crate::serving::Served { chain: chaindata.clone(), store: store.clone() }));
     }
@@ -298,6 +299,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         call_cache: Default::default(),
         cache_calls: !args.no_call_cache,
         cl_stats: Some(cl.stats.clone()),
+        dash: dash.clone(),
     }), args.rpc));
     if store.archive().is_some() {
         spawn_archive_healer(store.clone(), net.clone(), args.archive_backfill);
@@ -389,6 +391,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                     net.set_head(&h);
                 }
                 tracing::info!(number, arrival_ms = arrival_ms as i64, changed = ready.changed_keys.len(), ?reorged_to, filled, "state ready");
+                dash.record_block(crate::dashboard::BlockStat { number, arrival_ms, changed: ready.changed_keys.len() });
                 light.on_block(&store);
                 let _ = ws_events.send(crate::rpc::WsEvent::NewHead(ready.block));
                 if let Some(s) = saved.take() {
