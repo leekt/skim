@@ -105,6 +105,8 @@ pub struct ChainData {
     inner: RwLock<Inner>,
     receipts: Mutex<Cache<Arc<Vec<Receipt>>>>,
     bodies: Mutex<Cache<Arc<Vec<Bytes>>>>,
+    /// Block access lists (verified) of recent blocks, for transaction replay.
+    bals: Mutex<Cache<Arc<skim_bal::BlockAccessList>>>,
     pub max_log_range: u64,
     rr: AtomicUsize,
 }
@@ -120,6 +122,7 @@ impl ChainData {
             inner: Default::default(),
             receipts: Mutex::new(Cache::new(BLOCK_CACHE)),
             bodies: Mutex::new(Cache::new(BLOCK_CACHE)),
+            bals: Mutex::new(Cache::new(32)),
             max_log_range,
             rr: AtomicUsize::new(0),
         });
@@ -160,9 +163,10 @@ impl ChainData {
     }
 
     /// Transactions and BAL addresses of a verified gossiped payload.
-    pub fn note_payload(&self, number: u64, hash: B256, raw_txs: Vec<Bytes>, touched: HashSet<Address>) {
+    pub fn note_payload(&self, number: u64, hash: B256, raw_txs: Vec<Bytes>, touched: HashSet<Address>, bal: Arc<skim_bal::BlockAccessList>) {
         let hashes = tx_hashes(&raw_txs);
         self.bodies.lock().put(hash, Arc::new(raw_txs));
+        self.bals.lock().put(hash, bal);
         let mut g = self.inner.write();
         self.index_txs(&mut g, number, hash, hashes);
         g.touched.insert(number, (hash, Arc::new(touched)));
@@ -404,6 +408,43 @@ impl ChainData {
     }
 
     /// Where a transaction is: (number, block hash, header, index), if skim indexed it.
+    /// A block's access list, verified against its header (gossip cache, else eth/71 peers).
+    pub async fn block_bal(&self, hash: B256, header: &Header) -> Result<Arc<skim_bal::BlockAccessList>, DataError> {
+        if let Some(b) = self.bals.lock().get(&hash) {
+            return Ok(b);
+        }
+        for pass in 0..PASSES {
+            if pass > 0 {
+                tokio::time::sleep(PASS_BACKOFF * pass).await;
+            }
+            for p in self.peers().into_iter().take(4) {
+                let Ok(mut r) = self.net.bals(p, vec![hash]).await.0 else { continue };
+                let Some(Some(raw)) = r.0.pop() else { continue };
+                if let Ok(bal) = skim_bal::decode_verified(&raw, header.block_access_list_hash.unwrap_or_default()) {
+                    let bal = Arc::new(bal);
+                    self.bals.lock().put(hash, bal.clone());
+                    return Ok(bal);
+                }
+            }
+        }
+        Err(DataError::Unavailable(format!("block {} access list not served by peers", header.number)))
+    }
+
+    /// Where a transaction is: (number, block hash, header, index).
+    pub fn locate_tx(&self, tx: &B256) -> Option<(u64, B256, Arc<Header>, u32)> {
+        self.locate(tx)
+    }
+
+    /// A block's raw transactions and their receipts (both verified).
+    pub async fn block_txs_and_receipts(&self, hash: B256, header: &Header) -> Result<(Arc<Vec<Bytes>>, Arc<Vec<Receipt>>), DataError> {
+        Ok((self.block_txs(hash, header).await?, self.block_receipts(hash, header).await?))
+    }
+
+    /// Decodes a raw transaction and recovers its sender.
+    pub fn decode_tx(raw: &Bytes) -> Result<(SignedTx, Address), DataError> {
+        Self::decode_any(raw)
+    }
+
     fn locate(&self, tx: &B256) -> Option<(u64, B256, Arc<Header>, u32)> {
         let g = self.inner.read();
         let (n, i) = *g.tx_index.get(tx)?;

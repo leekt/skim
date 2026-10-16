@@ -74,6 +74,34 @@ const OUT_OF_SCOPE: &[&str] = &[
     "eth_subscribe",
 ];
 
+/// The EVM input for a mined transaction, exactly as signed.
+fn signed_tx_env(tx: &skim_el::SignedTx, from: Address) -> Result<TxEnv, RpcError> {
+    use alloy_consensus::{Transaction as _, private::alloy_eips::Typed2718};
+    let mut b = TxEnv::builder()
+        .caller(from)
+        .kind(tx.kind())
+        .data(tx.input().clone())
+        .value(tx.value())
+        .gas_limit(tx.gas_limit())
+        .nonce(tx.nonce())
+        .chain_id(tx.chain_id())
+        .tx_type(Some(tx.ty()));
+    b = match tx.gas_price() {
+        Some(p) => b.gas_price(p),
+        None => b.gas_price(tx.max_fee_per_gas()).gas_priority_fee(tx.max_priority_fee_per_gas()),
+    };
+    if let Some(al) = tx.access_list() {
+        b = b.access_list(al.clone());
+    }
+    if let Some(auth) = tx.authorization_list() {
+        b = b.authorization_list_signed(auth.to_vec());
+    }
+    if let Some(h) = tx.blob_versioned_hashes() {
+        b = b.blob_hashes(h.to_vec()).max_fee_per_blob_gas(tx.max_fee_per_blob_gas().unwrap_or_default());
+    }
+    b.build().map_err(|e| RpcError::new(-32000, format!("transaction not replayable: {e:?}")))
+}
+
 /// One `eth_simulateV1` block: environment fields and each call's outcome (geth's shape).
 fn simulated_block_json(b: &skim_sim::multi::SimBlockResult) -> Value {
     let number: u64 = b.env.number.saturating_to();
@@ -191,6 +219,53 @@ impl Rpc {
                     .ok_or_else(|| RpcError::unavailable(format!("block {} is not in the window or the archive", h.block_hash)))
             }
         }
+    }
+
+    /// Replays mined transactions of block `n` (one, or all) with a tracer. Each runs on its exact
+    /// pre-state: the parent block's state plus the block's access-list changes before it, so no
+    /// earlier transaction is re-executed. Every replay must reproduce the transaction's receipt
+    /// (status and gas used); if it doesn't, the trace is refused.
+    async fn replay(&self, n: u64, bh: B256, only: Option<usize>, opts: alloy_rpc_types_trace::geth::GethDebugTracingOptions) -> Result<Vec<(B256, Value)>, RpcError> {
+        let store = &self.sim.store;
+        let chain = self.chain()?;
+        let block = store.block(n).filter(|b| b.hash == bh).ok_or_else(|| RpcError::unavailable(format!("block {n} is outside the retained window")))?;
+        let parent = store.block(n - 1).ok_or_else(|| RpcError::unavailable(format!("parent of block {n} is outside the retained window")))?;
+        let header = self.sim.header_arc(&block).ok_or_else(|| RpcError::unavailable(format!("no header for block {n}")))?;
+        let bal = chain.block_bal(bh, &header).await?;
+        let (raw, receipts) = chain.block_txs_and_receipts(bh, &header).await?;
+        // Fetch up front, in one wave, what the access list says the replay will touch: the whole
+        // block's keys for a block trace, or the keys the one transaction wrote.
+        self.sim.prefetch_bal_keys(&parent, &bal, only.map(|i| i as u64)).await;
+        let indices: Vec<usize> = match only {
+            Some(i) => vec![i],
+            None => (0..raw.len()).collect(),
+        };
+        let mut out = Vec::with_capacity(indices.len());
+        for i in indices {
+            let rawtx = raw.get(i).ok_or_else(|| RpcError::unavailable("transaction index out of range"))?;
+            let (tx, from) = ChainData::decode_tx(rawtx)?;
+            let prestate = skim_bal::BlockWrites::before(&bal, i as u64 + 1);
+            let base = skim_sim::multi::TraceBase {
+                state_at: parent,
+                env: header.clone(),
+                prestate: Some(&prestate),
+                overrides: None,
+                block_overrides: None,
+                validating: true,
+            };
+            let (trace, plain) = self.sim.trace(&base, signed_tx_env(&tx, from)?, opts.clone()).await?;
+            // The replay must reproduce what the chain recorded.
+            let r = receipts.get(i).ok_or_else(|| RpcError::unavailable("receipt index out of range"))?;
+            let gas = r.cumulative_gas_used - if i == 0 { 0 } else { receipts[i - 1].cumulative_gas_used };
+            if plain.is_success() != r.success || plain.tx_gas_used() != gas {
+                return Err(RpcError::new(
+                    -32000,
+                    format!("replay of tx {i} in block {n} diverged from its receipt (status {} vs {}, gas {} vs {gas}); refusing the trace", plain.is_success(), r.success, plain.tx_gas_used()),
+                ));
+            }
+            out.push((alloy_primitives::keccak256(rawtx), serde_json::to_value(trace).unwrap()));
+        }
+        Ok(out)
     }
 
     fn chain(&self) -> Result<&Arc<ChainData>, RpcError> {
@@ -491,6 +566,24 @@ impl Rpc {
                     ExecutionResult::Success { .. } => {}
                 }
                 Ok(v)
+            }
+            "debug_traceTransaction" => {
+                let hash: B256 = need(params, 0)?;
+                let opts: alloy_rpc_types_trace::geth::GethDebugTracingOptions = param(params, 1)?.unwrap_or_default();
+                let chain = self.chain()?;
+                let (n, bh, _, i) = chain.locate_tx(&hash).ok_or_else(|| RpcError::unavailable("transaction not found in recent blocks"))?;
+                Ok(self.replay(n, bh, Some(i as usize), opts).await?.into_iter().next().map(|(_, t)| t).unwrap_or(Value::Null))
+            }
+            "debug_traceBlockByNumber" | "debug_traceBlockByHash" => {
+                let id: BlockId = if method.ends_with("ByHash") {
+                    BlockId::from(need::<B256>(params, 0)?)
+                } else {
+                    BlockId::Number(need::<BlockNumberOrTag>(params, 0)?)
+                };
+                let opts: alloy_rpc_types_trace::geth::GethDebugTracingOptions = param(params, 1)?.unwrap_or_default();
+                let b = self.resolve_block(Some(id), latest)?;
+                let traces = self.replay(b.number, b.hash, None, opts).await?;
+                Ok(Value::Array(traces.into_iter().map(|(h, t)| json!({"txHash": h, "result": t})).collect()))
             }
             "debug_traceCall" => {
                 let req: TransactionRequest = need(params, 0)?;

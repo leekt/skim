@@ -336,6 +336,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             v.computed_hash,
             env.payload.transactions.iter().map(|t| alloy_primitives::Bytes::copy_from_slice(t)).collect(),
             writes.touched.iter().copied().collect(),
+            Arc::new(bal),
         );
         match chain.place(v.header, Arc::new(writes)).await {
             Placed::Applied { ready, reorged_to, filled } => {

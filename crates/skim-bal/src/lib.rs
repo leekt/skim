@@ -3,7 +3,7 @@
 //!
 //! Types come from `alloy-eip7928`; this crate only adds what the state follower needs.
 
-use alloy_eip7928::{AccountChanges, BlockAccessList};
+pub use alloy_eip7928::{AccountChanges, BlockAccessList};
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_rlp::Decodable;
 
@@ -66,6 +66,36 @@ pub struct BlockWrites {
 }
 
 impl BlockWrites {
+    /// The state a block's BAL implies just before the change set at `index`: every change with a
+    /// smaller `block_access_index`, the latest per key. Index 0 is the pre-execution system
+    /// calls, transaction `i` is index `i + 1`, so `before(bal, i + 1)` is the state transaction
+    /// `i` ran on (on top of the parent block's state).
+    pub fn before(bal: &[AccountChanges], index: u64) -> Self {
+        let mut out = Self::default();
+        let take = |i: u64| i < index;
+        for acc in bal {
+            let a = acc.address;
+            out.touched.push(a);
+            if let Some(c) = acc.balance_changes().iter().filter(|c| take(c.block_access_index.0 as u64)).max_by_key(|c| c.block_access_index.0) {
+                out.writes.push((StateKey::Balance(a), c.post_balance));
+            }
+            if let Some(c) = acc.nonce_changes().iter().filter(|c| take(c.block_access_index.0 as u64)).max_by_key(|c| c.block_access_index.0) {
+                out.writes.push((StateKey::Nonce(a), U256::from(c.new_nonce)));
+            }
+            if let Some(c) = acc.code_changes().iter().filter(|c| take(c.block_access_index.0 as u64)).max_by_key(|c| c.block_access_index.0) {
+                let hash = alloy_primitives::keccak256(&c.new_code);
+                out.writes.push((StateKey::CodeHash(a), hash.into()));
+                out.code.push((hash, c.new_code.clone()));
+            }
+            for sc in acc.storage_changes() {
+                if let Some(c) = sc.changes.iter().filter(|c| take(c.block_access_index.0 as u64)).max_by_key(|c| c.block_access_index.0) {
+                    out.writes.push((StateKey::Storage(a, sc.slot), c.new_value));
+                }
+            }
+        }
+        out
+    }
+
     pub fn from_bal(bal: &[AccountChanges]) -> Self {
         let mut out = Self::default();
         for acc in bal {
@@ -142,5 +172,20 @@ mod tests {
     #[test]
     fn empty_bal() {
         assert!(decode(&[EMPTY_BAL_RLP]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn state_before_a_transaction() {
+        let bal = sample(); // slot 1: 10 at index 1, 30 at index 3; balance 5 at index 2
+        let a = Address::repeat_byte(0xaa);
+        let get = |w: &BlockWrites, k: StateKey| w.get(&k);
+        let w1 = BlockWrites::before(&bal, 1); // before tx 0 (index 1): nothing yet
+        assert_eq!(get(&w1, StateKey::Storage(a, U256::from(1))), None);
+        let w3 = BlockWrites::before(&bal, 3); // before tx 2: index 1 and 2 applied
+        assert_eq!(get(&w3, StateKey::Storage(a, U256::from(1))), Some(U256::from(10)));
+        assert_eq!(get(&w3, StateKey::Balance(a)), Some(U256::from(5)));
+        let all = BlockWrites::before(&bal, u64::MAX);
+        assert_eq!(get(&all, StateKey::Storage(a, U256::from(1))), Some(U256::from(30)));
+        assert_eq!(all.writes.len(), BlockWrites::from_bal(&bal).writes.len());
     }
 }

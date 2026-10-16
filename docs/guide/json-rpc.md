@@ -8,6 +8,7 @@ skim serves standard Ethereum JSON-RPC over HTTP and WebSocket on the same addre
 | `eth_call` | Local revm. Unknown state is fetched (verified) first. Honours `gasPrice` / `maxFeePerGas` / `maxPriorityFeePerGas` (0 if omitted, as nodes do), `accessList`, `authorizationList` (EIP-7702) and **state overrides** (`balance`, `nonce`, `code`, `state`, `stateDiff`). Blob fields are rejected (`-32602`), never ignored. |
 | `eth_simulateV1` | Sequences of calls across simulated blocks (each call sees earlier calls' writes), with per-block `blockOverrides` (number, time, gas limit, fee recipient, base fee, prevrandao) and `stateOverrides`. Per call: `status`, `returnData`, `gasUsed`, `logs`, `error`. `validation: true` checks nonces, balances and EIP-1559 base fees (simulated blocks get proper base fees) with the spec's error codes (e.g. `-38012`). `traceTransfers`: on Glamsterdam, ETH transfers already emit native EIP-7708 logs, so these are what you get. |
 | `debug_traceCall` | geth tracers: default (struct logs), `callTracer`, `prestateTracer`, `4byteTracer`, `muxTracer`, `noopTracer`, with `stateOverrides` and `blockOverrides`. Not yet: `flatCallTracer`, JS tracers. |
+| `debug_traceTransaction`, `debug_traceBlockByNumber`, `debug_traceBlockByHash` | Replays mined transactions with the same tracers. Each runs on its exact pre-state: the parent block's state plus the block's access-list changes before it (no earlier transaction is re-executed). Every replay must reproduce the transaction's receipt (status and gas, verified against `receiptsRoot`), or the trace is refused. For blocks inside `--window`; transactions by hash must be in blocks skim indexed. |
 | `eth_createAccessList` | geth's algorithm (iterate until the list is stable; gas is measured with the final list). |
 | `eth_getProof` | EIP-1186 proofs assembled from SNAP answers and verified against the block's state root before they're returned. Only for recent blocks, because peers serve only recent state roots. |
 | `eth_feeHistory` | Base fees (including the next block's) and gas-used ratios from headers; reward percentiles with geth's algorithm, from verified bodies and receipts. Blob fee fields are omitted (the blob-parameter schedule isn't tracked yet). |
@@ -60,7 +61,7 @@ viem's `watch*` helpers use these automatically with `webSocket(...)`.
 | `-32602` / `-32601` | Bad params / unknown method. |
 
 ## Not yet
-`debug_traceTransaction`, `flatCallTracer`, JS tracers, `newPendingTransactions`, blob fee fields in `eth_feeHistory`.
+`flatCallTracer`, JS tracers, `newPendingTransactions`, blob fee fields in `eth_feeHistory`, tracing transactions older than `--window`.
 
 ## Compatibility notes
 - **Checked against references:** state overrides, `eth_simulateV1` (including validation), all tracers, block data, receipts, `eth_getProof`, `eth_feeHistory` and `eth_createAccessList` were checked against Nethermind and geth (Infura) at the same block. Everything was identical (`sim_trace_check.py`, `rpc_gaps_check.py`).
@@ -70,3 +71,6 @@ viem's `watch*` helpers use these automatically with `webSocket(...)`.
 - **Calls without `gas`:** skim uses the block gas limit; nodes differ here (Nethermind: 100M).
 - **EIP-8037 gas breakdown in `callTracer`:** the field names aren't standardized across clients yet. skim says `executionGasUsed`, Nethermind `regularGasUsed`.
 - **Fee recipient in `prestateTracer`:** it is included, as geth and Nethermind do, even though skim's calls charge no fees.
+- **Failed transactions:** when execution fails before entering any frame (EIP-8037 state gas for a new account charged up front), the `callTracer` root frame is built from the transaction, with `error: "out of gas"`, as the other clients do.
+- **Some error strings differ:** for example, skim says "out of gas: not enough gas for reentrancy sentry" where Nethermind says "out of gas".
+- **Replay check:** compared with Nethermind on real Sepolia transactions, `callTracer` was identical for 20 of 20 transactions, and `prestateTracer` and the default tracer matched. A whole-block trace (156 transactions) differed only in the error string above (`replay_check.py`).
