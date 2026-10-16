@@ -78,6 +78,9 @@ pub struct Args {
     /// the newest gossiped block (trust-minimized, typically ~1-2 slots behind).
     #[arg(long)]
     require_verified: bool,
+    /// Don't cache `eth_call` results per (block, request) (measurements of raw execution).
+    #[arg(long)]
+    no_call_cache: bool,
     /// Disable the learned-set pattern tier (A/B measurements).
     #[arg(long)]
     no_learned_patterns: bool,
@@ -275,6 +278,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         light: Some(light.clone()),
         require_verified: args.require_verified,
         events: ws_events.clone(),
+        call_cache: Default::default(),
+        cache_calls: !args.no_call_cache,
     }), args.rpc));
     if store.archive().is_some() {
         spawn_archive_healer(store.clone(), net.clone(), args.archive_backfill);

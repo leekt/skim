@@ -127,3 +127,25 @@ Predicted waves are also capped at 192 keys, nearest tick words first, so a huge
 | Throughput, 1 / 10 / 50 in flight | 1,260 / 2,675 / 2,798 calls/s | **4,144 / 8,377 / 8,469 calls/s** |
 
 A profile under load now shows the server's time is almost all in the EVM interpreter itself.
+
+## 5. Throughput under concurrency
+`skim bench-node` (Rust client, the harness used for the full-node comparison), Uniswap V3 config, 10-core machine. Calls per second at 1 / 10 / 100 in flight:
+
+| | 1 | 10 | 100 |
+|---|---|---|---|
+| Measured next to a running Nethermind (it uses ~8.5 cores by itself) | 1.5k | 8.7k | 8.9k |
+| skim alone, before | 1.5k | 10.7k | 11.4k |
+| skim alone, faster hashing for state maps + TTL bookkeeping under a read lock | 1.7k | 13.3k | **13.8k** |
+| skim alone, repeated calls with the per-block result cache | 17.0k | 65.9k | **91.0k** |
+| Nethermind (measured with skim idle; its own background load ~8.5 cores) | 1.7k | 14.2k | 16.8k |
+
+**Where the time goes:**
+- Under load, 79% of skim's CPU is the revm interpreter itself.
+- skim's own overhead was ~8% before these changes.
+- At 100 in flight, skim saturates ~7.7 of 10 cores.
+
+The earlier 8.5k figure was partly CPU starvation: a full node was running on the same machine.
+
+**Result cache:** state at a block hash never changes, so `eth_call` with an identical request at the same block hash has the same outcome. skim caches results and reverts by (block hash, request), never errors such as `-32002`. Apps that poll the same quotes every block get the cached path. `--no-call-cache` turns it off.
+
+**Native precompile backends:** revm is now built with `secp256k1`, `blst` and `c-kzg` (its defaults; skim had them off). This didn't change this workload's throughput.

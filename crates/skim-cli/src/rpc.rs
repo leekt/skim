@@ -164,6 +164,36 @@ pub struct Rpc {
     pub require_verified: bool,
     /// Pushes for WebSocket subscriptions.
     pub events: tokio::sync::broadcast::Sender<WsEvent>,
+    /// `eth_call` results by (block hash, request). State at a block hash never changes, so an
+    /// identical call there always has the same outcome; apps polling the same call every block
+    /// hit this. Only fully resolved outcomes (results and reverts) are cached.
+    pub call_cache: parking_lot::Mutex<CallCache>,
+    pub cache_calls: bool,
+}
+
+#[derive(Default)]
+pub struct CallCache {
+    map: alloy_primitives::map::HashMap<(B256, B256), Result<Value, (i64, String, Option<Value>)>>,
+}
+
+impl CallCache {
+    const MAX: usize = 20_000;
+
+    fn get(&self, k: &(B256, B256)) -> Option<R> {
+        self.map.get(k).map(|r| r.clone().map_err(|(code, message, data)| RpcError { code, message, data }))
+    }
+
+    fn put(&mut self, k: (B256, B256), r: &R) {
+        let v = match r {
+            Ok(v) => Ok(v.clone()),
+            Err(e) if e.code == 3 => Err((e.code, e.message.clone(), e.data.clone())),
+            Err(_) => return, // unavailable / invalid: not a property of the block
+        };
+        if self.map.len() >= Self::MAX {
+            self.map.clear();
+        }
+        self.map.insert(k, v);
+    }
 }
 
 /// What WebSocket subscribers are told about.
@@ -266,6 +296,24 @@ impl Rpc {
             out.push((alloy_primitives::keccak256(rawtx), serde_json::to_value(trace).unwrap()));
         }
         Ok(out)
+    }
+
+    /// `eth_call` without the result cache.
+    async fn eth_call_uncached(&self, params: &Value, b: &BlockRef) -> R {
+        let sim = &self.sim;
+        let req: TransactionRequest = need(params, 0)?;
+        let header = self.header(b)?;
+        if let Some(overrides) = param::<alloy_rpc_types_eth::state::StateOverride>(params, 2)? {
+            // State overrides: the call runs on an overlay; the store is never modified.
+            let blocks = [skim_sim::multi::SimBlock { block: None, state: Some(overrides), calls: vec![self.tx_env(req, &header)?.into()] }];
+            let out = sim.simulate(b, &blocks, skim_sim::multi::Placement::SameBlock).await?;
+            return Self::exec_result(&out[0].calls[0]);
+        }
+        let out = sim.call(b, self.tx_env(req, &header)?, Mode::Resolve { max_rounds: 8 }).await?;
+        tracing::debug!(number = b.number, predicted_keys = out.predicted.as_ref().map_or(0, |p| p.keys),
+            predicted_ms = out.predicted.as_ref().map_or(0.0, |p| p.wall_ms), rounds = out.rounds.len(),
+            round_keys = out.rounds.iter().map(|r| r.keys).sum::<usize>(), "eth_call fetches");
+        Self::exec_result(&out.result)
     }
 
     fn chain(&self) -> Result<&Arc<ChainData>, RpcError> {
@@ -422,20 +470,17 @@ impl Rpc {
                 Ok(json!(B256::from(v)))
             }
             "eth_call" => {
-                let req: TransactionRequest = need(params, 0)?;
                 let b = self.resolve_block(param(params, 1)?, latest)?;
-                let header = self.header(&b)?;
-                if let Some(overrides) = param::<alloy_rpc_types_eth::state::StateOverride>(params, 2)? {
-                    // State overrides: the call runs on an overlay; the store is never modified.
-                    let blocks = [skim_sim::multi::SimBlock { block: None, state: Some(overrides), calls: vec![self.tx_env(req, &header)?.into()] }];
-                    let out = sim.simulate(&b, &blocks, skim_sim::multi::Placement::SameBlock).await?;
-                    return Self::exec_result(&out[0].calls[0]);
+                let key = (b.hash, alloy_primitives::keccak256(format!("{}|{}", params.get(0).unwrap_or(&Value::Null), params.get(2).unwrap_or(&Value::Null))));
+                if !self.cache_calls {
+                    return self.eth_call_uncached(params, &b).await;
                 }
-                let out = sim.call(&b, self.tx_env(req, &header)?, Mode::Resolve { max_rounds: 8 }).await?;
-                tracing::debug!(number = b.number, predicted_keys = out.predicted.as_ref().map_or(0, |p| p.keys),
-                    predicted_ms = out.predicted.as_ref().map_or(0.0, |p| p.wall_ms), rounds = out.rounds.len(),
-                    round_keys = out.rounds.iter().map(|r| r.keys).sum::<usize>(), "eth_call fetches");
-                Self::exec_result(&out.result)
+                if let Some(r) = self.call_cache.lock().get(&key) {
+                    return r;
+                }
+                let r = self.eth_call_uncached(params, &b).await;
+                self.call_cache.lock().put(key, &r);
+                r
             }
             "eth_estimateGas" => {
                 let req: TransactionRequest = need(params, 0)?;

@@ -16,10 +16,10 @@
 pub mod archive;
 pub mod persist;
 
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
+
+// The hot maps (every SLOAD of a simulation looks a key up) use alloy's fast hasher.
+use alloy_primitives::map::{HashMap, HashSet};
 
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use parking_lot::RwLock;
@@ -203,6 +203,7 @@ impl Store {
     /// A store that also archives every version of archived keys (reloaded from `archive`).
     pub fn with_archive(window: u64, archive: archive::Archive) -> Result<Arc<Self>, archive::ArchiveError> {
         let keys = archive.archived_keys()?;
+        let keys: HashSet<StateKey> = keys.into_iter().collect();
         let inner = Inner { archived: keys.clone(), watched_keys: keys, ..Default::default() };
         Ok(Arc::new(Self {
             inner: RwLock::new(inner),
@@ -348,6 +349,15 @@ impl Store {
 
     /// Extends on-demand keys that were just used (`cache_ttl_blocks` from the head).
     pub fn touch_ttl(&self, keys: &[StateKey], n: u64) {
+        // Most calls in a block find their keys already extended to head + n: check under the
+        // read lock and only take the write lock when something actually needs extending.
+        {
+            let st = self.inner.read();
+            let Some(head) = st.head().map(|h| h.number) else { return };
+            if !keys.iter().any(|k| st.temp.get(k).is_some_and(|e| *e < head + n)) {
+                return;
+            }
+        }
         let mut st = self.inner.write();
         let Some(head) = st.head().map(|h| h.number) else { return };
         for k in keys {

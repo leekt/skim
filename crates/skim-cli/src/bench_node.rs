@@ -44,6 +44,9 @@ pub struct Args {
     burst: usize,
     #[arg(long, default_value = "data/bench-node.jsonl")]
     out: String,
+    /// Concurrency levels of the throughput sweep.
+    #[arg(long, value_delimiter = ',', default_value = "1,10,100")]
+    sweep_levels: Vec<usize>,
 }
 
 const GENESIS: u64 = 1655733600;
@@ -196,7 +199,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         if args.throughput_every > 0 && done % args.throughput_every == 0 {
             let all = Arc::new(all);
             for (name, url) in &eps {
-                for conc in [1usize, 10, 100] {
+                for &conc in &args.sweep_levels {
                     let t = Instant::now();
                     let n_ok = stream::iter(0..args.burst)
                         .map(|i| {
