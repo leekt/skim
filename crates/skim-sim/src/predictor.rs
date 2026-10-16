@@ -52,9 +52,7 @@ pub struct Prediction {
     pub v3_words: i32,
 }
 
-fn account_keys(a: Address) -> [StateKey; 3] {
-    [StateKey::Balance(a), StateKey::Nonce(a), StateKey::CodeHash(a)]
-}
+use crate::account_keys;
 
 fn u256_word(data: &[u8], i: usize) -> Option<U256> {
     data.get(4 + 32 * i..4 + 32 * (i + 1)).map(U256::from_be_slice)

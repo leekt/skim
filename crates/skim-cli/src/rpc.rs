@@ -686,6 +686,7 @@ impl Rpc {
                         "subscribed_keys": z.watched_keys, "on_demand_keys": z.temp_keys,
                         "code": z.code, "code_bytes": z.code_bytes, "admissions_refused": z.admissions_refused,
                         "on_demand_evicted": z.on_demand_evicted, "recent_bal_bytes": z.recent_bal_bytes,
+                        "resolved_from_bal": z.resolved_from_bal,
                     },
                     "light_client": self.light.as_ref().map(|l| l.status()),
                     "el_peers": peers.len(),
@@ -811,6 +812,7 @@ impl Rpc {
         gauge!("skim_store_bytes", "kind" => "recent_bals").set(z.recent_bal_bytes as f64);
         counter!("skim_store_admissions_refused_total").absolute(z.admissions_refused);
         counter!("skim_store_on_demand_evicted_total").absolute(z.on_demand_evicted);
+        counter!("skim_store_resolved_from_bal_total").absolute(z.resolved_from_bal);
         if let Some(subs) = &self.subs {
             for s in subs.status() {
                 gauge!("skim_subscription_ready", "name" => s.name.clone()).set(s.ready as u8 as f64);

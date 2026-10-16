@@ -214,6 +214,11 @@ pub fn predict_range(snap: &Snapshot, pool: &V3Pool, lo: i32, hi: i32) -> Vec<St
 
 /// Fetches whatever `predict` says is unknown, repeating while new keys appear (bitmap words
 /// first, then the ticks they reveal). Returns the rounds' breakdowns.
+///
+/// With `Retention::Ttl(n)` the window is a hot set, not a subscription: every key in the
+/// current window gets its TTL extended on each pass, and keys the price moved away from
+/// expire `n` blocks after they last were in the window.
+#[allow(clippy::too_many_arguments)]
 pub async fn refresh_pool(
     store: &std::sync::Arc<Store>,
     sched: &Scheduler<ElTransport>,
@@ -222,6 +227,7 @@ pub async fn refresh_pool(
     pool: &V3Pool,
     (lo, hi): (i32, i32),
     budget: usize,
+    retention: Retention,
 ) -> (Vec<Resolve>, Vec<StateKey>) {
     let mut rounds = Vec::new();
     let mut fetched = Vec::new();
@@ -247,6 +253,10 @@ pub async fn refresh_pool(
                 }
             }
         }
+        if let Retention::Ttl(n) = retention {
+            let window: Vec<StateKey> = ordered.iter().map(|(_, k)| *k).collect();
+            store.touch_ttl(&window, n);
+        }
         let mut seen = std::collections::HashSet::new();
         let unknown: Vec<StateKey> = ordered
             .into_iter()
@@ -271,7 +281,7 @@ pub async fn refresh_pool(
                 }
             }
         }
-        rounds.push(resolve_with(store, sched, at, &accounts, &storage, &[], Priority::Low).await);
+        rounds.push(resolve_inner(store, sched, at, &accounts, &storage, &[], Priority::Low, retention).await);
     }
     (rounds, fetched)
 }

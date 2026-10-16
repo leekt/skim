@@ -54,10 +54,46 @@ fn rejects_non_child() {
 }
 
 #[test]
-fn untracked_writes_are_ignored() {
+fn untracked_writes_are_indexed_not_tracked() {
     let s = Store::new(64);
     s.apply_block(blk(1, 0), writes(&[(slot(1), 5)])).unwrap();
-    assert_eq!(known(&s.snapshot(&blk(1, 0)).unwrap(), slot(1)), None);
+    // Known from the recent BAL (the block's own post-state), without becoming tracked.
+    assert_eq!(known(&s.snapshot(&blk(1, 0)).unwrap(), slot(1)), Some(5));
+    assert!(s.inner.read().versions.get(&slot(1)).is_none());
+    assert_eq!(s.sizes().resolved_from_bal, 1);
+}
+
+#[test]
+fn recent_bal_answers_only_inside_the_indexed_window() {
+    let s = Store::new(4); // keeps the last 4 blocks' BALs
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    s.apply_block(blk(2, 0), writes(&[(slot(9), 7)])).unwrap();
+    // Before the write, the BAL says nothing: unknown, never zero.
+    assert_eq!(known(&s.snapshot(&blk(1, 0)).unwrap(), slot(9)), None);
+    for n in 3..=5 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap();
+    }
+    // Written at 2, untouched since: that write is the value at 5.
+    assert_eq!(known(&s.snapshot(&blk(5, 0)).unwrap(), slot(9)), Some(7));
+    // A later write wins over an earlier one.
+    s.apply_block(blk(6, 0), writes(&[(slot(9), 8)])).unwrap();
+    assert_eq!(known(&s.snapshot(&blk(6, 0)).unwrap(), slot(9)), Some(8));
+    // Once the writing blocks leave the window, the key is unknown again (a fetch is needed).
+    for n in 7..=12 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap();
+    }
+    assert_eq!(known(&s.snapshot(&blk(12, 0)).unwrap(), slot(9)), None);
+}
+
+#[test]
+fn recent_bal_lookup_follows_reorgs() {
+    let s = Store::new(64);
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    s.apply_block(blk(2, 0), writes(&[(slot(3), 30)])).unwrap();
+    s.rollback_to(1);
+    s.apply_block(blk(2, 1), writes(&[])).unwrap();
+    // The orphaned block's write is gone with it.
+    assert_eq!(known(&s.snapshot(&blk(2, 1)).unwrap(), slot(3)), None);
 }
 
 #[test]
@@ -141,13 +177,16 @@ fn on_demand_keys_stay_current_during_ttl_then_expire() {
     assert_eq!(known(&s.snapshot(&blk(2, 0)).unwrap(), slot(4)), Some(2));
     s.apply_block(blk(3, 0), writes(&[])).unwrap();
     assert_eq!(known(&s.snapshot(&blk(3, 0)).unwrap(), slot(4)), Some(2));
-    // Past head+TTL it is evicted entirely: Unknown again, not stale.
+    // Past head+TTL it is evicted: no stored versions. Reads still get the true value from the
+    // recent BAL (written at 2, untouched since), never the stale fetched one.
     s.apply_block(blk(4, 0), writes(&[])).unwrap();
-    assert_eq!(known(&s.snapshot(&blk(4, 0)).unwrap(), slot(4)), None);
-    assert_eq!(known(&s.snapshot(&blk(2, 0)).unwrap(), slot(4)), None);
-    // And no longer tracked: a later write is ignored.
+    assert!(s.inner.read().versions.get(&slot(4)).is_none());
+    assert_eq!(known(&s.snapshot(&blk(4, 0)).unwrap(), slot(4)), Some(2));
+    assert_eq!(known(&s.snapshot(&blk(1, 0)).unwrap(), slot(4)), None); // the fetched base is gone
+    // No longer tracked: a later write is not stored, only indexed.
     s.apply_block(blk(5, 0), writes(&[(slot(4), 5)])).unwrap();
-    assert_eq!(known(&s.snapshot(&blk(5, 0)).unwrap(), slot(4)), None);
+    assert!(s.inner.read().versions.get(&slot(4)).is_none());
+    assert_eq!(known(&s.snapshot(&blk(5, 0)).unwrap(), slot(4)), Some(5));
     assert_eq!(s.sizes().temp_keys, 0);
 }
 
@@ -391,7 +430,16 @@ fn complete_storage_answers_every_slot_and_follows_writes() {
     assert_eq!(known(&at2, slot(999)), Some(0)); // absent from a complete trie: proven zero
     s.apply_block(blk(3, 0), writes(&[(slot(7), 70)])).unwrap(); // a brand-new slot
     assert_eq!(known(&s.snapshot(&blk(3, 0)).unwrap(), slot(7)), Some(70));
-    assert_eq!(s.sizes().complete_slots, 2);
+    // Slot 7 was first written after the download: it is held too and counts toward limits.
+    assert_eq!(s.sizes().complete_slots, 3);
+    assert_eq!(s.complete_storage_len(&A), Some(3));
+    s.apply_block(blk(4, 0), writes(&[(slot(7), 71), (slot(1), 11)])).unwrap(); // known slots: no growth
+    assert_eq!(s.complete_storage_len(&A), Some(3));
+    // Dropping it (grew past its limit) stops tracking the contract.
+    s.drop_complete_storage(&A);
+    assert_eq!(s.complete_storage_len(&A), None);
+    s.apply_block(blk(5, 0), writes(&[])).unwrap();
+    assert!(s.inner.read().versions.get(&slot(7)).is_none());
     // Other contracts are unaffected: unknown stays unknown.
     assert_eq!(known(&at2, StateKey::Storage(Address::repeat_byte(0xcc), U256::from(1))), None);
 }

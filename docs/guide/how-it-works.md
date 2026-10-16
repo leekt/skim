@@ -16,7 +16,10 @@ CL gossip: execution_payload ──► rebuild the EL header from the payload
 - **Gaps:** gaps from a restart or missed gossip are filled from execution-layer peers (eth/71 `GetBlockAccessLists`).
 
 ## 2. State skim hasn't seen is fetched, and proven
-The first time a request reads an account or slot skim doesn't track, it asks EL peers over **SNAP** (`snap/1` from Geth, `snap/2` from Nethermind):
+A key skim doesn't track is resolved in this order:
+1. **Local:** subscribed or on-demand state skim already holds.
+2. **A recent BAL:** if a block in the window (`--window`, default 256 blocks) wrote the key, the latest such write is its value, as long as every block since that write is indexed. Nothing is fetched. State that changed recently, like the balance of an account that just sent a transaction, is answered immediately.
+3. **SNAP:** otherwise skim asks EL peers (`snap/1` from Geth, `snap/2` from Nethermind):
 
 ```text
 read slot x of C at head N
@@ -34,9 +37,13 @@ The fetch scheduler adapts per-peer concurrency (AIMD on latency), hedges slow r
 ## 3. Subscribed vs on-demand state
 | | Subscribed (in `skim.yaml`) | On demand (everything else) |
 |---|---|---|
-| Kept current | from every block's BAL, forever | for `cache_ttl_blocks` after last use |
+| Kept current | from every block's BAL, forever | from every block's BAL, for `cache_ttl_blocks` after last use (any read counts: `eth_call`, `eth_getStorageAt`, `eth_getBalance`, simulate, trace) |
 | Hot path | **no network** | one verified fetch wave the first time |
 | Readiness | reported per subscription (`skim_subscriptionStatus`) | best effort |
+
+Readiness also requires the bytecode of subscribed accounts, not just their code hash. Otherwise the first call would fetch it.
+
+A `storage: all` subscription's `max_slots` applies for the contract's whole life. Slots first written after the download count too. If the contract outgrows the limit, skim stops tracking it and the subscription reports the error.
 
 A subscription can name accounts and slots, or **calls**. For a call, skim runs it every block, records every key it reads (its *access set*), and keeps those keys subscribed. You don't need to know storage layouts: subscribe the `quote()` your app makes and skim keeps exactly the slots it reads.
 
@@ -44,7 +51,7 @@ A subscription can name accounts and slots, or **calls**. For a call, skim runs 
 A new call input (a different amount, another pool) may read keys skim doesn't track yet. Fetching them one EVM round at a time would take several network round trips. The **State Access Predictor** guesses them up front and fetches them in one wave:
 
 - **Learned sets:** the access set of the same input, otherwise of *similar* inputs (same contract, selector, addresses and small arguments; amounts in the same order of magnitude), otherwise the keys common to most runs of that function.
-- **Protocol predictors:** for Uniswap V3 (`predictors.uniswap_v3`), the tick range a swap of the requested size can reach, from the pool's current price and liquidity. A window around the current tick is also kept warm in the background.
+- **Protocol predictors:** for Uniswap V3 (`predictors.uniswap_v3`), the tick range a swap of the requested size can reach, from the pool's current price and liquidity. A window around the current tick is also kept warm in the background. That window is a hot set, not a subscription: its keys stay cached while they are near the price, and expire `window_ttl_blocks` after the price moves away.
 
 After running, any key the prediction missed is fetched in another round. A missed tick-bitmap word pulls in the whole word range at once.
 

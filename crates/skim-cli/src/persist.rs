@@ -290,6 +290,9 @@ mod tests {
     }
 }
 
+/// How long restored values stay cached before a subscription must claim them.
+const RESTORED_TTL_BLOCKS: u64 = 64;
+
 fn install(store: &Store, at: &BlockRef, values: &[(skim_bal::StateKey, alloy_primitives::U256)], code: &[(B256, alloy_primitives::Bytes)]) -> anyhow::Result<usize> {
     for (_, c) in code {
         store.insert_code(c.clone());
@@ -297,7 +300,10 @@ fn install(store: &Store, at: &BlockRef, values: &[(skim_bal::StateKey, alloy_pr
     let mut n = 0;
     for (k, v) in values {
         // `at` must still be in the window; insert_base replays any later blocks itself.
-        store.insert_base_with(at, *k, *v, Retention::Subscribed)?;
+        // Provisional: the next subscription pass re-subscribes the keys the current config
+        // still needs, and the rest (keys of removed subscriptions, anything subscribed by an
+        // older version) expire instead of staying subscribed forever.
+        store.insert_base_with(at, *k, *v, Retention::Ttl(RESTORED_TTL_BLOCKS))?;
         n += 1;
     }
     Ok(n)

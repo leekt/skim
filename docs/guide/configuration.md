@@ -33,6 +33,7 @@ predictors:
     pools: ["0x…", "0x…"]             # V3 pools (fee/tokens/tickSpacing are read on start)
     words: 2                          # tick-bitmap words kept warm on each side (grows with observed reach)
     prefetch_budget: 256              # background keys per pool per block (low priority)
+    window_ttl_blocks: 16             # prefetched keys expire this long after leaving the window
 ```
 
 ### Subscriptions in detail
@@ -97,6 +98,8 @@ The snapshot is a cache, never a source of truth. On start it is used only after
 1. headers from its block to the current head link by hash
 2. every block's access list matches its header
 3. those blocks' writes are replayed
+
+Restored values are provisional: they are cached like on-demand state until the first subscription pass re-subscribes the keys the current config still needs. Keys of removed subscriptions expire instead of staying subscribed.
 
 Anything that doesn't check out (a reorg while skim was down, a gap over 8,192 blocks, an unreadable file) is discarded, and state is fetched as on a fresh start. The replay needs one EL peer that serves eth/71. In practice, restart time is dominated by how long the first such peer takes to connect.
 

@@ -175,3 +175,23 @@ The caches are bounded: BALs of 64 blocks, bodies of 128, and envelopes of 64 sl
 Subscribed state didn't wait in either restart: the snapshot replayed from consensus peers in about 2 s.
 
 Once a SNAP peer was connected, cold reads of four unsubscribed contracts (code and balance) answered in 0.26–1.26 s.
+
+## Third review (state lifecycle)
+| Finding | Fix | Check |
+|---|---|---|
+| Direct reads (`eth_getStorageAt`, `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`) didn't extend an on-demand key's TTL on a cache hit, so a value polled every block expired and was fetched again every few blocks. `eth_simulateV1` and tracing had the same gap | Every read path extends the TTL of the on-demand keys it used | Live: an unsubscribed account's balance polled for 10 blocks (TTL 4): 2 SNAP requests in the first block, 0 after |
+| Uniswap V3 background prefetch stored its tick window as **subscribed** keys, forever. Ticks the price left behind piled up, used the `max_subscribed_keys` budget (so a subscription's own keys could be refused), and survived restarts through the snapshot | The window is a hot set: keys in it get their TTL extended on each pass and expire `window_ttl_blocks` (16) after the price moves away. Restored snapshot values are provisional until a subscription claims them | Live, after a restart: subscribed keys **3,166 → 35** (the two subscriptions' own keys); the window's ~3,100 keys are on demand; both subscriptions ready |
+| `storage: all` checked `max_slots` only at download. Slots first written later were tracked without counting toward any limit | Those slots count toward `max_slots` and `max_subscribed_keys`. Past `max_slots`, the contract is no longer tracked and the subscription reports the error (no re-download every block, also for a contract too large at download) | `complete_storage_answers_every_slot_and_follows_writes` |
+| A subscription pass still running made the next block's pass be skipped, so readiness and `on_block` results lagged | Passes are coalesced: one at a time, always on the newest head | |
+| Readiness counted an account's code hash but not its bytecode, so a "ready" subscription could still fetch code on the first call | Missing bytecode of subscribed accounts is fetched and counts as missing | |
+
+**BAL-first resolution (new).** A key skim doesn't hold is first looked up in the recent-BAL index. If a block in the window wrote it, and every block since is indexed, that write is the value at the head, with no fetch. Each block's writes are kept sorted, so a lookup is a binary search per block.
+
+Live check: the balances of the 10 senders in the latest block (none tracked), read through skim:
+- all 10 identical to a reference node at the same block
+- 0 SNAP requests
+- `resolved_from_bal` 0 → 10
+
+Tests: `recent_bal_answers_only_inside_the_indexed_window` (before the write: unknown; a later write wins; outside the window: unknown), `recent_bal_lookup_follows_reorgs`.
+
+**Open (seen while checking):** a restart snapshot 3,900 blocks old was replayed from EL peers in 175 s, and subscriptions waited for it. For gaps that large, fetching the subscribed keys fresh is likely faster than replaying.

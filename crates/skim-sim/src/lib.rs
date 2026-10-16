@@ -123,6 +123,22 @@ impl Simulator {
         })
     }
 
+    /// Keeps the on-demand keys a request used current for another TTL (no effect on
+    /// subscribed keys). Every read path calls this, so state that is read every block never
+    /// expires while it is in use.
+    pub fn keep_warm(&self, access: &db::Access) {
+        self.keep_warm_with(access, *self.on_demand.read());
+    }
+
+    fn keep_warm_with(&self, access: &db::Access, retention: Retention) {
+        let Retention::Ttl(n) = retention else { return };
+        let mut keys: Vec<StateKey> = access.storage.iter().map(|(a, s)| StateKey::Storage(*a, *s)).collect();
+        for a in &access.accounts {
+            keys.extend(account_keys(*a));
+        }
+        self.store.touch_ttl(&keys, n);
+    }
+
     /// Before an interactive fetch wave: if no SNAP peer is connected (e.g. right after a cold
     /// start), waits for one instead of failing, up to `state_wait`.
     pub async fn await_state_peers(&self) -> Result<(), SimError> {
@@ -224,14 +240,7 @@ impl Simulator {
                 {
                     self.predictor.lock().record(input, &access.accounts, &access.storage);
                 }
-                if let Retention::Ttl(n) = retention {
-                    // Recently used on-demand keys stay cached for another TTL.
-                    let mut keys: Vec<StateKey> = access.storage.iter().map(|(a, s)| StateKey::Storage(*a, *s)).collect();
-                    for a in &access.accounts {
-                        keys.extend([StateKey::Balance(*a), StateKey::Nonce(*a), StateKey::CodeHash(*a)]);
-                    }
-                    self.store.touch_ttl(&keys, n);
-                }
+                self.keep_warm_with(&access, retention);
                 return Ok(CallOutcome { result, access, predicted, rounds, exec_us, fetched_accounts, fetched_storage });
             }
             if let (Mode::Resolve { .. }, Some(input), None) = (mode, &input, &predicted) {
@@ -340,6 +349,15 @@ impl Simulator {
     pub async fn read(&self, b: &BlockRef, key: StateKey) -> Result<U256, SimError> {
         let snap = self.store.snapshot(b)?;
         if let StateValue::Known(v) = snap.get(&key)? {
+            // A hit keeps an on-demand key alive like a call's read does: polling a value every
+            // block must not let it expire and be fetched again.
+            if let Retention::Ttl(n) = *self.on_demand.read() {
+                let keys = match key {
+                    StateKey::Storage(..) => vec![key],
+                    StateKey::Balance(a) | StateKey::Nonce(a) | StateKey::CodeHash(a) => account_keys(a).to_vec(),
+                };
+                self.store.touch_ttl(&keys, n);
+            }
             return Ok(v);
         }
         if snap.is_archived() {
@@ -375,6 +393,11 @@ impl Simulator {
         prefetch::resolve(&self.store, &self.sched, &self.fetch_at(b), &[], &[], &[h]).await;
         self.store.code(&h).ok_or(SimError::Incomplete(1))
     }
+}
+
+/// An account's three keys (fetched and kept together).
+pub fn account_keys(a: Address) -> [StateKey; 3] {
+    [StateKey::Balance(a), StateKey::Nonce(a), StateKey::CodeHash(a)]
 }
 
 /// Splits keys into the accounts and slots still unknown at `snap`.

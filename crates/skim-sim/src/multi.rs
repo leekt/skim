@@ -458,6 +458,7 @@ impl Simulator {
         for _ in 0..MAX_ROUNDS {
             let (out, access) = self.simulate_once(&snap, &header, blocks, place, opts)?;
             if !access.has_misses() {
+                self.keep_warm(&access);
                 return Ok(out);
             }
             if snap.is_archived() {
@@ -603,6 +604,7 @@ impl Simulator {
             drop(cache);
             let access = sdb.access.into_inner().unwrap();
             if !access.has_misses() {
+                self.keep_warm(&access);
                 // Only now is a rejection meaningful: with unknown state (e.g. the sender not yet
                 // fetched, reading as nonce 0) the EVM's verdict says nothing.
                 plain = Some(r.map_err(invalid_tx)?.result);

@@ -69,6 +69,8 @@ pub struct StoreSizes {
     pub admissions_refused: u64,
     /// On-demand keys evicted early because `max_on_demand` was reached.
     pub on_demand_evicted: u64,
+    /// Reads of untracked keys answered from a recent BAL write instead of a fetch.
+    pub resolved_from_bal: u64,
     /// Slots held for fully downloaded contracts (`storage: all`).
     pub complete_slots: usize,
     /// Estimated bytes held by the recent-BAL index (all writes of the last `window` blocks,
@@ -126,6 +128,21 @@ struct Inner {
 struct Complete {
     block: u64,
     slots: Arc<HashMap<B256, U256>>,
+    /// Slots first written after the download (not in `slots`). They are tracked too, so they
+    /// count toward the limits like the downloaded ones.
+    extra: HashSet<U256>,
+}
+
+impl Complete {
+    fn len(&self) -> usize {
+        self.slots.len() + self.extra.len()
+    }
+
+    fn note_write(&mut self, slot: U256) {
+        if !self.extra.contains(&slot) && !self.slots.contains_key(&keccak256(slot.to_be_bytes::<32>())) {
+            self.extra.insert(slot);
+        }
+    }
 }
 
 impl Inner {
@@ -169,6 +186,8 @@ pub struct Store {
     /// Hard limit on on-demand (TTL) keys; the soonest-expiring are evicted first.
     max_on_demand: std::sync::atomic::AtomicUsize,
     on_demand_evicted: std::sync::atomic::AtomicU64,
+    /// Reads of untracked keys answered from a recent block's BAL write (no fetch needed).
+    resolved_from_bal: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     pub(crate) test_hook: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
@@ -195,6 +214,7 @@ impl Store {
             admissions_refused: Default::default(),
             max_on_demand: std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_ON_DEMAND),
             on_demand_evicted: Default::default(),
+            resolved_from_bal: Default::default(),
             #[cfg(test)]
             test_hook: Default::default(),
         })
@@ -215,6 +235,7 @@ impl Store {
             admissions_refused: Default::default(),
             max_on_demand: std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_ON_DEMAND),
             on_demand_evicted: Default::default(),
+            resolved_from_bal: Default::default(),
             #[cfg(test)]
             test_hook: Default::default(),
         }))
@@ -259,7 +280,7 @@ impl Store {
 
     /// Whether `k` may become subscribed (already is, or there's room).
     fn admit(&self, st: &Inner, k: &StateKey) -> bool {
-        let complete: usize = st.complete.values().map(|c| c.slots.len()).sum();
+        let complete: usize = st.complete.values().map(Complete::len).sum();
         let ok = st.watched_keys.contains(k)
             || st.watched_keys.len() + complete < self.max_subscribed.load(std::sync::atomic::Ordering::Relaxed);
         if !ok {
@@ -383,6 +404,14 @@ impl Store {
     /// Applies a block whose BAL commitment has already been verified. The first block anchors
     /// the chain; later ones must extend the head.
     pub fn apply_block(&self, block: BlockRef, writes: Arc<BlockWrites>) -> Result<StateReady, StateError> {
+        // Recent-BAL lookups binary-search each block's writes (BAL-built values are sorted).
+        let writes = if writes.is_normalized() {
+            writes
+        } else {
+            let mut w = (*writes).clone();
+            w.normalize();
+            Arc::new(w)
+        };
         let ready = {
             let mut st = self.inner.write();
             if let Some(h) = st.head() {
@@ -393,6 +422,11 @@ impl Store {
             let mut changed = Vec::new();
             for &(k, v) in &writes.writes {
                 if st.tracked(&k) {
+                    if let StateKey::Storage(a, s) = k
+                        && let Some(c) = st.complete.get_mut(&a)
+                    {
+                        c.note_write(s);
+                    }
                     st.put(k, block.number, v);
                     changed.push(k);
                 }
@@ -547,8 +581,9 @@ impl Store {
             code: st.code.len(),
             code_bytes: st.code.values().map(|c| c.len()).sum(),
             admissions_refused: self.admissions_refused.load(std::sync::atomic::Ordering::Relaxed),
+            resolved_from_bal: self.resolved_from_bal.load(std::sync::atomic::Ordering::Relaxed),
             on_demand_evicted: self.on_demand_evicted.load(std::sync::atomic::Ordering::Relaxed),
-            complete_slots: st.complete.values().map(|c| c.slots.len()).sum(),
+            complete_slots: st.complete.values().map(Complete::len).sum(),
             recent_bal_bytes: st.recent.values().map(|w| (w.writes.len() + w.touched.len() + w.storage_reads.len()) * BAL_ENTRY_BYTES).sum(),
         }
     }
@@ -657,7 +692,7 @@ impl Store {
             return Err(StateError::Reorged { number: at.number, hash: at.hash });
         }
         let max = self.max_subscribed.load(std::sync::atomic::Ordering::Relaxed);
-        let others: usize = st.complete.iter().filter(|(x, _)| **x != a).map(|(_, c)| c.slots.len()).sum();
+        let others: usize = st.complete.iter().filter(|(x, _)| **x != a).map(|(_, c)| c.len()).sum();
         if st.watched_keys.len() + others + slots.len() > max {
             self.admissions_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(StateError::LimitReached(slots.len()));
@@ -668,11 +703,33 @@ impl Store {
             .range(at.number + 1..)
             .flat_map(|(n, w)| w.writes.iter().filter(|(k, _)| matches!(k, StateKey::Storage(x, _) if *x == a)).map(move |(k, v)| (*n, *k, *v)))
             .collect();
+        let mut c = Complete { block: at.number, slots: Arc::new(slots.into_iter().collect()), extra: HashSet::default() };
         for (n, k, v) in later {
+            if let StateKey::Storage(_, s) = k {
+                c.note_write(s);
+            }
             st.put(k, n, v);
         }
-        st.complete.insert(a, Complete { block: at.number, slots: Arc::new(slots.into_iter().collect()) });
+        st.complete.insert(a, c);
         Ok(())
+    }
+
+    /// Slots held for a fully downloaded contract (downloaded plus written since).
+    pub fn complete_storage_len(&self, a: &Address) -> Option<usize> {
+        self.inner.read().complete.get(a).map(Complete::len)
+    }
+
+    /// Stops keeping a contract's whole storage (e.g. it grew past its limit): the address is
+    /// no longer tracked, and its slots' versions are dropped unless watched individually.
+    pub fn drop_complete_storage(&self, a: &Address) {
+        let mut st = self.inner.write();
+        st.complete.remove(a);
+        st.watched_addresses.remove(a);
+        let watched = std::mem::take(&mut st.watched_keys);
+        st.versions.retain(|k, _| match k {
+            StateKey::Storage(x, _) | StateKey::Balance(x) | StateKey::Nonce(x) | StateKey::CodeHash(x) => x != a || watched.contains(k),
+        });
+        st.watched_keys = watched;
     }
 
     /// The block a contract's whole storage is known from, if it is.
@@ -808,6 +865,19 @@ impl Snapshot {
         {
             let h = keccak256(slot.to_be_bytes::<32>());
             return Ok(StateValue::Known(c.slots.get(&h).copied().unwrap_or_default()));
+        }
+        // Not tracked, but a recent block wrote it: that write is its value at this block,
+        // provided every block from the write to this one is indexed (a gap could hide a later
+        // write). Saves a SNAP fetch for state that changed recently.
+        let n = self.block.number;
+        for (m, w) in st.recent.range(..=n).rev() {
+            if let Some(v) = w.lookup(key) {
+                if st.recent.range(m..=&n).count() as u64 == n - m + 1 {
+                    self.store.resolved_from_bal.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(StateValue::Known(v));
+                }
+                break;
+            }
         }
         Ok(StateValue::Unknown)
     }

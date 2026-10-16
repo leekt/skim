@@ -67,6 +67,7 @@ For a ready-to-paste `skim.yaml` block covering the hot addresses that aren't pi
 | `skim_store_keys` | gauge | `kind` (`subscribed`, `on_demand`, `versions`) |
 | `skim_store_bytes` | gauge | `kind` (`code`, `recent_bals`) |
 | `skim_store_admissions_refused_total`, `skim_store_on_demand_evicted_total` | counter | |
+| `skim_store_resolved_from_bal_total` | counter | reads of untracked keys answered from a recent BAL (no fetch) |
 | `skim_subscription_ready`, `skim_subscription_missing_keys` | gauge | `name` |
 | `skim_served_requests_total`, `skim_served_items_total` | counter | `layer`, `kind` |
 | `skim_address_calls_total`, `skim_address_fetched_keys_total` | counter | `address` |

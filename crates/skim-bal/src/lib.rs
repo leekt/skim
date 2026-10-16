@@ -54,7 +54,8 @@ pub enum StateKey {
 /// The final post-block value of every key a block wrote, plus what it only read.
 #[derive(Debug, Default, Clone)]
 pub struct BlockWrites {
-    /// Final value per written key (last change by `block_access_index`).
+    /// Final value per written key (last change by `block_access_index`). Sorted by key when
+    /// built from a BAL (see [`Self::normalize`]), so [`Self::lookup`] is a binary search.
     pub writes: Vec<(StateKey, U256)>,
     /// New code by hash, for keys in `writes` of kind `CodeHash` (value = hash as U256).
     pub code: Vec<(B256, Bytes)>,
@@ -93,6 +94,7 @@ impl BlockWrites {
                 }
             }
         }
+        out.normalize();
         out
     }
 
@@ -116,11 +118,38 @@ impl BlockWrites {
             }
             out.storage_reads.extend(acc.storage_reads().iter().map(|&s| (a, s)));
         }
+        out.normalize();
         out
     }
 
     pub fn get(&self, key: &StateKey) -> Option<U256> {
         self.writes.iter().find(|(k, _)| k == key).map(|&(_, v)| v)
+    }
+
+    /// Sorts `writes` by key (a later entry for the same key wins).
+    pub fn normalize(&mut self) {
+        if self.is_normalized() {
+            return;
+        }
+        // Stable sort keeps insertion order within a key; keep the last entry of each run.
+        self.writes.sort_by_key(|(k, _)| *k);
+        let mut out: Vec<(StateKey, U256)> = Vec::with_capacity(self.writes.len());
+        for (k, v) in self.writes.drain(..) {
+            match out.last_mut() {
+                Some(last) if last.0 == k => last.1 = v,
+                _ => out.push((k, v)),
+            }
+        }
+        self.writes = out;
+    }
+
+    pub fn is_normalized(&self) -> bool {
+        self.writes.windows(2).all(|w| w[0].0 < w[1].0)
+    }
+
+    /// [`Self::get`] by binary search; requires [`Self::normalize`] (BAL-built values are).
+    pub fn lookup(&self, key: &StateKey) -> Option<U256> {
+        self.writes.binary_search_by(|(k, _)| k.cmp(key)).ok().map(|i| self.writes[i].1)
     }
 }
 
@@ -128,6 +157,30 @@ impl BlockWrites {
 mod tests {
     use super::*;
     use alloy_eip7928::{BalanceChange, BlockAccessIndex, SlotChanges, StorageChange};
+
+    #[test]
+    fn normalized_writes_are_sorted_and_keep_the_last_value_per_key() {
+        let (a, b) = (Address::repeat_byte(2), Address::repeat_byte(1));
+        let mut w = BlockWrites {
+            writes: vec![
+                (StateKey::Storage(a, U256::from(5)), U256::from(1)),
+                (StateKey::Balance(b), U256::from(9)),
+                (StateKey::Storage(a, U256::from(5)), U256::from(2)),
+            ],
+            ..Default::default()
+        };
+        w.normalize();
+        assert!(w.is_normalized());
+        assert_eq!(w.writes.len(), 2);
+        assert_eq!(w.lookup(&StateKey::Storage(a, U256::from(5))), Some(U256::from(2)));
+        assert_eq!(w.lookup(&StateKey::Balance(b)), Some(U256::from(9)));
+        assert_eq!(w.lookup(&StateKey::Nonce(b)), None);
+        let built = BlockWrites::from_bal(&sample());
+        assert!(built.is_normalized());
+        for (k, v) in &built.writes {
+            assert_eq!(built.lookup(k), Some(*v));
+        }
+    }
 
     fn sample() -> BlockAccessList {
         let a = Address::repeat_byte(0xaa);

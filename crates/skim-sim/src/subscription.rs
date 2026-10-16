@@ -135,6 +135,9 @@ pub struct Subscriptions {
     /// Required keys per subscription (declared + admitted learned keys).
     required: RwLock<BTreeMap<String, HashSet<StateKey>>>,
     status: RwLock<BTreeMap<String, Status>>,
+    /// `storage: all` subscriptions over their `max_slots` (at download or grown since): not
+    /// downloaded again every block; the error stays until the config changes.
+    too_large: RwLock<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -149,15 +152,29 @@ pub enum ConfigError {
     TooManyKeys(usize, usize),
 }
 
+/// Code hashes among `keys` (known, non-empty) whose bytecode skim doesn't hold.
+fn missing_code(sim: &Simulator, snap: &skim_state::Snapshot, keys: &[StateKey]) -> Vec<alloy_primitives::B256> {
+    let mut out: Vec<alloy_primitives::B256> = keys
+        .iter()
+        .filter(|k| matches!(k, StateKey::CodeHash(_)))
+        .filter_map(|k| match snap.get(k) {
+            Ok(StateValue::Known(h)) => Some(alloy_primitives::B256::from(h)),
+            _ => None,
+        })
+        .filter(|h| *h != revm::primitives::KECCAK_EMPTY && !h.is_zero() && sim.store.code(h).is_none())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Readiness: the head is current, every required key is known, every call ran cleanly at
 /// this block, and the key limit cut nothing. An empty key set from a failed run is not ready.
 fn is_ready(head_ok: bool, missing: usize, calls_ok: bool, truncated: bool) -> bool {
     head_ok && missing == 0 && calls_ok && !truncated
 }
 
-fn account_keys(a: Address) -> [StateKey; 3] {
-    [StateKey::Balance(a), StateKey::Nonce(a), StateKey::CodeHash(a)]
-}
+use crate::account_keys;
 
 impl Subscriptions {
     pub fn new(specs: Vec<SubscriptionSpec>, max_keys: usize) -> Result<Self, ConfigError> {
@@ -186,7 +203,14 @@ impl Subscriptions {
             return Err(ConfigError::TooManyKeys(total, max_keys));
         }
         let status = specs.iter().map(|s| (s.name.clone(), Status { name: s.name.clone(), ..Default::default() })).collect();
-        Ok(Self { specs, max_keys, declared: required.clone(), required: RwLock::new(required), status: RwLock::new(status) })
+        Ok(Self {
+            specs,
+            max_keys,
+            declared: required.clone(),
+            required: RwLock::new(required),
+            status: RwLock::new(status),
+            too_large: Default::default(),
+        })
     }
 
     pub fn total_keys(&self) -> usize {
@@ -249,12 +273,25 @@ impl Subscriptions {
         //     storage root), then BALs keep it current. A reorg below the download drops it.
         for spec in self.specs.iter().filter(|s| s.storage_all()) {
             let Some(a) = spec.address else { continue };
+            let max = spec.max_slots.map_or(DEFAULT_MAX_SLOTS, |l| l.0);
+            if let Some(e) = self.too_large.read().get(&spec.name) {
+                self.status.write().entry(spec.name.clone()).or_default().error = Some(e.clone());
+                continue;
+            }
             sim.store.watch_address(a);
-            if sim.store.complete_storage_block(&a).is_some() {
+            if let Some(n) = sim.store.complete_storage_len(&a) {
+                // The limit holds for the contract's whole life: slots first written after the
+                // download count too. Past it, stop tracking the contract (not just its new slots).
+                if n > max {
+                    sim.store.drop_complete_storage(&a);
+                    let e = format!("storage grew to {n} slots, past max_slots {max}; raise max_slots (or set it to unlimited)");
+                    tracing::warn!(subscription = %spec.name, address = %a, "{e}");
+                    self.too_large.write().insert(spec.name.clone(), e.clone());
+                    self.status.write().entry(spec.name.clone()).or_default().error = Some(e);
+                }
                 continue;
             }
             let at = if sim.miss_at_parent { sim.store.block(head.number.saturating_sub(1)).unwrap_or(*head) } else { *head };
-            let max = spec.max_slots.map_or(DEFAULT_MAX_SLOTS, |l| l.0);
             let tr = sim.sched.transport();
             let mut err = Some("no peer served the storage yet".to_string());
             for peer in tr.net.peers().into_iter().filter(|(_, p)| p.snap1 || p.snap2).map(|(id, _)| id).take(4) {
@@ -271,7 +308,11 @@ impl Subscriptions {
                         break;
                     }
                     Ok(skim_snap::el::StorageAll::TooLarge(n)) => {
-                        err = Some(format!("more than {max} slots ({n}+); raise max_slots (or set it to unlimited)"));
+                        let e = format!("more than {max} slots ({n}+); raise max_slots (or set it to unlimited)");
+                        // A verified answer: don't download again every block.
+                        sim.store.drop_complete_storage(&a);
+                        self.too_large.write().insert(spec.name.clone(), e.clone());
+                        err = Some(e);
                         break;
                     }
                     Ok(skim_snap::el::StorageAll::Unavailable) | Err(_) => continue,
@@ -354,15 +395,27 @@ impl Subscriptions {
             }
         }
 
-        // 3. Readiness at the head: required keys known, every call ran cleanly at this block,
-        //    and nothing was cut by the key limit.
+        // 2b. Bytecode of subscribed accounts: a code hash alone can't run a call. Fetch what is
+        //     missing (calls fetch their own as they run; declared `account: true` keys don't).
+        if let Ok(snap) = sim.store.snapshot(head) {
+            let all: Vec<StateKey> = self.required.read().values().flat_map(|k| k.iter().copied()).collect();
+            let hashes = missing_code(sim, &snap, &all);
+            if !hashes.is_empty() {
+                let at = if sim.miss_at_parent { sim.store.block(head.number.saturating_sub(1)).unwrap_or(*head) } else { *head };
+                prefetch::resolve_retained(&sim.store, &sim.sched, &at, &[], &[], &hashes, skim_snap::Priority::High, Retention::Subscribed).await;
+            }
+        }
+
+        // 3. Readiness at the head: required keys known (with their bytecode), every call ran
+        //    cleanly at this block, and nothing was cut by the key limit.
         let Ok(snap) = sim.store.snapshot(head) else { return };
         let head_ok = sim.store.head().is_some_and(|h| h.hash == head.hash);
         let req = self.required.read();
         let mut st = self.status.write();
         for spec in &self.specs {
             let keys = req.get(&spec.name).cloned().unwrap_or_default();
-            let missing = keys.iter().filter(|k| !matches!(snap.get(k), Ok(StateValue::Known(_)))).count();
+            let keys_vec: Vec<StateKey> = keys.iter().copied().collect();
+            let missing = keys.iter().filter(|k| !matches!(snap.get(k), Ok(StateValue::Known(_)))).count() + missing_code(sim, &snap, &keys_vec).len();
             let s = st.entry(spec.name.clone()).or_default();
             s.name = spec.name.clone();
             s.block = Some(head.number);

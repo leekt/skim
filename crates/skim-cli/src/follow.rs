@@ -658,7 +658,7 @@ fn spawn_prefetch(ctx: &Arc<Ctx>, b: BlockRef) {
                 Some(p) if ctx.adaptive_window => p.lock().unwrap().window(&pool.address),
                 _ => (-ctx.v3_words, ctx.v3_words),
             };
-            let (rounds, fetched) = prefetch::refresh_pool(&ctx.store, &ctx.sched, &b, &at, &pool, window, ctx.prefetch_budget).await;
+            let (rounds, fetched) = prefetch::refresh_pool(&ctx.store, &ctx.sched, &b, &at, &pool, window, ctx.prefetch_budget, skim_state::Retention::Subscribed).await;
             {
                 let mut pf = ctx.prefetched.lock().unwrap();
                 if pf.len() > 500_000 {

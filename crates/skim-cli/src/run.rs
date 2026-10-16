@@ -131,6 +131,14 @@ struct V3Config {
     /// Background prefetch budget: keys per pool per block.
     #[serde(default = "two_fifty_six")]
     prefetch_budget: usize,
+    /// Prefetched keys are a hot window, not a subscription: a key stays cached this many
+    /// blocks after it was last inside the window around the current tick.
+    #[serde(default = "sixteen")]
+    window_ttl_blocks: u64,
+}
+
+fn sixteen() -> u64 {
+    16
 }
 
 fn two() -> i32 {
@@ -329,8 +337,26 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     if store.archive().is_some() {
         spawn_archive_healer(store.clone(), net.clone(), args.archive_backfill);
     }
-    let maintaining = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let restoring = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Subscription maintenance: one pass at a time, always on the newest head. Heads that
+    // arrive during a pass are coalesced (the next pass runs once, on the latest), never
+    // dropped, so readiness and on_block results catch up instead of falling behind.
+    let (maint_tx, mut maint_rx) = tokio::sync::watch::channel::<Option<skim_state::BlockRef>>(None);
+    {
+        let (sim, subs, restoring, events) = (sim.clone(), subs.clone(), restoring.clone(), ws_events.clone());
+        tokio::spawn(async move {
+            while maint_rx.changed().await.is_ok() {
+                // Subscriptions wait for a restore: fetching the same keys over SNAP in
+                // parallel would only compete for (often absent) EL peers.
+                while restoring.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                let Some(b) = *maint_rx.borrow_and_update() else { continue };
+                subs.maintain(&sim, &b).await;
+                let _ = events.send(crate::rpc::WsEvent::Subscriptions(b.number));
+            }
+        });
+    }
     let v3 = cfg.predictors.uniswap_v3.map(Arc::new);
     if let Some(v) = &v3 {
         sim.predictor.lock().base_words = v.words;
@@ -442,14 +468,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                     tokio::spawn(v3_tick(sim.clone(), v.clone(), v3_state.clone(), ready.block));
                 }
                 // Keep subscriptions current and their readiness fresh (one pass at a time).
-                if !restoring.load(std::sync::atomic::Ordering::SeqCst) && !maintaining.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    let (sim, subs, flag, b, events) = (sim.clone(), subs.clone(), maintaining.clone(), ready.block, ws_events.clone());
-                    tokio::spawn(async move {
-                        subs.maintain(&sim, &b).await;
-                        let _ = events.send(crate::rpc::WsEvent::Subscriptions(b.number));
-                        flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                    });
-                }
+                let _ = maint_tx.send(Some(ready.block));
             }
             Placed::Reanchored(_) => tracing::warn!(number, "re-anchored"),
             Placed::Duplicate => {}
@@ -534,7 +553,8 @@ async fn v3_tick(sim: Arc<Simulator>, cfg: Arc<V3Config>, st: Arc<V3State>, b: s
     let pools = st.pools.lock().clone();
     for p in pools {
         let window = sim.predictor.lock().window(&p.address);
-        skim_sim::prefetch::refresh_pool(&sim.store, &sim.sched, &b, &at, &p, window, cfg.prefetch_budget).await;
+        let ttl = skim_state::Retention::Ttl(cfg.window_ttl_blocks);
+        skim_sim::prefetch::refresh_pool(&sim.store, &sim.sched, &b, &at, &p, window, cfg.prefetch_budget, ttl).await;
     }
     st.busy.store(false, SeqCst);
 }

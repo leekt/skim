@@ -50,6 +50,7 @@ fn describe() {
     describe_gauge!("skim_store_bytes", "Store sizes in bytes by kind (code, recent_bals)");
     describe_counter!("skim_store_admissions_refused_total", "Keys refused by max_subscribed_keys");
     describe_counter!("skim_store_on_demand_evicted_total", "On-demand keys evicted by max_on_demand_keys");
+    describe_counter!("skim_store_resolved_from_bal_total", "Reads of untracked keys answered from a recent block's BAL write instead of a fetch");
     describe_gauge!("skim_subscription_ready", "1 when a subscription's state is complete at the head");
     describe_gauge!("skim_subscription_missing_keys", "Keys a subscription still misses");
     describe_counter!("skim_served_requests_total", "Requests skim answered for other peers");
