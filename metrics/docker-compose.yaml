@@ -1,0 +1,55 @@
+# Prometheus + Grafana for skim. Start skim with `--metrics 127.0.0.1:9465`, then:
+#
+#   docker compose -f metrics/docker-compose.yaml up -d
+#
+# Grafana: http://localhost:3001 (skim dashboard is the home page). Prometheus: http://localhost:9091.
+# Everything is configurable through environment variables (or a metrics/.env file):
+#   SKIM_METRICS_TARGETS  comma-separated host:port list to scrape (default host.docker.internal:9465)
+#   SCRAPE_INTERVAL       default 5s
+#   PROMETHEUS_PORT       default 9091      PROMETHEUS_RETENTION  default 15d
+#   GRAFANA_PORT          default 3001      GRAFANA_ADMIN_PASSWORD default admin
+#   GRAFANA_ANONYMOUS     default true (view without logging in)
+services:
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    entrypoint: ["/bin/sh", "-c"]
+    # Prometheus doesn't expand env vars in its config, so the template is filled in at start.
+    command:
+      - |
+        targets=$$(echo "$${SKIM_METRICS_TARGETS}" | sed 's/[^,][^,]*/"&"/g')
+        sed -e "s|__TARGETS__|$${targets}|" -e "s|__INTERVAL__|$${SCRAPE_INTERVAL}|" /etc/prometheus/prometheus.tmpl.yaml > /prometheus/prometheus.yaml
+        exec /bin/prometheus --config.file=/prometheus/prometheus.yaml --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=$${PROMETHEUS_RETENTION}
+    environment:
+      SKIM_METRICS_TARGETS: ${SKIM_METRICS_TARGETS:-host.docker.internal:9465}
+      SCRAPE_INTERVAL: ${SCRAPE_INTERVAL:-5s}
+      PROMETHEUS_RETENTION: ${PROMETHEUS_RETENTION:-15d}
+    volumes:
+      - ./prometheus.tmpl.yaml:/etc/prometheus/prometheus.tmpl.yaml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9091}:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: ${GRAFANA_ANONYMOUS:-true}
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/skim.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./provisioning/grafana:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:

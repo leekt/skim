@@ -143,14 +143,19 @@ const { result } = await client.simulateContract({
 // answered locally in a few ms
 ```
 
-**Dashboard:** your running node serves one at `/dashboard` on its RPC address (`--rpc`, default `127.0.0.1:8545`). It shows:
-- connected peers by client, with SNAP latency per peer
-- block arrival and RPC latency
-- which addresses your calls read, and which of them aren't pinned by a subscription (with a `skim.yaml` snippet to pin them)
+**Monitoring:** run skim with `--metrics 127.0.0.1:9465` and start the bundled Prometheus and Grafana stack ([metrics/](metrics)):
 
-It's built from stock [Kumo](https://www.npmjs.com/package/@cloudflare/kumo) components, and its layout is a JSON config ([dashboard/](dashboard)).
+```bash
+docker compose -f metrics/docker-compose.yaml up -d     # Grafana on port 3001, skim dashboard preloaded
+```
 
-<img src="assets/dashboard-addresses.png" alt="skim dashboard: addresses read by eth_call, pinned or on demand, with a suggested skim.yaml" width="100%">
+The dashboard shows:
+- peers by client, with SNAP latency per peer
+- block arrival and RPC latency per method
+- which addresses your calls read, and which of them aren't pinned by a subscription
+- what skim serves to other peers, and process CPU and memory
+
+<img src="assets/grafana-dashboard.png" alt="skim Grafana dashboard" width="100%">
 
 **Next steps:**
 - **[Examples](examples):** Uniswap V3, Uniswap V4 and sending transactions, all with viem.

@@ -7,6 +7,7 @@ mod chaindata;
 mod dashboard;
 mod persist;
 mod light;
+mod metrics;
 mod follow;
 mod probe_cl;
 mod probe_clreq;

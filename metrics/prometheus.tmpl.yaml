@@ -1,0 +1,8 @@
+# Template: docker-compose.yaml fills in the targets (SKIM_METRICS_TARGETS) and interval (SCRAPE_INTERVAL).
+global:
+  scrape_interval: __INTERVAL__
+
+scrape_configs:
+  - job_name: skim
+    static_configs:
+      - targets: [__TARGETS__]

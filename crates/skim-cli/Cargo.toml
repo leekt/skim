@@ -34,6 +34,10 @@ skim-snap.workspace = true
 skim-state.workspace = true
 skim-sim.workspace = true
 axum.workspace = true
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "=0.18.3", default-features = false }
+metrics-process = "=2.4.3"
+metrics-util = { version = "0.20", default-features = false }
 serde_yaml_ng.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-rpc-types-trace.workspace = true

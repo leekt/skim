@@ -16,7 +16,8 @@ The binary is `./target/release/skim`. Nothing else is needed: no node, no datab
 
 | Port | Protocol | What |
 |---|---|---|
-| `127.0.0.1:8545` | HTTP | JSON-RPC (`--rpc`), and the dashboard at `/dashboard` |
+| `127.0.0.1:8545` | HTTP | JSON-RPC (`--rpc`) |
+| off (e.g. `127.0.0.1:9465`) | HTTP | Prometheus metrics at `/metrics` (`--metrics`) |
 | `9130` TCP + UDP, `9131` UDP | libp2p / discv5 / QUIC | consensus-layer gossip (`--cl-port`) |
 | `30388` TCP + UDP | RLPx / discv4 | execution-layer peers (`--el-port`) |
 
@@ -74,10 +75,14 @@ curl -s localhost:8545 -H 'content-type: application/json' \
 [{"name":"my-pool","ready":true,"block":11919451,"required_keys":5,"missing_keys":0, …}]
 ```
 
-**Not sure what to subscribe?** Run your app against skim and open `/dashboard` on skim's RPC address (default `127.0.0.1:8545`), tab **Addresses**:
-- It lists every contract your calls read, and whether a subscription pins it.
-- It shows how many keys had to be fetched from the network.
-- It suggests a `skim.yaml` block for the hot ones that aren't pinned.
+**Not sure what to subscribe?** Run your app against skim, then use either of these:
+- **Grafana** ([metrics/](../../metrics)): the **Addresses your calls read** table lists every contract your calls read, whether a subscription pins it, and how many keys had to be fetched from the network.
+- **`skim_dashboard`** (JSON-RPC): returns the same data plus a ready-to-paste `skim.yaml` block for the hot addresses that aren't pinned:
+
+```bash
+curl -s localhost:8545 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"skim_dashboard","params":[]}' | jq -r .result.suggestion
+```
 
 ## Next
 - [Uniswap V3 and V4 examples (viem)](../../examples): complete, runnable configs and scripts

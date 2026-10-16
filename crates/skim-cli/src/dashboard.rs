@@ -1,6 +1,6 @@
-//! What `/dashboard` shows: connected peers and their latency, block arrival, RPC latency per
-//! method, and which contract addresses requests read (pinned by a subscription or not).
-//! Served as one page (`dashboard/`, built with Kumo) plus the `skim_dashboard` JSON-RPC method.
+//! Usage and latency history behind `skim_dashboard` and the Prometheus metrics: which contract
+//! addresses requests read (pinned by a subscription or not), RPC latency per method, and
+//! block arrival.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -14,8 +14,6 @@ use skim_bal::StateKey;
 use skim_sim::db::Access;
 use skim_state::Store;
 
-/// The built page, gzipped (`cd dashboard && npm install && npm run build`).
-pub const PAGE_GZ: &[u8] = include_bytes!("../assets/dashboard.html.gz");
 
 /// Distinct slots remembered per address (counts keep going past this).
 const SLOTS_PER_ADDRESS: usize = 4096;

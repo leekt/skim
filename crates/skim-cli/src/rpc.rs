@@ -178,9 +178,12 @@ pub struct Rpc {
 /// Addresses a call read (kept with cached results so cache hits still count as usage).
 type Reads = Arc<[Address]>;
 
+/// A cached outcome: the result, or a revert's (code, message, data).
+type CachedResult = Result<Value, (i64, String, Option<Value>)>;
+
 #[derive(Default)]
 pub struct CallCache {
-    map: alloy_primitives::map::HashMap<(B256, B256), (Result<Value, (i64, String, Option<Value>)>, Reads)>,
+    map: alloy_primitives::map::HashMap<(B256, B256), (CachedResult, Reads)>,
 }
 
 impl CallCache {
@@ -716,6 +719,16 @@ impl Rpc {
         tracing::debug!(method, ms, ok = res.is_ok(), "rpc");
         if method != "skim_dashboard" {
             self.dash.record_method(method, ms, res.is_ok());
+            // Method names come from the request: only known ones get their own series.
+            let m = if known_method(method) { method.to_string() } else { "other".to_string() };
+            metrics::histogram!("skim_rpc_request_duration_seconds", "method" => m.clone()).record(ms / 1e3);
+            let outcome = match &res {
+                Ok(_) => "ok",
+                Err(e) if e.code == 3 => "reverted",
+                Err(e) if e.code == -32002 => "unavailable",
+                Err(_) => "error",
+            };
+            metrics::counter!("skim_rpc_requests_total", "method" => m, "outcome" => outcome).increment(1);
         }
         match res {
             Ok(v) => json!({"jsonrpc": "2.0", "id": id, "result": v}),
@@ -730,8 +743,104 @@ impl Rpc {
     }
 }
 
+/// Methods skim implements (others are labelled "other" in metrics, bounding cardinality).
+fn known_method(m: &str) -> bool {
+    (m.starts_with("eth_") || m.starts_with("debug_") || m.starts_with("skim_") || m.starts_with("net_") || m.starts_with("web3_"))
+        && m.len() <= 40
+        && m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 impl Rpc {
-    /// Everything `/dashboard` shows, in one document.
+    /// Refreshes the gauges and totals that mirror live state, right before a scrape.
+    pub fn refresh_metrics(&self, top_addresses: usize) {
+        use metrics::{counter, gauge};
+        let sim = &self.sim;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        if let Some(h) = sim.store.head() {
+            gauge!("skim_head_block").set(h.number as f64);
+            gauge!("skim_head_age_seconds").set(now - h.timestamp as f64);
+        }
+        let peers = sim.sched.transport().net.peers();
+        gauge!("skim_peers", "layer" => "el").set(peers.len() as f64);
+        gauge!("skim_snap_peers").set(peers.iter().filter(|(_, p)| p.snap1 || p.snap2).count() as f64);
+        for c in crate::dashboard::by_kind(peers.iter().map(|(_, p)| p.client.as_str())) {
+            gauge!("skim_peer_clients", "layer" => "el", "client" => c["client"].as_str().unwrap_or("").to_string()).set(c["count"].as_f64().unwrap_or(0.0));
+        }
+        let fetch = sim.sched.peer_stats();
+        for (id, p) in &peers {
+            let Some(f) = fetch.get(id) else { continue };
+            let labels = [("peer", format!("{:.10}", id.to_string())), ("client", crate::dashboard::client_kind(&p.client))];
+            if f.ok > 0 {
+                gauge!("skim_snap_peer_latency_ms", &labels).set(f.ewma_ms);
+            }
+            gauge!("skim_snap_peer_inflight", &labels).set(f.inflight as f64);
+            counter!("skim_snap_peer_answers_total", &labels).absolute(f.ok);
+            counter!("skim_snap_peer_errors_total", &labels).absolute(f.errors);
+        }
+        let st = sim.sched.stats();
+        for (kind, v) in [
+            ("jobs", st.jobs), ("requests", st.requests), ("ok", st.ok), ("errors", st.errors), ("failed", st.failed),
+            ("hedges", st.hedges), ("root_unavailable", st.root_unavailable), ("disconnects", st.disconnects), ("dedup_hits", st.dedup_hits),
+        ] {
+            counter!("skim_snap_fetch_total", "kind" => kind).absolute(v);
+        }
+        if let Some(s) = &self.cl_stats {
+            let s = s.lock().unwrap();
+            gauge!("skim_peers", "layer" => "cl").set(s.peer_list.len() as f64);
+            for c in crate::dashboard::by_kind(s.peer_list.iter().map(|p| p.agent.as_deref().unwrap_or(""))) {
+                gauge!("skim_peer_clients", "layer" => "cl", "client" => c["client"].as_str().unwrap_or("").to_string()).set(c["count"].as_f64().unwrap_or(0.0));
+            }
+            for (kind, v) in [("envelopes_by_range", s.envelope_range_reqs), ("envelopes_by_root", s.envelope_root_reqs)] {
+                counter!("skim_served_requests_total", "layer" => "cl", "kind" => kind).absolute(v);
+            }
+            counter!("skim_served_items_total", "layer" => "cl", "kind" => "envelopes").absolute(s.envelopes_served);
+        }
+        let c = sim.sched.transport().net.serve_counts();
+        for (kind, reqs, items) in [
+            ("headers", c.header_reqs, c.headers), ("bodies", c.body_reqs, c.bodies), ("receipts", c.receipt_reqs, c.receipts),
+            ("bals", c.bal_reqs, c.bals), ("snap", c.snap_reqs, c.codes),
+        ] {
+            counter!("skim_served_requests_total", "layer" => "el", "kind" => kind).absolute(reqs);
+            counter!("skim_served_items_total", "layer" => "el", "kind" => kind).absolute(items);
+        }
+        let z = sim.store.sizes();
+        gauge!("skim_store_keys", "kind" => "subscribed").set(z.watched_keys as f64);
+        gauge!("skim_store_keys", "kind" => "on_demand").set(z.temp_keys as f64);
+        gauge!("skim_store_keys", "kind" => "versions").set(z.versions as f64);
+        gauge!("skim_store_bytes", "kind" => "code").set(z.code_bytes as f64);
+        gauge!("skim_store_bytes", "kind" => "recent_bals").set(z.recent_bal_bytes as f64);
+        counter!("skim_store_admissions_refused_total").absolute(z.admissions_refused);
+        counter!("skim_store_on_demand_evicted_total").absolute(z.on_demand_evicted);
+        if let Some(subs) = &self.subs {
+            for s in subs.status() {
+                gauge!("skim_subscription_ready", "name" => s.name.clone()).set(s.ready as u8 as f64);
+                gauge!("skim_subscription_missing_keys", "name" => s.name.clone()).set(s.missing_keys as f64);
+            }
+        }
+        if top_addresses > 0 {
+            let labels = self.subs.as_ref().map(|s| s.labels()).unwrap_or_default();
+            for a in self.dash.addresses_json(&sim.store, &labels).into_iter().take(top_addresses) {
+                // Only `address` labels the counters, so a change of pinning or subscription
+                // never splits an address into two series.
+                let addr = a["address"].as_str().unwrap_or("").to_string();
+                counter!("skim_address_calls_total", "address" => addr.clone()).absolute(a["calls"].as_u64().unwrap_or(0));
+                counter!("skim_address_fetched_keys_total", "address" => addr.clone()).absolute(a["fetched"].as_u64().unwrap_or(0));
+                let pinning = match a["status"].as_str() {
+                    Some("pinned") => 2.0,
+                    Some("partly pinned") => 1.0,
+                    _ => 0.0,
+                };
+                gauge!("skim_address_pinning", "address" => addr.clone()).set(pinning);
+                gauge!("skim_address_info", "address" => addr.clone(), "subscription" => a["label"].as_str().unwrap_or("").to_string()).set(1.0);
+                let slots = a["slots"].as_u64().unwrap_or(0);
+                let unpinned = a["unpinned_slots"].as_u64().unwrap_or(0);
+                gauge!("skim_address_slots", "address" => addr.clone(), "pinned" => "true").set((slots - unpinned) as f64);
+                gauge!("skim_address_slots", "address" => addr, "pinned" => "false").set(unpinned as f64);
+            }
+        }
+    }
+
+    /// `skim_dashboard`: peers, latency, RPC and address usage in one document.
     fn dashboard_json(&self) -> Value {
         use crate::dashboard::{by_kind, client_kind, round2};
         let sim = &self.sim;
@@ -877,16 +986,6 @@ pub async fn serve(rpc: Arc<Rpc>, addr: std::net::SocketAddr) -> anyhow::Result<
     // HTTP POST and WebSocket on the same address.
     let app = Router::new()
         .route("/", post(handle).get(ws_upgrade))
-        .route(
-            "/dashboard",
-            axum::routing::get(|| async {
-                use axum::http::header;
-                (
-                    [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CONTENT_ENCODING, "gzip")],
-                    crate::dashboard::PAGE_GZ,
-                )
-            }),
-        )
         .with_state(rpc);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "JSON-RPC listening (HTTP and WebSocket)");

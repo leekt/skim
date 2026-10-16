@@ -81,6 +81,17 @@ pub struct Args {
     /// Don't cache `eth_call` results per (block, request) (measurements of raw execution).
     #[arg(long)]
     no_call_cache: bool,
+    /// Serve Prometheus metrics at http://<addr>/metrics (e.g. 127.0.0.1:9465; off unless set).
+    /// `metrics/` has a Prometheus + Grafana stack with skim's dashboard.
+    #[arg(long, value_name = "ADDR")]
+    metrics: Option<SocketAddr>,
+    /// Addresses (most-called first) exported with per-address series; 0 exports none.
+    #[arg(long, default_value_t = 50)]
+    metrics_addresses: usize,
+    /// Seconds after which a series that stopped updating (a peer that left, an address that
+    /// fell out of the top N) is dropped from /metrics.
+    #[arg(long, default_value_t = 300)]
+    metrics_idle: u64,
     /// How long a request that needs state skim doesn't hold waits for a SNAP peer when none is
     /// connected (the first minutes after a cold start), before answering -32002.
     #[arg(long, default_value_t = 60)]
@@ -182,6 +193,11 @@ fn hundred_k() -> skim_sim::subscription::Limit {
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
+    // Before anything else starts: reth registers its network metrics when the network is built.
+    let metrics_handle = match args.metrics {
+        Some(_) => Some(crate::metrics::install(std::time::Duration::from_secs(args.metrics_idle))?),
+        None => None,
+    };
     let persist = if args.ephemeral {
         None
     } else {
@@ -289,7 +305,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         net.serve(Arc::new(crate::serving::Served { chain: chaindata.clone(), store: store.clone() }));
     }
     let (ws_events, _) = tokio::sync::broadcast::channel::<crate::rpc::WsEvent>(256);
-    tokio::spawn(serve(Arc::new(Rpc {
+    let rpc = Arc::new(Rpc {
         sim: sim.clone(),
         subs: Some(subs.clone()),
         chain: Some(chaindata.clone()),
@@ -300,7 +316,16 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         cache_calls: !args.no_call_cache,
         cl_stats: Some(cl.stats.clone()),
         dash: dash.clone(),
-    }), args.rpc));
+    });
+    tokio::spawn(serve(rpc.clone(), args.rpc));
+    if let (Some(addr), Some(handle)) = (args.metrics, metrics_handle) {
+        let top = args.metrics_addresses;
+        tokio::spawn(async move {
+            if let Err(e) = crate::metrics::serve(addr, handle, rpc, top).await {
+                tracing::error!("metrics endpoint: {e}");
+            }
+        });
+    }
     if store.archive().is_some() {
         spawn_archive_healer(store.clone(), net.clone(), args.archive_backfill);
     }
@@ -392,6 +417,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 }
                 tracing::info!(number, arrival_ms = arrival_ms as i64, changed = ready.changed_keys.len(), ?reorged_to, filled, "state ready");
                 dash.record_block(crate::dashboard::BlockStat { number, arrival_ms, changed: ready.changed_keys.len() });
+                if arrival_ms.is_finite() {
+                    metrics::histogram!("skim_block_arrival_seconds").record(arrival_ms / 1e3);
+                }
+                metrics::gauge!("skim_block_changed_keys").set(ready.changed_keys.len() as f64);
                 light.on_block(&store);
                 let _ = ws_events.send(crate::rpc::WsEvent::NewHead(ready.block));
                 if let Some(s) = saved.take() {
