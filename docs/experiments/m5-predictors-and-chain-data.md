@@ -93,7 +93,13 @@ How each piece of data is obtained:
 | Two addresses, 1,024 blocks | 183 | 13.1 s |
 | `Swap` topic with no address, 1,024 blocks (bloom saturated) | 881 | 116 s |
 
-Wide historical scans are bounded by receipt downloads from the 1–2 EL peers connected at the time. Narrow filters over followed blocks are nearly free. Sending was checked for decoding, validation and broadcast. A funded Sepolia key is needed for an end-to-end inclusion test.
+Wide historical scans are bounded by receipt downloads from the 1–2 EL peers connected at the time. Narrow filters over followed blocks are nearly free. **End-to-end send** (2026-10-16, `examples/send-transaction/send.mjs`, unmodified viem, a 0-value self-transfer from a test key):
+1. skim gave viem the nonce, gas and fees, then broadcast the signed transaction to 3 EL peers.
+2. A gossiped payload included it 3.2 s later (block 11,924,541, index 147). viem's `waitForTransactionReceipt` returned success 4.3 s after sending.
+3. Compared with Infura afterwards:
+   - `eth_getTransactionReceipt`: identical on all 14 shared fields
+   - `eth_getTransactionByHash`: identical on all 20 shared fields
+   - `eth_getTransactionCount` (latest and pending) and `eth_getBalance`: identical
 
 ## 4. Warm-path latency (after the review fixes)
 Three things ran on every call, even when every key was already local:

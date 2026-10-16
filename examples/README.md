@@ -72,6 +72,13 @@ PRIVATE_KEY=0x… npm run send -- 0xRecipient 0.001
 2. `eth_sendRawTransaction` is checked against verified state, then gossiped to skim's EL peers.
 3. `waitForTransactionReceipt` polls skim. The receipt comes from the including block's peers, checked against `receiptsRoot`.
 
+```text
+from 0x6011…0491  balance 0.05 ETH
+sent 0xeb9b34c0…1e50
+included in block 11924541 (index 147), status success, gas used 12000, after 4.3 s
+```
+The receipt and transaction skim served were identical to a reference node's.
+
 ## Adapting these to your app
 1. **Subscribe what you read.** List the slots if you know them; otherwise subscribe the calls your app makes. See the [configuration reference](../docs/guide/configuration.md).
 2. **Point your client at skim.** `http('http://127.0.0.1:8545')` in viem, `--rpc-url` in Foundry.
