@@ -205,3 +205,18 @@ Live, with a snapshot 655 blocks old:
 | Subscriptions ready | after the replay (79 s here; 175 s for the 3,900-block gap) | **25 s** after start (first block at 20 s) |
 | Replay | blocks readiness | finished at 79 s in the background, installed the 2 keys still missing |
 | Pool `slot0` / liquidity and the subscribed quote vs a reference node | | identical, both before and after the replay landed |
+
+## Fourth review (storage-mode transitions)
+Values move between modes: recent BAL → on demand → subscribed → whole storage → archive. The fixes give every move the same rules:
+- **Ownership:** a key owned by a subscription (individually, or through its address) never loses versions to an on-demand TTL. That applies to both expiry and capacity eviction, and `watch_address` clears the address's TTL entries.
+- **Promotion:** when a key gets a retention (on-demand read, subscription, archive) and holds no versions, the values it only had in recent BALs become versions, at the blocks that wrote them. From there BAL writes keep it current, and the archive persists it from the write.
+
+| Finding | Fix | Regression test (✓ = fails on the previous code) |
+|---|---|---|
+| P1: a key fetched on demand, then covered by `storage: all`, lost its newer versions when the old TTL expired, and reads fell back to the download's old value | Ownership: an owned key's versions are never deleted by TTL expiry or capacity eviction | `ttl_key_promoted_to_whole_storage_keeps_its_newer_versions` ✓, `capacity_eviction_never_deletes_versions_a_subscription_owns` ✓ |
+| P1: `safe` / `finalized` resolved by height only: after the light client verified A100, a chain switch to B100 made `safe` return B100 | The light client keeps verified blocks as (number, hash) pairs that move together. RPC resolves the pair and refuses (`-32002`) when the block at that height has another hash. A verified block replaced by a reorg is dropped. Same for `latest` under `--require-verified` | `safe_never_resolves_to_a_replacement_block_at_the_same_height`, `number_and_hash_move_together` |
+| P2: a value answered from a recent BAL was never installed. A subscription or archive registered the key without a value, and an on-demand read couldn't extend a TTL that didn't exist | Promotion from the BAL index on `watch_key`, archiving, and on-demand use | `a_bal_only_value_is_promoted_when_a_key_is_subscribed` ✓, `a_bal_only_value_is_archived_from_the_block_that_wrote_it` ✓, `an_on_demand_read_of_a_bal_only_value_keeps_it` ✓ |
+| P2: an oversized `storage: all` answer (cut off at `max_slots`, before the storage root could be checked) disabled the subscription for the process | An oversized answer is a peer's claim: try the other peers, then back off (32 blocks, doubling, at most 2,048) and retry. Only verified facts are permanent: growth past `max_slots` (from verified BALs), or a budget drop. Pages with duplicate or out-of-order leaves are rejected as bad answers | `unverified_oversized_answers_back_off_instead_of_disabling` |
+| P2: whole-storage growth was counted but not held to `max_subscribed_keys`, and an install didn't count slots written during its download | Growth past the budget drops the growing contract's whole-storage tracking (never: keep claiming completeness while skipping writes). The subscription reports why. An install counts writes since its download block | `whole_storage_growth_is_held_to_the_global_budget`, `install_counts_slots_written_during_the_download_toward_the_budget` |
+
+**CI** (`.github/workflows/ci.yml`) runs the workspace tests on every push and pull request, including all of the regressions above, and replays past fuzz crashes.

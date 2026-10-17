@@ -135,9 +135,18 @@ pub struct Subscriptions {
     /// Required keys per subscription (declared + admitted learned keys).
     required: RwLock<BTreeMap<String, HashSet<StateKey>>>,
     status: RwLock<BTreeMap<String, Status>>,
-    /// `storage: all` subscriptions over their `max_slots` (at download or grown since): not
-    /// downloaded again every block; the error stays until the config changes.
+    /// `storage: all` subscriptions that verifiably exceed a limit (grew past `max_slots`, or
+    /// the store dropped them at `max_subscribed_keys`): not downloaded again; the error stays
+    /// until restart. Only verified facts land here.
     too_large: RwLock<BTreeMap<String, String>>,
+    /// `storage: all` downloads to retry later: (block to retry at, attempts so far). Set when
+    /// peers only gave unverified oversized answers, or the budget refused the install.
+    retry_at: RwLock<BTreeMap<String, (u64, u32)>>,
+}
+
+/// Backoff for `storage: all` retries: 32 blocks, doubling, at most ~7 hours of blocks.
+fn retry_after(attempts: u32) -> u64 {
+    (32u64 << attempts.min(6)).min(2048)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -210,6 +219,7 @@ impl Subscriptions {
             required: RwLock::new(required),
             status: RwLock::new(status),
             too_large: Default::default(),
+            retry_at: Default::default(),
         })
     }
 
@@ -278,10 +288,18 @@ impl Subscriptions {
                 self.status.write().entry(spec.name.clone()).or_default().error = Some(e.clone());
                 continue;
             }
+            // The store drops a whole-storage contract whose growth hits the global budget.
+            if let Some(e) = sim.store.take_complete_drop(&a) {
+                tracing::warn!(subscription = %spec.name, address = %a, "{e}");
+                self.too_large.write().insert(spec.name.clone(), e.clone());
+                self.status.write().entry(spec.name.clone()).or_default().error = Some(e);
+                continue;
+            }
             sim.store.watch_address(a);
             if let Some(n) = sim.store.complete_storage_len(&a) {
                 // The limit holds for the contract's whole life: slots first written after the
-                // download count too. Past it, stop tracking the contract (not just its new slots).
+                // (verified) download count too, and those writes come from verified BALs. Past
+                // it, stop tracking the contract (not just its new slots).
                 if n > max {
                     sim.store.drop_complete_storage(&a);
                     let e = format!("storage grew to {n} slots, past max_slots {max}; raise max_slots (or set it to unlimited)");
@@ -291,9 +309,14 @@ impl Subscriptions {
                 }
                 continue;
             }
+            if self.retry_at.read().get(&spec.name).is_some_and(|(at, _)| head.number < *at) {
+                continue; // backing off; the last error stays in the status
+            }
             let at = if sim.miss_at_parent { sim.store.block(head.number.saturating_sub(1)).unwrap_or(*head) } else { *head };
             let tr = sim.sched.transport();
             let mut err = Some("no peer served the storage yet".to_string());
+            let mut back_off = false;
+            let mut oversized_reports = Vec::new();
             for peer in tr.net.peers().into_iter().filter(|(_, p)| p.snap1 || p.snap2).map(|(id, _)| id).take(4) {
                 match tr.storage_all(peer, at.state_root, a, max).await {
                     Ok(skim_snap::el::StorageAll::Complete { slots, .. }) => {
@@ -303,19 +326,38 @@ impl Subscriptions {
                                 tracing::info!(subscription = %spec.name, address = %a, slots = n, block = at.number, "storage: all downloaded and verified");
                                 None
                             }
-                            Err(e) => Some(e.to_string()),
+                            Err(e) => {
+                                // e.g. the subscribed-key budget: retry later, not every block.
+                                back_off = true;
+                                Some(e.to_string())
+                            }
                         };
                         break;
                     }
                     Ok(skim_snap::el::StorageAll::TooLarge(n)) => {
-                        let e = format!("more than {max} slots ({n}+); raise max_slots (or set it to unlimited)");
-                        // A verified answer: don't download again every block.
-                        sim.store.drop_complete_storage(&a);
-                        self.too_large.write().insert(spec.name.clone(), e.clone());
-                        err = Some(e);
-                        break;
+                        // The leaves passed the budget before the storage root could be checked,
+                        // so this is a peer's claim, not a verified size: try the other peers.
+                        oversized_reports.push(n);
+                        continue;
                     }
                     Ok(skim_snap::el::StorageAll::Unavailable) | Err(_) => continue,
+                }
+            }
+            if err.is_some() && !oversized_reports.is_empty() {
+                back_off = true;
+                err = Some(format!(
+                    "{} peer(s) sent more than {max} slots ({}+, unverified: the download stops at max_slots before the storage root can be checked); raise max_slots if the contract really is that large",
+                    oversized_reports.len(),
+                    oversized_reports.iter().min().unwrap()
+                ));
+            }
+            {
+                let mut r = self.retry_at.write();
+                if back_off {
+                    let attempts = r.get(&spec.name).map_or(0, |(_, a)| a + 1);
+                    r.insert(spec.name.clone(), (head.number + retry_after(attempts), attempts));
+                } else if err.is_none() {
+                    r.remove(&spec.name);
                 }
             }
             if let Some(e) = err {
@@ -438,6 +480,15 @@ impl Subscriptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unverified_oversized_answers_back_off_instead_of_disabling() {
+        // Retries are spaced out but never stop: 32, 64, ... blocks, capped at 2048.
+        assert_eq!(retry_after(0), 32);
+        assert_eq!(retry_after(1), 64);
+        assert_eq!(retry_after(6), 2048);
+        assert_eq!(retry_after(40), 2048);
+    }
 
     #[test]
     fn failed_or_truncated_simulations_are_never_ready() {

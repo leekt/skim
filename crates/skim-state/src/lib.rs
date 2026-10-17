@@ -122,6 +122,9 @@ struct Inner {
     /// Contracts whose whole storage is known (`storage: all`): every slot at `block`, keyed by
     /// keccak(slot) as the trie stores it. Later writes are ordinary versions on top.
     complete: HashMap<Address, Complete>,
+    /// Whole-storage contracts dropped because their growth hit `max_subscribed_keys`, and why
+    /// (reported by the owning subscription).
+    dropped_complete: HashMap<Address, String>,
 }
 
 #[derive(Clone)]
@@ -138,10 +141,9 @@ impl Complete {
         self.slots.len() + self.extra.len()
     }
 
-    fn note_write(&mut self, slot: U256) {
-        if !self.extra.contains(&slot) && !self.slots.contains_key(&keccak256(slot.to_be_bytes::<32>())) {
-            self.extra.insert(slot);
-        }
+    /// Records a write; true if it is a slot the contract didn't hold yet.
+    fn note_write(&mut self, slot: U256) -> bool {
+        !self.extra.contains(&slot) && !self.slots.contains_key(&keccak256(slot.to_be_bytes::<32>())) && self.extra.insert(slot)
     }
 }
 
@@ -162,6 +164,52 @@ impl Inner {
             StateKey::Balance(a) | StateKey::Nonce(a) | StateKey::CodeHash(a) | StateKey::Storage(a, _) => a,
         };
         self.watched_addresses.contains(a)
+    }
+
+    fn subscribed_total(&self) -> usize {
+        self.watched_keys.len() + self.complete.values().map(Complete::len).sum::<usize>()
+    }
+
+    /// Stops whole-storage tracking of `a`: the address is no longer tracked, and its keys'
+    /// versions are dropped unless a key is watched individually.
+    fn drop_complete(&mut self, a: &Address) {
+        self.complete.remove(a);
+        self.watched_addresses.remove(a);
+        let watched = std::mem::take(&mut self.watched_keys);
+        self.versions.retain(|k, _| match k {
+            StateKey::Storage(x, _) | StateKey::Balance(x) | StateKey::Nonce(x) | StateKey::CodeHash(x) => x != a || watched.contains(k),
+        });
+        self.watched_keys = watched;
+    }
+
+    /// Owned by a subscription (the key itself, or its whole address). An owned key's versions
+    /// are never deleted because of an on-demand TTL, whatever TTL entry it still has.
+    fn owned(&self, k: &StateKey) -> bool {
+        self.watched_keys.contains(k) || self.tracked_by_address(k)
+    }
+
+    /// The writes to `k` in the recent-BAL index, oldest first, if they are usable: every block
+    /// from the first of them to the head is indexed (a gap could hide a write).
+    fn bal_writes(&self, k: &StateKey) -> Vec<(u64, U256)> {
+        let Some(head) = self.head().map(|h| h.number) else { return vec![] };
+        let w: Vec<(u64, U256)> = self.recent.iter().filter_map(|(n, b)| b.lookup(k).map(|v| (*n, v))).collect();
+        match w.first() {
+            Some((first, _)) if self.recent.range(first..=&head).count() as u64 == head - first + 1 => w,
+            _ => vec![],
+        }
+    }
+
+    /// Promotion from the recent-BAL index: when a key gets a retention (on-demand, subscribed,
+    /// archived) and holds no versions, the values it only had in recent BALs become its
+    /// versions, at the blocks that wrote them. From there BAL writes keep it current like any
+    /// fetched key, and archiving persists them.
+    fn seed_from_bal(&mut self, k: &StateKey) {
+        if self.versions.get(k).is_some_and(|v| !v.is_empty()) {
+            return;
+        }
+        for (n, v) in self.bal_writes(k) {
+            self.put(*k, n, v);
+        }
     }
 
     fn put(&mut self, key: StateKey, number: u64, value: U256) {
@@ -314,6 +362,8 @@ impl Store {
         }
         st.temp.remove(&k);
         st.watched_keys.insert(k);
+        // Seed before archiving, so the archive starts at the block that wrote the value.
+        st.seed_from_bal(&k);
         if !st.archived.insert(k) {
             return true;
         }
@@ -331,6 +381,7 @@ impl Store {
         let mut st = self.inner.write();
         st.temp.remove(&k);
         st.watched_keys.insert(k);
+        st.seed_from_bal(&k);
         true
     }
 
@@ -344,7 +395,13 @@ impl Store {
 
     /// Every BAL write to this address is recorded from now on.
     pub fn watch_address(&self, a: Address) {
-        self.inner.write().watched_addresses.insert(a);
+        let mut st = self.inner.write();
+        st.watched_addresses.insert(a);
+        // The address owns its keys now: on-demand TTL entries for them must not expire (and
+        // delete) versions that address-level tracking keeps current.
+        st.temp.retain(|k, _| match k {
+            StateKey::Balance(x) | StateKey::Nonce(x) | StateKey::CodeHash(x) | StateKey::Storage(x, _) => *x != a,
+        });
     }
 
     /// Subscribes `k`. Returns false (and changes nothing) if the subscribed-key limit refuses it.
@@ -355,6 +412,7 @@ impl Store {
         }
         st.temp.remove(&k);
         st.watched_keys.insert(k);
+        st.seed_from_bal(&k);
         true
     }
 
@@ -368,14 +426,20 @@ impl Store {
         }
     }
 
-    /// Extends on-demand keys that were just used (`cache_ttl_blocks` from the head).
+    /// Extends on-demand keys that were just used (`cache_ttl_blocks` from the head). A used key
+    /// skim doesn't track yet but read from a recent BAL becomes on-demand state like a fetched
+    /// one (its BAL values become versions), so it stays known after the BAL leaves the window.
     pub fn touch_ttl(&self, keys: &[StateKey], n: u64) {
         // Most calls in a block find their keys already extended to head + n: check under the
-        // read lock and only take the write lock when something actually needs extending.
+        // read lock and only take the write lock when something actually needs doing.
         {
             let st = self.inner.read();
             let Some(head) = st.head().map(|h| h.number) else { return };
-            if !keys.iter().any(|k| st.temp.get(k).is_some_and(|e| *e < head + n)) {
+            let needs = |k: &StateKey| match st.temp.get(k) {
+                Some(e) => *e < head + n,
+                None => !st.tracked(k) && !st.bal_writes(k).is_empty(),
+            };
+            if !keys.iter().any(needs) {
                 return;
             }
         }
@@ -384,8 +448,31 @@ impl Store {
         for k in keys {
             if let Some(e) = st.temp.get_mut(k) {
                 *e = (*e).max(head + n);
+            } else if !st.tracked(k) && !st.bal_writes(k).is_empty() {
+                self.admit_temp(&mut st, *k, head + n);
+                st.seed_from_bal(k);
             }
         }
+    }
+
+    /// Adds an on-demand entry expiring at `until`, evicting the soonest-expiring tenth when
+    /// `max_on_demand` is reached (never `key` itself, never versions of owned keys).
+    fn admit_temp(&self, st: &mut Inner, key: StateKey, until: u64) {
+        let max = self.max_on_demand.load(std::sync::atomic::Ordering::Relaxed);
+        if !st.temp.contains_key(&key) && st.temp.len() >= max {
+            let mut by_exp: Vec<(u64, StateKey)> = st.temp.iter().map(|(k, e)| (*e, *k)).collect();
+            by_exp.sort();
+            let n_evict = (max / 10).max(1).min(by_exp.len());
+            for (_, k) in by_exp.into_iter().take(n_evict) {
+                st.temp.remove(&k);
+                if !st.owned(&k) {
+                    st.versions.remove(&k);
+                }
+            }
+            self.on_demand_evicted.fetch_add(n_evict as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        let e = st.temp.entry(key).or_insert(0);
+        *e = (*e).max(until);
     }
 
     pub fn is_subscribed(&self, k: &StateKey) -> bool {
@@ -420,16 +507,30 @@ impl Store {
                 }
             }
             let mut changed = Vec::new();
+            let max = self.max_subscribed.load(std::sync::atomic::Ordering::Relaxed);
+            let mut over_budget: Vec<Address> = Vec::new();
             for &(k, v) in &writes.writes {
                 if st.tracked(&k) {
                     if let StateKey::Storage(a, s) = k
-                        && let Some(c) = st.complete.get_mut(&a)
+                        && st.complete.get_mut(&a).is_some_and(|c| c.note_write(s))
+                        && st.subscribed_total() > max
+                        && !over_budget.contains(&a)
                     {
-                        c.note_write(s);
+                        over_budget.push(a);
                     }
                     st.put(k, block.number, v);
                     changed.push(k);
                 }
+            }
+            // A whole-storage contract whose growth exceeds the subscribed-key budget stops
+            // being tracked as a whole (never: keep claiming completeness and skip its writes).
+            for a in over_budget {
+                st.drop_complete(&a);
+                st.dropped_complete.insert(
+                    a,
+                    format!("whole storage dropped at block {}: growth exceeded limits.max_subscribed_keys = {max}", block.number),
+                );
+                self.admissions_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             // Keep code only for tracked accounts: every contract deployed on the chain shows up
             // in some BAL, and caching all of it grows without bound.
@@ -520,20 +621,7 @@ impl Store {
                 let subscribed = st.watched_keys.contains(&key) || st.tracked_by_address(&key);
                 if !subscribed {
                     let head = st.head().map_or(at.number, |h| h.number);
-                    let max = self.max_on_demand.load(std::sync::atomic::Ordering::Relaxed);
-                    if !st.temp.contains_key(&key) && st.temp.len() >= max {
-                        // Evict the soonest-expiring tenth (never the key being inserted).
-                        let mut by_exp: Vec<(u64, StateKey)> = st.temp.iter().map(|(k, e)| (*e, *k)).collect();
-                        by_exp.sort();
-                        let n_evict = (max / 10).max(1).min(by_exp.len());
-                        for (_, k) in by_exp.into_iter().take(n_evict) {
-                            st.temp.remove(&k);
-                            st.versions.remove(&k);
-                        }
-                        self.on_demand_evicted.fetch_add(n_evict as u64, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    let e = st.temp.entry(key).or_insert(0);
-                    *e = (*e).max(head + n);
+                    self.admit_temp(&mut st, key, head + n);
                 }
             }
         }
@@ -691,25 +779,32 @@ impl Store {
         if st.chain.get(&at.number).map(|b| b.hash) != Some(at.hash) {
             return Err(StateError::Reorged { number: at.number, hash: at.hash });
         }
-        let max = self.max_subscribed.load(std::sync::atomic::Ordering::Relaxed);
-        let others: usize = st.complete.iter().filter(|(x, _)| **x != a).map(|(_, c)| c.len()).sum();
-        if st.watched_keys.len() + others + slots.len() > max {
-            self.admissions_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Err(StateError::LimitReached(slots.len()));
-        }
-        st.watched_addresses.insert(a);
         let later: Vec<(u64, StateKey, U256)> = st
             .recent
             .range(at.number + 1..)
             .flat_map(|(n, w)| w.writes.iter().filter(|(k, _)| matches!(k, StateKey::Storage(x, _) if *x == a)).map(move |(k, v)| (*n, *k, *v)))
             .collect();
         let mut c = Complete { block: at.number, slots: Arc::new(slots.into_iter().collect()), extra: HashSet::default() };
-        for (n, k, v) in later {
+        for (_, k, _) in &later {
             if let StateKey::Storage(_, s) = k {
-                c.note_write(s);
+                c.note_write(*s);
             }
+        }
+        // Slots written between the download block and now count toward the budget too.
+        let max = self.max_subscribed.load(std::sync::atomic::Ordering::Relaxed);
+        let others: usize = st.complete.iter().filter(|(x, _)| **x != a).map(|(_, c)| c.len()).sum();
+        if st.watched_keys.len() + others + c.len() > max {
+            self.admissions_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(StateError::LimitReached(c.len()));
+        }
+        st.watched_addresses.insert(a);
+        st.temp.retain(|k, _| match k {
+            StateKey::Balance(x) | StateKey::Nonce(x) | StateKey::CodeHash(x) | StateKey::Storage(x, _) => *x != a,
+        });
+        for (n, k, v) in later {
             st.put(k, n, v);
         }
+        st.dropped_complete.remove(&a);
         st.complete.insert(a, c);
         Ok(())
     }
@@ -722,14 +817,13 @@ impl Store {
     /// Stops keeping a contract's whole storage (e.g. it grew past its limit): the address is
     /// no longer tracked, and its slots' versions are dropped unless watched individually.
     pub fn drop_complete_storage(&self, a: &Address) {
-        let mut st = self.inner.write();
-        st.complete.remove(a);
-        st.watched_addresses.remove(a);
-        let watched = std::mem::take(&mut st.watched_keys);
-        st.versions.retain(|k, _| match k {
-            StateKey::Storage(x, _) | StateKey::Balance(x) | StateKey::Nonce(x) | StateKey::CodeHash(x) => x != a || watched.contains(k),
-        });
-        st.watched_keys = watched;
+        self.inner.write().drop_complete(a);
+    }
+
+    /// Why a whole-storage contract was dropped by the store (subscribed-key budget), if it was.
+    /// Taking it clears it.
+    pub fn take_complete_drop(&self, a: &Address) -> Option<String> {
+        self.inner.write().dropped_complete.remove(a)
     }
 
     /// The block a contract's whole storage is known from, if it is.
@@ -789,7 +883,10 @@ impl Store {
         let expired: Vec<StateKey> = st.temp.iter().filter(|(_, e)| **e < head).map(|(k, _)| *k).collect();
         for k in expired {
             st.temp.remove(&k);
-            st.versions.remove(&k);
+            // A subscription (key or address) may own it now: its versions are not the TTL's.
+            if !st.owned(&k) {
+                st.versions.remove(&k);
+            }
         }
         // Bytecode lives only as long as some tracked account's code hash points at it.
         let referenced: HashSet<B256> = st

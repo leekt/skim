@@ -461,3 +461,120 @@ fn complete_storage_is_dropped_when_its_block_is_reorged_out_and_counts_toward_t
     let r = s.install_complete_storage(&blk(2, 1), A, (1..=3).map(|i| (h(i), U256::from(i))).collect());
     assert!(matches!(r, Err(StateError::LimitReached(3))));
 }
+
+// ---- Third review: transitions between storage modes ----------------------------------------
+
+#[test]
+fn ttl_key_promoted_to_whole_storage_keeps_its_newer_versions() {
+    // Review scenario: K fetched with a short TTL at 1, whole storage installed at 1 (K = 10),
+    // block 2 writes K = 20, then the old TTL expires. K must read 20, never the download's 10.
+    let s = Store::new(64);
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    s.insert_base_with(&blk(1, 0), slot(4), U256::from(10), Retention::Ttl(2)).unwrap();
+    s.watch_address(A);
+    let h = keccak256(U256::from(4).to_be_bytes::<32>());
+    s.install_complete_storage(&blk(1, 0), A, vec![(h, U256::from(10))]).unwrap();
+    s.apply_block(blk(2, 0), writes(&[(slot(4), 20)])).unwrap();
+    for n in 3..=8 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap(); // the TTL (1 + 2) is long gone
+    }
+    assert_eq!(known(&s.snapshot(&blk(8, 0)).unwrap(), slot(4)), Some(20));
+}
+
+#[test]
+fn capacity_eviction_never_deletes_versions_a_subscription_owns() {
+    let s = Store::new(4);
+    s.set_max_on_demand(4);
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    s.insert_base_with(&blk(1, 0), slot(1), U256::from(11), Retention::Ttl(100)).unwrap();
+    s.watch_address(A); // A owns slot 1 now
+    s.apply_block(blk(2, 0), writes(&[(slot(1), 12)])).unwrap();
+    for n in 3..=8 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap(); // block 2's BAL leaves the window
+    }
+    let b = Address::repeat_byte(0xbb);
+    for i in 0..20u64 {
+        s.insert_base_with(&blk(8, 0), StateKey::Storage(b, U256::from(i)), U256::from(i), Retention::Ttl(100)).unwrap();
+    }
+    assert_eq!(known(&s.snapshot(&blk(8, 0)).unwrap(), slot(1)), Some(12));
+}
+
+#[test]
+fn a_bal_only_value_is_promoted_when_a_key_is_subscribed() {
+    let s = Store::new(4);
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    s.apply_block(blk(2, 0), writes(&[(slot(6), 60)])).unwrap(); // untracked: BAL index only
+    assert!(s.watch_key(slot(6)));
+    for n in 3..=12 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap(); // block 2 leaves the 4-block window
+    }
+    // Still known: the BAL value became a version when the key was subscribed.
+    assert_eq!(known(&s.snapshot(&blk(12, 0)).unwrap(), slot(6)), Some(60));
+}
+
+#[test]
+fn a_bal_only_value_is_archived_from_the_block_that_wrote_it() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::with_archive(4, archive::Archive::open(d.path().join("a.redb")).unwrap()).unwrap();
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    s.apply_block(blk(2, 0), writes(&[(slot(6), 60)])).unwrap();
+    s.apply_block(blk(3, 0), writes(&[])).unwrap();
+    assert!(s.archive_key_checked(slot(6)));
+    for n in 4..=12 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap();
+    }
+    let old = s.snapshot(&blk(3, 0)).unwrap();
+    assert!(old.is_archived());
+    assert_eq!(known(&old, slot(6)), Some(60)); // coverage starts at block 2, where it was written
+    assert_eq!(known(&s.snapshot(&blk(12, 0)).unwrap(), slot(6)), Some(60));
+    assert_eq!(s.archive_errors(), 0);
+}
+
+#[test]
+fn an_on_demand_read_of_a_bal_only_value_keeps_it() {
+    let s = Store::new(4);
+    s.apply_block(blk(1, 0), writes(&[(slot(8), 80)])).unwrap();
+    for n in 2..=12 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap();
+        s.touch_ttl(&[slot(8)], 4); // read every block
+    }
+    assert_eq!(known(&s.snapshot(&blk(12, 0)).unwrap(), slot(8)), Some(80));
+    assert_eq!(s.sizes().temp_keys, 1);
+}
+
+#[test]
+fn whole_storage_growth_is_held_to_the_global_budget() {
+    let s = Store::new(64);
+    s.set_max_subscribed(6);
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    let (b, c) = (Address::repeat_byte(0xb1), Address::repeat_byte(0xc1));
+    let h = |i: u64| keccak256(U256::from(i).to_be_bytes::<32>());
+    for x in [b, c] {
+        s.watch_address(x);
+        s.install_complete_storage(&blk(1, 0), x, vec![(h(1), U256::from(1)), (h(2), U256::from(2))]).unwrap();
+    }
+    // 4 of 6 used. Each contract grows by 2 new slots: the second pushes the total past 6.
+    let w = |x: Address, i: u64| (StateKey::Storage(x, U256::from(i)), i);
+    s.apply_block(blk(2, 0), writes(&[w(b, 10), w(b, 11)])).unwrap();
+    assert!(s.take_complete_drop(&b).is_none());
+    s.apply_block(blk(3, 0), writes(&[w(c, 10), w(c, 11)])).unwrap();
+    let why = s.take_complete_drop(&c).expect("c was dropped");
+    assert!(why.contains("max_subscribed_keys"), "{why}");
+    assert_eq!(s.complete_storage_len(&c), None);
+    assert_eq!(s.complete_storage_len(&b), Some(4));
+    // c no longer claims completeness: an unknown slot of c is unknown, not a proven zero.
+    assert_eq!(known(&s.snapshot(&blk(3, 0)).unwrap(), StateKey::Storage(c, U256::from(999))), None);
+}
+
+#[test]
+fn install_counts_slots_written_during_the_download_toward_the_budget() {
+    let s = Store::new(64);
+    s.set_max_subscribed(3);
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    s.watch_address(A);
+    s.apply_block(blk(2, 0), writes(&[(slot(10), 1), (slot(11), 1)])).unwrap();
+    let h = |i: u64| keccak256(U256::from(i).to_be_bytes::<32>());
+    // 2 downloaded + 2 written since = 4 > 3.
+    let r = s.install_complete_storage(&blk(1, 0), A, vec![(h(1), U256::from(1)), (h(2), U256::from(2))]);
+    assert!(matches!(r, Err(StateError::LimitReached(4))), "{r:?}");
+}

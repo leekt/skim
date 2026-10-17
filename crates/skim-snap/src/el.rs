@@ -66,7 +66,8 @@ pub struct ElTransport {
 pub enum StorageAll {
     /// Every slot (hashed key, value), rebuilt to the account's storage root.
     Complete { slots: Vec<(B256, U256)>, storage_root: B256 },
-    /// More than the allowed number of slots.
+    /// More than the allowed number of slots were sent, before the storage root could be
+    /// checked: a peer's claim, not a verified size.
     TooLarge(usize),
     /// The peer couldn't serve it, or what it served didn't rebuild to the root.
     Unavailable,
@@ -167,6 +168,15 @@ impl ElTransport {
                 return Ok(StorageAll::Unavailable);
             }
             let last = page.last().map(|d| d.hash);
+            // A trie has each key once, in order: duplicates or disorder (e.g. padding to look
+            // oversized) mark a bad answer, not a large contract.
+            let prev = leaves.last().map(|(h, _)| *h);
+            let ordered = page.first().is_none_or(|d| d.hash >= start && prev.is_none_or(|p| d.hash > p))
+                && page.windows(2).all(|w| w[0].hash < w[1].hash);
+            if !ordered {
+                self.rejections.bad_proof.fetch_add(1, Ordering::Relaxed);
+                return Ok(StorageAll::Unavailable);
+            }
             leaves.extend(page.into_iter().map(|d| (d.hash, d.data)));
             if leaves.len() > max_slots {
                 return Ok(StorageAll::TooLarge(leaves.len()));

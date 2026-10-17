@@ -241,12 +241,12 @@ impl Rpc {
                 // `safe`: signed by a sync-committee supermajority; `finalized`: finalized
                 // beacon block's execution block. Both from the light client.
                 let st = self.light.as_ref().map(|l| l.status()).unwrap_or_default();
-                let n = if t == BlockNumberOrTag::Safe { st.verified_block } else { st.finalized_block };
-                let n = n.ok_or_else(|| RpcError::unavailable(format!("no {t} block verified yet")))?;
-                store
-                    .block(n)
-                    .or_else(|| store.archived_block(n).map(|(b, _)| b))
-                    .ok_or_else(|| RpcError::unavailable(format!("{t} block {n} is outside the retained window")))
+                let v = if t == BlockNumberOrTag::Safe { st.verified_block } else { st.finalized_block };
+                let v = v.ok_or_else(|| RpcError::unavailable(format!("no {t} block verified yet")))?;
+                // The verified hash, at its height: never whichever block holds that height now.
+                crate::light::resolve(store, &v).ok_or_else(|| {
+                    RpcError::unavailable(format!("{t} block {} ({}) is not on the selected chain or outside the retained window", v.number, v.hash))
+                })
             }
             BlockId::Number(t) => Err(RpcError::unavailable(format!("block tag {t} is not tracked yet"))),
             BlockId::Hash(h) => {
@@ -963,7 +963,7 @@ impl Rpc {
     /// The block `latest` means for this request (the head, or the verified head).
     fn latest(&self) -> Option<BlockRef> {
         if self.require_verified {
-            self.light.as_ref().and_then(|l| l.status().verified_block).and_then(|n| self.sim.store.block(n))
+            self.light.as_ref().and_then(|l| l.status().verified_block).and_then(|v| crate::light::resolve(&self.sim.store, &v))
         } else {
             self.sim.store.head()
         }

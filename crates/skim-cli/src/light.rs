@@ -13,15 +13,26 @@ use parking_lot::{Mutex, RwLock};
 use skim_cl::{ClNode, light};
 use skim_state::{Store, persist::Persist};
 
+/// A verified execution block: the hash the light client verified, and where it sits on the
+/// chain skim follows. Never one without the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct VerifiedBlock {
+    pub number: u64,
+    pub hash: B256,
+}
+
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct LightStatus {
     /// Sync committee period skim holds (None until bootstrapped).
     pub period: Option<u64>,
-    /// Highest execution block a supermajority of the sync committee vouched for.
-    pub verified_block: Option<u64>,
+    /// Highest execution block a supermajority of the sync committee vouched for, found on the
+    /// selected chain: number and hash, always set together (`safe`).
+    pub verified_block: Option<VerifiedBlock>,
+    /// The latest attested execution block hash (may not be on skim's chain yet).
     pub verified_hash: Option<B256>,
-    /// Execution block of the latest finalized beacon block skim verified.
-    pub finalized_block: Option<u64>,
+    /// Execution block of the latest finalized beacon block skim verified, found on the
+    /// selected chain (`finalized`).
+    pub finalized_block: Option<VerifiedBlock>,
     pub finalized_hash: Option<B256>,
     pub updates_verified: u64,
     pub updates_rejected: u64,
@@ -151,20 +162,40 @@ impl Light {
     /// Resolves verified hashes to block numbers in the store's chain (blocks may arrive after
     /// the update that vouches for them).
     pub fn on_block(&self, store: &Store) {
-        let (v, f) = {
+        let (v, f, cur_v, cur_f) = {
             let st = self.status.read();
-            (st.verified_hash, st.finalized_hash)
+            (st.verified_hash, st.finalized_hash, st.verified_block, st.finalized_block)
         };
-        let vn = v.and_then(|h| store.number_of_hash(&h));
-        let fnum = f.and_then(|h| store.number_of_hash(&h));
+        let next_v = advance(store, cur_v, v);
+        let next_f = advance(store, cur_f, f);
         let mut st = self.status.write();
-        if let Some(n) = vn {
-            st.verified_block = Some(st.verified_block.map_or(n, |o| o.max(n)));
-        }
-        if let Some(n) = fnum {
-            st.finalized_block = Some(st.finalized_block.map_or(n, |o| o.max(n)));
-        }
+        st.verified_block = next_v;
+        st.finalized_block = next_f;
     }
+}
+
+/// The verified block to report after a new block: the newly attested hash once it is on the
+/// chain (if it is not lower), else the current one while it is still on the chain. A verified
+/// block whose height now holds a different block (a reorg replaced it) is dropped, never kept
+/// as a bare height.
+fn advance(store: &Store, current: Option<VerifiedBlock>, attested: Option<B256>) -> Option<VerifiedBlock> {
+    let still_on_chain = |b: &VerifiedBlock| store.block(b.number).is_none_or(|x| x.hash == b.hash);
+    let current = current.filter(still_on_chain);
+    let candidate = attested.and_then(|h| store.number_of_hash(&h).map(|number| VerifiedBlock { number, hash: h }));
+    match (current, candidate) {
+        (Some(c), Some(n)) if n.number < c.number => Some(c),
+        (_, Some(n)) => Some(n),
+        (c, None) => c,
+    }
+}
+
+/// Resolves a verified block to the block skim holds at that height, only if it is the same
+/// block (by hash). Otherwise `None`: the caller refuses instead of substituting.
+pub fn resolve(store: &Store, b: &VerifiedBlock) -> Option<skim_state::BlockRef> {
+    store
+        .block(b.number)
+        .or_else(|| store.archived_block(b.number).map(|(x, _)| x))
+        .filter(|x| x.hash == b.hash)
 }
 
 async fn fetch_checkpoint(url: &str) -> anyhow::Result<B256> {
@@ -177,4 +208,57 @@ async fn fetch_checkpoint(url: &str) -> anyhow::Result<B256> {
         .await?;
     let r = v["data"]["root"].as_str().ok_or_else(|| anyhow::anyhow!("no data.root"))?;
     Ok(r.trim_start_matches("0x").parse()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skim_state::BlockRef;
+
+    fn blk(n: u64, branch: u8) -> BlockRef {
+        let h = |n: u64, b: u8| {
+            let mut x = [0u8; 32];
+            x[..8].copy_from_slice(&n.to_be_bytes());
+            x[31] = b;
+            B256::from(x)
+        };
+        BlockRef { number: n, hash: h(n, branch), parent_hash: h(n.saturating_sub(1), if n == 1 { 0 } else { branch }), state_root: B256::ZERO, timestamp: 0 }
+    }
+
+    fn chain(store: &Store, from: u64, to: u64, branch: u8) {
+        for n in from..=to {
+            store.apply_block(blk(n, branch), Default::default()).unwrap();
+        }
+    }
+
+    #[test]
+    fn safe_never_resolves_to_a_replacement_block_at_the_same_height() {
+        // Review scenario: the LC verifies A100; the chain switches to B100.
+        let store = Store::new(64);
+        chain(&store, 1, 100, 0);
+        let a100 = blk(100, 0);
+        let v = advance(&store, None, Some(a100.hash)).expect("A100 is on the chain");
+        assert_eq!(v, VerifiedBlock { number: 100, hash: a100.hash });
+        assert_eq!(resolve(&store, &v), Some(a100));
+
+        store.rollback_to(99);
+        let b100 = BlockRef { parent_hash: blk(99, 0).hash, ..blk(100, 1) }; // same parent, different block
+        store.apply_block(b100, Default::default()).unwrap();
+        assert_eq!(resolve(&store, &v), None, "must refuse, not return B100");
+        // The next block drops the stale verified block instead of keeping its height.
+        assert_eq!(advance(&store, Some(v), Some(a100.hash)), None);
+    }
+
+    #[test]
+    fn number_and_hash_move_together() {
+        let store = Store::new(64);
+        chain(&store, 1, 120, 0);
+        let v110 = VerifiedBlock { number: 110, hash: blk(110, 0).hash };
+        // An older attestation never pairs the old height with a new hash (or vice versa).
+        assert_eq!(advance(&store, Some(v110), Some(blk(105, 0).hash)), Some(v110));
+        // A newer one replaces both.
+        assert_eq!(advance(&store, Some(v110), Some(blk(118, 0).hash)), Some(VerifiedBlock { number: 118, hash: blk(118, 0).hash }));
+        // A hash skim hasn't seen yet keeps the current pair.
+        assert_eq!(advance(&store, Some(v110), Some(B256::repeat_byte(0x77))), Some(v110));
+    }
 }
