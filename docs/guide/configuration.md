@@ -99,7 +99,7 @@ The snapshot is a cache, never a source of truth. On start it is used only after
 2. every block's access list matches its header
 3. those blocks' writes are replayed
 
-Restored values are provisional: they are cached like on-demand state until the first subscription pass re-subscribes the keys the current config still needs. Keys of removed subscriptions expire instead of staying subscribed.
+Subscriptions don't wait for the replay: they fetch what they need right away, and the replay fills in only what is still unknown when it finishes. Restored values are provisional: they are cached like on-demand state until the first subscription pass re-subscribes the keys the current config still needs. Keys of removed subscriptions expire instead of staying subscribed.
 
 Anything that doesn't check out (a reorg while skim was down, a gap over 8,192 blocks, an unreadable file) is discarded, and state is fetched as on a fresh start. The replay needs one EL peer that serves eth/71. In practice, restart time is dominated by how long the first such peer takes to connect.
 

@@ -337,20 +337,17 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     if store.archive().is_some() {
         spawn_archive_healer(store.clone(), net.clone(), args.archive_backfill);
     }
-    let restoring = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Subscription maintenance: one pass at a time, always on the newest head. Heads that
     // arrive during a pass are coalesced (the next pass runs once, on the latest), never
     // dropped, so readiness and on_block results catch up instead of falling behind.
     let (maint_tx, mut maint_rx) = tokio::sync::watch::channel::<Option<skim_state::BlockRef>>(None);
     {
-        let (sim, subs, restoring, events) = (sim.clone(), subs.clone(), restoring.clone(), ws_events.clone());
+        let (sim, subs, events) = (sim.clone(), subs.clone(), ws_events.clone());
         tokio::spawn(async move {
             while maint_rx.changed().await.is_ok() {
-                // Subscriptions wait for a restore: fetching the same keys over SNAP in
-                // parallel would only compete for (often absent) EL peers.
-                while restoring.load(std::sync::atomic::Ordering::SeqCst) {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                }
+                // No waiting for a restore: subscribed key sets are small, so fetching them
+                // fresh is usually faster than replaying a long snapshot gap. Both run; the
+                // restore fills in only what is still unknown when it finishes.
                 let Some(b) = *maint_rx.borrow_and_update() else { continue };
                 subs.maintain(&sim, &b).await;
                 let _ = events.send(crate::rpc::WsEvent::Subscriptions(b.number));
@@ -450,14 +447,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 light.on_block(&store);
                 let _ = ws_events.send(crate::rpc::WsEvent::NewHead(ready.block));
                 if let Some(s) = saved.take() {
-                    // Subscriptions wait for the restore: fetching the same keys over SNAP in
-                    // parallel would only compete for (often absent) EL peers.
-                    restoring.store(true, std::sync::atomic::Ordering::SeqCst);
-                    let (store, net, cl, flag, b) = (store.clone(), net.clone(), cl.clone(), restoring.clone(), ready.block);
-                    tokio::spawn(async move {
-                        crate::persist::restore(store, net, cl, s, b).await;
-                        flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                    });
+                    // Runs alongside subscription maintenance (see the maintenance task).
+                    let (store, net, cl, b) = (store.clone(), net.clone(), cl.clone(), ready.block);
+                    tokio::spawn(crate::persist::restore(store, net, cl, s, b));
                 }
                 if let Some(p) = &persist
                     && number % 4 == 0

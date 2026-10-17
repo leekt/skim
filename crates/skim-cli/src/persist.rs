@@ -109,7 +109,7 @@ pub async fn restore(store: Arc<Store>, net: ElNet, cl: skim_cl::ClNode, saved: 
     }
 }
 
-async fn restore_inner(store: &Store, net: &ElNet, saved: &Saved, head: &BlockRef) -> anyhow::Result<usize> {
+async fn restore_inner(store: &Arc<Store>, net: &ElNet, saved: &Saved, head: &BlockRef) -> anyhow::Result<usize> {
     use reth_eth_wire_types::BlockHashOrNumber;
     if saved.number >= head.number {
         // The snapshot is at or after the first block we applied: check it's on this chain.
@@ -288,17 +288,39 @@ mod tests {
         let gapped: Vec<_> = vec![blocks[0].clone(), blocks[2].clone()];
         assert!(verify_and_replay(&saved, &gapped, &head_of(&hs[2])).is_err());
     }
+
+    #[test]
+    fn a_restore_fills_only_keys_a_fresh_fetch_has_not_resolved() {
+        // The restore and the first subscription passes run concurrently.
+        let store = Arc::new(Store::new(64));
+        let hs = chain(B256::ZERO, 1, 1, 1);
+        let at = head_of(&hs[0]);
+        store.apply_block(at, Arc::new(BlockWrites::default())).unwrap();
+        let fetched = StateKey::Storage(Address::repeat_byte(1), U256::from(2));
+        store.insert_base(&at, fetched, U256::from(20)).unwrap(); // the fresh fetch got there first
+        let n = install(&store, &at, &[(fetched, U256::from(99)), (slot(), U256::from(7))], &[]).unwrap();
+        assert_eq!(n, 1);
+        let snap = store.snapshot(&at).unwrap();
+        assert_eq!(snap.get(&fetched).unwrap(), skim_state::StateValue::Known(U256::from(20)));
+        assert_eq!(snap.get(&slot()).unwrap(), skim_state::StateValue::Known(U256::from(7)));
+    }
 }
 
 /// How long restored values stay cached before a subscription must claim them.
 const RESTORED_TTL_BLOCKS: u64 = 64;
 
-fn install(store: &Store, at: &BlockRef, values: &[(skim_bal::StateKey, alloy_primitives::U256)], code: &[(B256, alloy_primitives::Bytes)]) -> anyhow::Result<usize> {
+fn install(store: &Arc<Store>, at: &BlockRef, values: &[(skim_bal::StateKey, alloy_primitives::U256)], code: &[(B256, alloy_primitives::Bytes)]) -> anyhow::Result<usize> {
     for (_, c) in code {
         store.insert_code(c.clone());
     }
+    // The restore runs alongside the first subscription passes, which fetch fresh state: a
+    // key already known at `at` came from a verified fetch (or a BAL) and is left alone.
+    let snap = store.snapshot(at)?;
     let mut n = 0;
     for (k, v) in values {
+        if matches!(snap.get(k), Ok(skim_state::StateValue::Known(_))) {
+            continue;
+        }
         // `at` must still be in the window; insert_base replays any later blocks itself.
         // Provisional: the next subscription pass re-subscribes the keys the current config
         // still needs, and the rest (keys of removed subscriptions, anything subscribed by an

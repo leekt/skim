@@ -194,4 +194,14 @@ Live check: the balances of the 10 senders in the latest block (none tracked), r
 
 Tests: `recent_bal_answers_only_inside_the_indexed_window` (before the write: unknown; a later write wins; outside the window: unknown), `recent_bal_lookup_follows_reorgs`.
 
-**Open (seen while checking):** a restart snapshot 3,900 blocks old was replayed from EL peers in 175 s, and subscriptions waited for it. For gaps that large, fetching the subscribed keys fresh is likely faster than replaying.
+**Restarts no longer wait for the snapshot replay.** A restart snapshot 3,900 blocks old was replayed from EL peers in 175 s, and subscriptions waited for it.
+- **Change:** subscription maintenance now starts at the first block and fetches what it needs fresh, while the replay runs alongside. When the replay finishes, it fills in only the keys still unknown; anything a fresh fetch already resolved is left alone (`a_restore_fills_only_keys_a_fresh_fetch_has_not_resolved`).
+- **Why it pays now:** since the V3 fix, subscribed key sets are small (35 keys here), so a fresh fetch is one SNAP round. Replay costs a request per 64 blocks of gap.
+
+Live, with a snapshot 655 blocks old:
+
+| | Before | After |
+|---|---|---|
+| Subscriptions ready | after the replay (79 s here; 175 s for the 3,900-block gap) | **25 s** after start (first block at 20 s) |
+| Replay | blocks readiness | finished at 79 s in the background, installed the 2 keys still missing |
+| Pool `slot0` / liquidity and the subscribed quote vs a reference node | | identical, both before and after the replay landed |
