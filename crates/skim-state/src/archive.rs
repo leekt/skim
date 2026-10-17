@@ -622,6 +622,28 @@ impl Archive {
         Ok(tx.open_table(HASHES)?.get(number)?.map(|g| B256::from(*g.value())))
     }
 
+    /// The archived hash at `n`, only if the archive proves it an ancestor of `anchor` (a block
+    /// the caller knows is on the chain it asks about): `n` and the anchor are in one segment
+    /// (every block in a segment is the parent of the next) and the anchor is archived under
+    /// that hash. Read in one transaction, so a concurrent truncation can't split the check.
+    pub fn ancestor_hash(&self, n: u64, anchor: (u64, B256)) -> Result<Option<B256>, ArchiveError> {
+        let (k, kh) = anchor;
+        if n > k {
+            return Ok(None);
+        }
+        let tx = self.db.begin_read()?;
+        let segs = tx.open_table(SEGMENTS)?;
+        let same_segment = segs.range(..=n)?.next_back().transpose()?.is_some_and(|(_, e)| e.value() >= k);
+        if !same_segment {
+            return Ok(None);
+        }
+        let hashes = tx.open_table(HASHES)?;
+        if hashes.get(k)?.map(|g| B256::from(*g.value())) != Some(kh) {
+            return Ok(None);
+        }
+        Ok(hashes.get(n)?.map(|g| B256::from(*g.value())))
+    }
+
     pub fn number_of(&self, hash: &B256) -> Result<Option<u64>, ArchiveError> {
         let tx = self.db.begin_read()?;
         Ok(tx.open_table(BY_HASH)?.get(&hash.0)?.map(|g| g.value()))

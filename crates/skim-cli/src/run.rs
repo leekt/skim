@@ -164,12 +164,20 @@ struct OnDemand {
     enabled: bool,
     #[serde(default = "four")]
     cache_ttl_blocks: u64,
+    /// Fetch rounds a call may take before it is refused. Each round fetches the state where the
+    /// previous run stopped; deep call chains (e.g. ENS's Universal Resolver) need more.
+    #[serde(default = "eight")]
+    max_fetch_rounds: usize,
 }
 
 impl Default for OnDemand {
     fn default() -> Self {
-        Self { enabled: true, cache_ttl_blocks: 4 }
+        Self { enabled: true, cache_ttl_blocks: 4, max_fetch_rounds: 8 }
     }
+}
+
+fn eight() -> usize {
+    8
 }
 
 #[derive(serde::Deserialize)]
@@ -286,6 +294,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     if !cfg.state.on_demand.enabled {
         tracing::warn!("on_demand.enabled=false: unsubscribed state is still fetched for correctness, with a 1-block TTL");
     }
+    sim.max_rounds.store(cfg.state.on_demand.max_fetch_rounds.max(1), std::sync::atomic::Ordering::Relaxed);
     *sim.on_demand.write() = skim_state::Retention::Ttl(if cfg.state.on_demand.enabled { cfg.state.on_demand.cache_ttl_blocks } else { 1 });
     let subs = Arc::new(skim_sim::subscription::Subscriptions::new(cfg.state.subscriptions, cfg.state.limits.max_subscribed_keys.0)?);
     // The limit is enforced by the store itself, for every path that subscribes keys.
@@ -503,7 +512,7 @@ async fn v3_tick(sim: Arc<Simulator>, cfg: Arc<V3Config>, st: Arc<V3State>, b: s
                         .gas_price(0)
                         .build()
                         .ok()?;
-                    let out = sim.call(&b, tx, skim_sim::Mode::Resolve { max_rounds: 8 }).await.ok()?;
+                    let out = sim.call(&b, tx, skim_sim::Mode::Resolve { max_rounds: sim.max_rounds.load(std::sync::atomic::Ordering::Relaxed) }).await.ok()?;
                     match out.result {
                         revm::context::result::ExecutionResult::Success { output, .. } if output.data().len() == 32 => {
                             Some(alloy_primitives::Bytes::copy_from_slice(output.data()))

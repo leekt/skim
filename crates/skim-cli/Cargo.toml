@@ -42,3 +42,6 @@ serde_yaml_ng.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-rpc-types-trace.workspace = true
 skim-cl.workspace = true
+
+[dev-dependencies]
+skim-cl = { workspace = true, features = ["testkit"] }

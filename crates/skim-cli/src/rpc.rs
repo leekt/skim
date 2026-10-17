@@ -329,7 +329,7 @@ impl Rpc {
             self.dash.record_hit(b.number, &to);
             return Ok((Self::exec_result(&out[0].calls[0]), to));
         }
-        let out = sim.call(b, self.tx_env(req, &header)?, Mode::Resolve { max_rounds: 8 }).await?;
+        let out = sim.call(b, self.tx_env(req, &header)?, Mode::Resolve { max_rounds: sim.max_rounds.load(std::sync::atomic::Ordering::Relaxed) }).await?;
         self.dash.record_call(b.number, &out.access, &out.fetched_accounts, &out.fetched_storage);
         let mut reads: Vec<Address> = out.access.accounts.clone();
         reads.extend(out.access.storage.iter().map(|(a, _)| *a));
@@ -516,7 +516,7 @@ impl Rpc {
                 let cap = req.gas.unwrap_or(header.gas_limit);
                 let mut tx = self.tx_env(req, &header)?;
                 tx.gas_limit = cap;
-                let first = sim.call(&b, tx.clone(), Mode::Resolve { max_rounds: 8 }).await?;
+                let first = sim.call(&b, tx.clone(), Mode::Resolve { max_rounds: sim.max_rounds.load(std::sync::atomic::Ordering::Relaxed) }).await?;
                 Self::exec_result(&first.result)?;
                 // State is now local: binary-search the lowest gas limit that still succeeds.
                 let (mut lo, mut hi) = (first.result.tx_gas_used().saturating_sub(1), cap);

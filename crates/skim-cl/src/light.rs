@@ -398,6 +398,171 @@ pub fn apply_updates(cs: &mut Committees, updates: &[Vec<u8>], fork_version: [u8
     out
 }
 
+/// Generated light-client fixtures (BLS keys, Merkle branches) for tests here and in dependent
+/// crates (`testkit` feature): committees, bootstraps, optimistic and full updates.
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit {
+    use super::*;
+
+    pub use blst::min_pk::{AggregateSignature, SecretKey};
+
+    pub const FV: [u8; 4] = [0x90, 0, 0, 0x76];
+
+    /// The root `verify_branch` folds `leaf` and `branch` into for `gindex`.
+    pub fn fold(leaf: [u8; 32], branch: &[[u8; 32]], gindex: u64) -> [u8; 32] {
+        let depth = 63 - gindex.leading_zeros() as usize;
+        let index = gindex - (1 << depth);
+        let mut v = leaf;
+        for (i, node) in branch.iter().enumerate() {
+            v = if (index >> i) & 1 == 1 { sha(node, &v) } else { sha(&v, node) };
+        }
+        v
+    }
+
+    pub fn nodes(seed: u8, n: usize) -> Vec<[u8; 32]> {
+        (0..n).map(|i| [seed.wrapping_add(i as u8); 32]).collect()
+    }
+
+    /// The execution block hash the fixture header at `slot` carries.
+    pub fn exec_hash(slot: u64) -> B256 {
+        let mut x = [0xee; 32];
+        x[24..].copy_from_slice(&slot.to_be_bytes());
+        B256::from(x)
+    }
+
+    /// A `LightClientHeader` at `slot` with the given state root (execution branch valid).
+    pub fn lc_header(slot: u64, state_root: [u8; 32]) -> (Vec<u8>, BeaconHeader) {
+        let exec = exec_hash(slot).0;
+        let eb = nodes(0x10, 11);
+        let body_root = fold(exec, &eb, EXECUTION_BLOCK_HASH_GINDEX);
+        let h = BeaconHeader { slot, proposer_index: 7, parent_root: [1; 32], state_root, body_root };
+        let mut b = Vec::with_capacity(HEADER_LEN);
+        b.extend_from_slice(&slot.to_le_bytes());
+        b.extend_from_slice(&7u64.to_le_bytes());
+        b.extend_from_slice(&[1; 32]);
+        b.extend_from_slice(&state_root);
+        b.extend_from_slice(&body_root);
+        b.extend_from_slice(&exec);
+        eb.iter().for_each(|n| b.extend_from_slice(n));
+        (b, h)
+    }
+
+    /// A `SyncCommittee` of 512 copies of `sk`'s key: (bytes, root).
+    pub fn committee_bytes(sk: &SecretKey) -> (Vec<u8>, [u8; 32]) {
+        let pk = sk.sk_to_pk().to_bytes();
+        let mut b: Vec<u8> = (0..SYNC_COMMITTEE_SIZE).flat_map(|_| pk).collect();
+        b.extend_from_slice(&pk);
+        let root = sha(&merkleize(b[..SYNC_COMMITTEE_SIZE * 48].chunks(48).map(pubkey_root).collect()), &pubkey_root(&pk));
+        (b, root)
+    }
+
+    /// A sync aggregate: the first MIN_PARTICIPANTS members (all `sk`) sign `h`.
+    pub fn aggregate(sk: &SecretKey, h: &BeaconHeader) -> Vec<u8> {
+        let sig = sk.sign(&signing_root(h.root(), FV, SEPOLIA_GENESIS_VALIDATORS_ROOT), BLS_DST, &[]);
+        let sigs = vec![&sig; MIN_PARTICIPANTS];
+        let agg = AggregateSignature::aggregate(&sigs, false).unwrap().to_signature();
+        let mut b = vec![0u8; 64];
+        for i in 0..MIN_PARTICIPANTS {
+            b[i / 8] |= 1 << (i % 8);
+        }
+        b.extend_from_slice(&agg.to_bytes());
+        b
+    }
+
+    pub fn optimistic(sk: &SecretKey, attested_slot: u64, signature_slot: u64) -> Vec<u8> {
+        let (mut b, h) = lc_header(attested_slot, [3; 32]);
+        b.extend_from_slice(&aggregate(sk, &h));
+        b.extend_from_slice(&signature_slot.to_le_bytes());
+        b
+    }
+
+    pub fn key(i: u8) -> SecretKey {
+        SecretKey::key_gen(&[i; 32], &[]).unwrap()
+    }
+
+    pub const P: u64 = 1400;
+    pub const BOUNDARY: u64 = (P + 1) * SLOTS_PER_PERIOD; // first slot of period P + 1
+
+    pub fn bootstrapped(sk: &SecretKey) -> Committees {
+        let (cb, root) = committee_bytes(sk);
+        let br = nodes(0x20, 11);
+        let (hb, h) = lc_header(BOUNDARY - 100, fold(root, &br, CURRENT_SYNC_COMMITTEE_GINDEX));
+        let mut b = hb;
+        b.extend_from_slice(&cb);
+        br.iter().for_each(|n| b.extend_from_slice(n));
+        let (header, c) = bootstrap(&b, B256::from(h.root())).unwrap();
+        assert_eq!((header.beacon.slot, c.period), (BOUNDARY - 100, P));
+        Committees::new(c)
+    }
+
+    /// A `LightClientUpdate` attested at `attested_slot` (no finalized header), carrying
+    /// `next`'s committee, signed by `signer` at `signature_slot`.
+    pub fn update(signer: &SecretKey, next: &SecretKey, attested_slot: u64, signature_slot: u64, tamper: bool) -> Vec<u8> {
+        let (cb, root) = committee_bytes(next);
+        let nb = nodes(0x30, 11);
+        let state_root = fold(if tamper { [0xad; 32] } else { root }, &nb, NEXT_SYNC_COMMITTEE_GINDEX);
+        let (mut b, h) = lc_header(attested_slot, state_root);
+        b.extend_from_slice(&cb);
+        nb.iter().for_each(|n| b.extend_from_slice(n));
+        b.extend_from_slice(&[0u8; HEADER_LEN]); // no finalized header
+        b.extend_from_slice(&[0u8; 32 * 9]);
+        b.extend_from_slice(&aggregate(signer, &h));
+        b.extend_from_slice(&signature_slot.to_le_bytes());
+        b
+    }
+
+    /// A state root committing to two leaves at `g1` and `g2`, with their branches (other
+    /// subtrees are filler).
+    pub fn two_leaf_root(g1: u64, l1: [u8; 32], g2: u64, l2: [u8; 32]) -> ([u8; 32], Vec<[u8; 32]>, Vec<[u8; 32]>) {
+        fn value(g: u64, g1: u64, l1: [u8; 32], g2: u64, l2: [u8; 32]) -> [u8; 32] {
+            if g == g1 {
+                return l1;
+            }
+            if g == g2 {
+                return l2;
+            }
+            let under = |x: u64| {
+                let mut x = x;
+                while x > g {
+                    x >>= 1;
+                }
+                x == g
+            };
+            if under(g1) || under(g2) {
+                sha(&value(2 * g, g1, l1, g2, l2), &value(2 * g + 1, g1, l1, g2, l2))
+            } else {
+                [0x5a; 32]
+            }
+        }
+        let branch = |g: u64| {
+            let mut out = Vec::new();
+            let mut x = g;
+            while x > 1 {
+                out.push(value(x ^ 1, g1, l1, g2, l2));
+                x >>= 1;
+            }
+            out
+        };
+        (value(1, g1, l1, g2, l2), branch(g1), branch(g2))
+    }
+
+    /// A full update attested at `attested_slot`, carrying `next`'s committee and a finalized
+    /// header at `finalized_slot`, signed by `signer` at `signature_slot`.
+    pub fn update_with_finality(signer: &SecretKey, next: &SecretKey, attested_slot: u64, finalized_slot: u64, signature_slot: u64) -> Vec<u8> {
+        let (cb, croot) = committee_bytes(next);
+        let (fb, fh) = lc_header(finalized_slot, [9; 32]);
+        let (state_root, nb, finb) = two_leaf_root(NEXT_SYNC_COMMITTEE_GINDEX, croot, FINALIZED_ROOT_GINDEX, fh.root());
+        let (mut b, h) = lc_header(attested_slot, state_root);
+        b.extend_from_slice(&cb);
+        nb.iter().for_each(|n| b.extend_from_slice(n));
+        b.extend_from_slice(&fb);
+        finb.iter().for_each(|n| b.extend_from_slice(n));
+        b.extend_from_slice(&aggregate(signer, &h));
+        b.extend_from_slice(&signature_slot.to_le_bytes());
+        b
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,107 +614,9 @@ mod tests {
         assert_eq!(verify_sync_aggregate(&c, &header, &agg_bytes, 101, fv, 4), Err(LcError::Participation(3, 4)));
     }
 
-    // ---- Committee rollover (generated fixtures) ------------------------------------------------
+    // ---- Committee rollover (generated fixtures: `testkit`) ------------------------------------
 
-    use blst::min_pk::{AggregateSignature, SecretKey};
-
-    const FV: [u8; 4] = [0x90, 0, 0, 0x76];
-
-    /// The root `verify_branch` folds `leaf` and `branch` into for `gindex`.
-    fn fold(leaf: [u8; 32], branch: &[[u8; 32]], gindex: u64) -> [u8; 32] {
-        let depth = 63 - gindex.leading_zeros() as usize;
-        let index = gindex - (1 << depth);
-        let mut v = leaf;
-        for (i, node) in branch.iter().enumerate() {
-            v = if (index >> i) & 1 == 1 { sha(node, &v) } else { sha(&v, node) };
-        }
-        v
-    }
-
-    fn nodes(seed: u8, n: usize) -> Vec<[u8; 32]> {
-        (0..n).map(|i| [seed.wrapping_add(i as u8); 32]).collect()
-    }
-
-    /// A `LightClientHeader` at `slot` with the given state root (execution branch valid).
-    fn lc_header(slot: u64, state_root: [u8; 32]) -> (Vec<u8>, BeaconHeader) {
-        let exec = [0xee; 32];
-        let eb = nodes(0x10, 11);
-        let body_root = fold(exec, &eb, EXECUTION_BLOCK_HASH_GINDEX);
-        let h = BeaconHeader { slot, proposer_index: 7, parent_root: [1; 32], state_root, body_root };
-        let mut b = Vec::with_capacity(HEADER_LEN);
-        b.extend_from_slice(&slot.to_le_bytes());
-        b.extend_from_slice(&7u64.to_le_bytes());
-        b.extend_from_slice(&[1; 32]);
-        b.extend_from_slice(&state_root);
-        b.extend_from_slice(&body_root);
-        b.extend_from_slice(&exec);
-        eb.iter().for_each(|n| b.extend_from_slice(n));
-        (b, h)
-    }
-
-    /// A `SyncCommittee` of 512 copies of `sk`'s key: (bytes, root).
-    fn committee_bytes(sk: &SecretKey) -> (Vec<u8>, [u8; 32]) {
-        let pk = sk.sk_to_pk().to_bytes();
-        let mut b: Vec<u8> = (0..SYNC_COMMITTEE_SIZE).flat_map(|_| pk).collect();
-        b.extend_from_slice(&pk);
-        let root = sha(&merkleize(b[..SYNC_COMMITTEE_SIZE * 48].chunks(48).map(pubkey_root).collect()), &pubkey_root(&pk));
-        (b, root)
-    }
-
-    /// A sync aggregate: the first MIN_PARTICIPANTS members (all `sk`) sign `h`.
-    fn aggregate(sk: &SecretKey, h: &BeaconHeader) -> Vec<u8> {
-        let sig = sk.sign(&signing_root(h.root(), FV, SEPOLIA_GENESIS_VALIDATORS_ROOT), BLS_DST, &[]);
-        let sigs = vec![&sig; MIN_PARTICIPANTS];
-        let agg = AggregateSignature::aggregate(&sigs, false).unwrap().to_signature();
-        let mut b = vec![0u8; 64];
-        for i in 0..MIN_PARTICIPANTS {
-            b[i / 8] |= 1 << (i % 8);
-        }
-        b.extend_from_slice(&agg.to_bytes());
-        b
-    }
-
-    fn optimistic(sk: &SecretKey, attested_slot: u64, signature_slot: u64) -> Vec<u8> {
-        let (mut b, h) = lc_header(attested_slot, [3; 32]);
-        b.extend_from_slice(&aggregate(sk, &h));
-        b.extend_from_slice(&signature_slot.to_le_bytes());
-        b
-    }
-
-    fn key(i: u8) -> SecretKey {
-        SecretKey::key_gen(&[i; 32], &[]).unwrap()
-    }
-
-    const P: u64 = 1400;
-    const BOUNDARY: u64 = (P + 1) * SLOTS_PER_PERIOD; // first slot of period P + 1
-
-    fn bootstrapped(sk: &SecretKey) -> Committees {
-        let (cb, root) = committee_bytes(sk);
-        let br = nodes(0x20, 11);
-        let (hb, h) = lc_header(BOUNDARY - 100, fold(root, &br, CURRENT_SYNC_COMMITTEE_GINDEX));
-        let mut b = hb;
-        b.extend_from_slice(&cb);
-        br.iter().for_each(|n| b.extend_from_slice(n));
-        let (header, c) = bootstrap(&b, B256::from(h.root())).unwrap();
-        assert_eq!((header.beacon.slot, c.period), (BOUNDARY - 100, P));
-        Committees::new(c)
-    }
-
-    /// A `LightClientUpdate` attested at `attested_slot` (no finalized header), carrying
-    /// `next`'s committee, signed by `signer` at `signature_slot`.
-    fn update(signer: &SecretKey, next: &SecretKey, attested_slot: u64, signature_slot: u64, tamper: bool) -> Vec<u8> {
-        let (cb, root) = committee_bytes(next);
-        let nb = nodes(0x30, 11);
-        let state_root = fold(if tamper { [0xad; 32] } else { root }, &nb, NEXT_SYNC_COMMITTEE_GINDEX);
-        let (mut b, h) = lc_header(attested_slot, state_root);
-        b.extend_from_slice(&cb);
-        nb.iter().for_each(|n| b.extend_from_slice(n));
-        b.extend_from_slice(&[0u8; HEADER_LEN]); // no finalized header
-        b.extend_from_slice(&[0u8; 32 * 9]);
-        b.extend_from_slice(&aggregate(signer, &h));
-        b.extend_from_slice(&signature_slot.to_le_bytes());
-        b
-    }
+    use super::testkit::*;
 
     #[test]
     fn the_committee_rolls_into_the_next_period() {
@@ -591,57 +658,6 @@ mod tests {
     }
 
     // ---- Catch-up from an old checkpoint (sequential full updates) ----------------------------
-
-    /// A state root committing to two leaves at `g1` and `g2`, with their branches (other
-    /// subtrees are filler).
-    fn two_leaf_root(g1: u64, l1: [u8; 32], g2: u64, l2: [u8; 32]) -> ([u8; 32], Vec<[u8; 32]>, Vec<[u8; 32]>) {
-        fn value(g: u64, g1: u64, l1: [u8; 32], g2: u64, l2: [u8; 32]) -> [u8; 32] {
-            if g == g1 {
-                return l1;
-            }
-            if g == g2 {
-                return l2;
-            }
-            let under = |x: u64| {
-                let mut x = x;
-                while x > g {
-                    x >>= 1;
-                }
-                x == g
-            };
-            if under(g1) || under(g2) {
-                sha(&value(2 * g, g1, l1, g2, l2), &value(2 * g + 1, g1, l1, g2, l2))
-            } else {
-                [0x5a; 32]
-            }
-        }
-        let branch = |g: u64| {
-            let mut out = Vec::new();
-            let mut x = g;
-            while x > 1 {
-                out.push(value(x ^ 1, g1, l1, g2, l2));
-                x >>= 1;
-            }
-            out
-        };
-        (value(1, g1, l1, g2, l2), branch(g1), branch(g2))
-    }
-
-    /// A full update attested at `attested_slot`, carrying `next`'s committee and a finalized
-    /// header at `finalized_slot`, signed by `signer` at `signature_slot`.
-    fn update_with_finality(signer: &SecretKey, next: &SecretKey, attested_slot: u64, finalized_slot: u64, signature_slot: u64) -> Vec<u8> {
-        let (cb, croot) = committee_bytes(next);
-        let (fb, fh) = lc_header(finalized_slot, [9; 32]);
-        let (state_root, nb, finb) = two_leaf_root(NEXT_SYNC_COMMITTEE_GINDEX, croot, FINALIZED_ROOT_GINDEX, fh.root());
-        let (mut b, h) = lc_header(attested_slot, state_root);
-        b.extend_from_slice(&cb);
-        nb.iter().for_each(|n| b.extend_from_slice(n));
-        b.extend_from_slice(&fb);
-        finb.iter().for_each(|n| b.extend_from_slice(n));
-        b.extend_from_slice(&aggregate(signer, &h));
-        b.extend_from_slice(&signature_slot.to_le_bytes());
-        b
-    }
 
     #[test]
     fn a_client_two_periods_behind_catches_up_from_full_updates() {

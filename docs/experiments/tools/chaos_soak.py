@@ -33,14 +33,17 @@ Gates (exit status nonzero on any):
     >= 95% and cold probes >= 80%, counting skim timeouts and connection failures as unanswered
     (refusing or timing out on everything fails); every required probe kind sampled at least
     its minimum number of times
-  - freshness: outside recovery windows, no more than 2% of the time with a head older than
-    3 slots (wall clock; a stalled skim can't hide behind "no new block, no probes")
+  - freshness: outside recovery windows, no more than 2% of the time with skim's head stale:
+    its header timestamp more than 3 slots behind the wall clock, or more than 3 blocks behind
+    the reference node's head. Sampled every 2 s by a separate thread, so slow probes can't
+    delay it, and by head age rather than arrival gaps, so a stream of steadily arriving but
+    old blocks fails. The longest gap between new heads is reported separately
   - recovery: subscriptions ready again within RECOVERY_LIMIT_S (default 180) of each restart
 
 `--selftest` checks the classification rules (reverts and halts are outcomes to compare).
 Reorgs are not injected here (live network); they're covered by deterministic store tests.
 """
-import json, os, random, signal, subprocess, sys, time, urllib.request
+import json, os, random, signal, subprocess, sys, threading, time, urllib.request
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--selftest":
     pass  # handled below, after the helpers are defined
@@ -54,7 +57,9 @@ SUBSCRIBED_KINDS = ("quote_sub", "slot_sub", "archived", "restart_archive")
 # Every run must exercise these, at least this many times (outside recovery windows).
 REQUIRED_KINDS = {"quote": 100, "quote_sub": 50, "slot_sub": 50, "slot_cold": 50, "blockhash": 50, "gasprice": 50,
                   "bal_first": 50, "archived": 20, "restart_archive": 10, "promo_slot": 10}
-STALE_AFTER_S = 36
+STALE_AFTER_S = 36  # head age (wall clock - header timestamp) beyond 3 slots
+STALE_LAG_BLOCKS = 3  # or this many blocks behind the reference head
+FRESH_EVERY_S = 2
 SUBSCRIBED_MIN, COLD_MIN = 0.95, 0.80
 SKIM = f"http://127.0.0.1:{PORT}"
 MAX_KEYS = 60
@@ -201,6 +206,16 @@ def classify(s, r):
     return "match" if so == ro else "WRONG"
 
 
+def is_stale(now, head_ts, skim_n, ref_n):
+    """skim's head is stale: older than STALE_AFTER_S by its own timestamp, or more than
+    STALE_LAG_BLOCKS behind the reference head (None if the reference wasn't sampled)."""
+    if head_ts is None:
+        return True
+    if now - head_ts > STALE_AFTER_S:
+        return True
+    return ref_n is not None and skim_n is not None and ref_n - skim_n > STALE_LAG_BLOCKS
+
+
 def selftest():
     ok = {"result": "0x01"}
     rev = lambda d: {"error": {"code": 3, "message": "execution reverted", "data": d}}
@@ -217,6 +232,24 @@ def selftest():
         (ok, {"error": {"code": -32000, "message": "out of gas"}}, "WRONG"),  # ref halted, skim didn't
     ]
     bad = [(s, r, want, classify(s, r)) for s, r, want in cases if classify(s, r) != want]
+    # Freshness by head age, not arrival: a block arriving now but stamped 5 minutes ago is
+    # stale, every time, however regularly such blocks keep coming.
+    t = 1_000_000.0
+    fresh_cases = [
+        ((t, t - 6, 100, 100), False),
+        ((t, t - 300, 100, 100), True),   # old header, arriving on time
+        ((t, t - 6, 100, 125), True),     # recent timestamp claim, but 25 blocks behind the reference
+        ((t, t - 6, 100, None), False),   # reference not sampled: age alone decides
+        ((t, None, None, 100), True),     # no head at all
+    ]
+    for args, want in fresh_cases:
+        if is_stale(*args) != want:
+            bad.append(("is_stale", args, want))
+    # Steadily arriving old headers fail the gate end to end.
+    share = sum(is_stale(t + 12 * i, t + 12 * i - 300, 100 + i, 125 + i) for i in range(100)) / 100
+    if share <= 0.02:
+        bad.append(("steady old stream passes", share))
+    cases = cases + fresh_cases + [None]
     for b in bad:
         print("SELFTEST FAIL", b)
     print(f"selftest: {len(cases) - len(bad)}/{len(cases)} ok")
@@ -235,8 +268,9 @@ restart_at = None  # time of the last restart while recovering
 promo = None  # (address, block it was subscribed at)
 senders_seen = []
 last_n = None
-last_head_t = time.time()  # wall clock of the last new head
-stale_s = 0.0  # time outside recovery with a head older than STALE_AFTER_S
+stale_s = 0.0  # steady-state time with a stale head (sampled by the freshness thread)
+fresh_s = 0.0  # steady-state time the freshness thread observed
+max_head_gap_s = 0.0  # longest wall-clock gap between new heads (reported, not gated)
 steady_s = 0.0
 last_tick = time.time()
 promo_from = None  # first block skim reports the restart_archive key covered from
@@ -250,6 +284,34 @@ skim = Skim()
 skim.start("A")
 restart_at = time.time()  # the first start is a recovery too
 t_end = time.time() + MINUTES * 60
+
+
+def freshness():
+    """Samples head age and lag every FRESH_EVERY_S, independently of the probe loop."""
+    global stale_s, fresh_s, max_head_gap_s
+    prev_t, last_hash, last_new = time.time(), None, time.time()
+    ref_n, ref_t = None, 0.0
+    while time.time() < t_end:
+        time.sleep(FRESH_EVERY_S)
+        now = time.time()
+        h = rpc(SKIM, "eth_getBlockByNumber", ["latest", False], timeout=3).get("result")
+        if now - ref_t >= 6:  # the reference is sampled less often
+            r = rpc(REF, "eth_blockNumber", [], timeout=5).get("result")
+            ref_n, ref_t = (int(r, 16) if r else None), now
+        now = time.time()
+        if h and h["hash"] != last_hash:
+            last_hash = h["hash"]
+            max_head_gap_s = max(max_head_gap_s, now - last_new) if restart_at is None else max_head_gap_s
+            last_new = now
+        dt, prev_t = now - prev_t, now
+        if restart_at is not None:
+            continue
+        fresh_s += dt
+        if is_stale(now, int(h["timestamp"], 16) if h else None, int(h["number"], 16) if h else None, ref_n):
+            stale_s += dt
+
+
+threading.Thread(target=freshness, daemon=True).start()
 next_chaos = time.time() + random.uniform(6, 12) * 60
 last = None
 first_block = None
@@ -280,13 +342,10 @@ while time.time() < t_end:
     now = time.time()
     if restart_at is None:
         steady_s += now - last_tick
-        if now - last_head_t > STALE_AFTER_S:
-            stale_s += now - max(last_tick, last_head_t + STALE_AFTER_S)
     last_tick = now
     if not head or head["hash"] == last:
         time.sleep(1)
         continue
-    last_head_t = now
     last = head["hash"]
     n = int(head["number"], 16)
     last_n = n
@@ -380,14 +439,15 @@ for k, need in REQUIRED_KINDS.items():
         failures.append(f"{k}: {got} steady-state samples (< {need})")
     if not by_kind.get(k, {}).get("match"):
         failures.append(f"{k}: never matched")
-stale_share = stale_s / steady_s if steady_s else 0.0
+stale_share = stale_s / fresh_s if fresh_s else 1.0
 if stale_share > 0.02:
-    failures.append(f"head older than {STALE_AFTER_S} s for {stale_share:.1%} of steady-state time")
+    failures.append(f"head stale (> {STALE_AFTER_S} s old or > {STALE_LAG_BLOCKS} blocks behind the reference) for {stale_share:.1%} of steady-state time")
 slow = [r for r in recoveries if r is None or r > RECOVERY_LIMIT_S]
 if slow:
     failures.append(f"{len(slow)} restart(s) not ready within {RECOVERY_LIMIT_S:.0f} s: {slow}")
 summary = {"minutes": MINUTES, "counts": counts, "by_kind": by_kind, "steady_answer_rate": answer_rate,
            "steady_samples": {k: sum(v) for k, v in steady.items()}, "stale_share": round(stale_share, 4),
+           "max_head_gap_s": round(max_head_gap_s, 1),
            "bal_promotions_during_run": (bal_promotions["end"] or 0) - (bal_promotions["start"] or 0),
            "recoveries_s": [None if r is None else round(r, 1) for r in recoveries], "pending_recovery_s": pending_recovery,
            "subscribed_over_limit_samples": over_limit,

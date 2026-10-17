@@ -107,6 +107,9 @@ pub struct Simulator {
     /// How long an interactive request waits for a SNAP peer when none is connected, before
     /// giving up (`--state-wait`).
     pub state_wait: RwLock<std::time::Duration>,
+    /// Miss rounds an interactive call may take (`on_demand.max_fetch_rounds`): each round
+    /// fetches the state the previous run stopped at, so deep call chains need more.
+    pub max_rounds: std::sync::atomic::AtomicUsize,
 }
 
 impl Simulator {
@@ -119,6 +122,7 @@ impl Simulator {
             code_cache: RwLock::default(),
             miss_at_parent: true,
             on_demand: RwLock::new(Retention::Ttl(4)),
+            max_rounds: std::sync::atomic::AtomicUsize::new(8),
             state_wait: RwLock::new(std::time::Duration::from_secs(60)),
         })
     }
@@ -187,8 +191,8 @@ impl Simulator {
 
     /// One local execution (CPU only).
     pub fn execute(&self, snap: &Snapshot, header: &Header, tx: TxEnv) -> Result<(ExecutionResult, Access), SimError> {
-        let store = self.store.clone();
-        let block_hash = move |n: u64| store.block_hash(n);
+        let (store, at) = (self.store.clone(), *snap.block());
+        let block_hash = move |n: u64| store.block_hash_at(&at, n);
         let db = db::SnapDb { snap, block_hash: &block_hash, access: Default::default(), code_cache: &self.code_cache };
         let res = {
             let mut evm = Context::mainnet()

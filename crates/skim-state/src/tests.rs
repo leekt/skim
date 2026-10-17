@@ -638,3 +638,71 @@ fn a_restart_at_the_same_archived_block_keeps_continuity() {
     assert_eq!(ar.get_at(&slot(5), 101, blk(101, 0).hash).unwrap(), archive::ArchiveRead::Value(U256::from(10)));
     assert_eq!(s.archive_errors(), 0);
 }
+
+/// Disk: A98 -> A99 -> A100 (seventh review, P1).
+fn archive_a98_a100(path: &std::path::Path) {
+    let s = Store::with_archive(64, archive::Archive::open(path).unwrap()).unwrap();
+    for n in 98..=100 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap();
+    }
+    assert_eq!(s.archive().unwrap().segments().unwrap(), vec![(98, 100)]);
+}
+
+#[test]
+fn blockhash_never_returns_an_archived_hash_from_an_abandoned_fork() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("a.redb");
+    archive_a98_a100(&path);
+    // Offline, A98 -> B99 -> B100 -> B101 replaced A99 -> A100. The restarted store's first
+    // block is B101; reconciliation hasn't run, so A99 and A100 are still archived.
+    let s = Store::with_archive(64, archive::Archive::open(&path).unwrap()).unwrap();
+    let b101 = blk(101, 1);
+    s.apply_block(b101, writes(&[])).unwrap();
+    assert_eq!(s.archive().unwrap().hash(99).unwrap(), Some(blk(99, 0).hash), "the old fork is still on disk");
+    assert_eq!(s.block_hash_at(&b101, 100), Some(blk(100, 1).hash));
+    assert_eq!(s.block_hash_at(&b101, 99), None, "A99 is not an ancestor of B101: unknown, not A99");
+    assert_eq!(s.block_hash_at(&b101, 98), None);
+    // Once B99's hash is established by linked headers, it is answered.
+    s.insert_ancestor_hashes(&[(100, blk(100, 1).hash, blk(99, 1).hash), (99, blk(99, 1).hash, blk(98, 0).hash)]);
+    assert_eq!(s.block_hash_at(&b101, 99), Some(blk(99, 1).hash));
+}
+
+#[test]
+fn blockhash_uses_archived_ancestors_that_link_to_the_simulated_block() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("a.redb");
+    archive_a98_a100(&path);
+    let s = Store::with_archive(64, archive::Archive::open(&path).unwrap()).unwrap();
+    let a101 = blk(101, 0);
+    s.apply_block(a101, writes(&[])).unwrap();
+    assert_eq!(s.block_hash_at(&a101, 99), Some(blk(99, 0).hash));
+    assert_eq!(s.block_hash_at(&a101, 98), Some(blk(98, 0).hash));
+    assert_eq!(s.block_hash_at(&a101, 101), Some(a101.hash));
+    assert_eq!(s.block_hash_at(&a101, 102), None);
+    // A block that isn't on the chain the store holds gets nothing from it.
+    assert_eq!(s.block_hash_at(&blk(101, 7), 99), None);
+}
+
+#[test]
+fn archiving_a_long_unchanged_key_keeps_its_value_from_a_known_block() {
+    // Seventh review, P2: K = 10 since block 1, unchanged and tracked past both the state window
+    // and the hash ring, then promoted to archive retention.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::with_archive(64, archive::Archive::open(&d.path().join("a.redb")).unwrap()).unwrap();
+    s.watch_key(slot(5));
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    s.insert_base(&blk(1, 0), slot(5), U256::from(10)).unwrap();
+    for n in 2..=400 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap();
+    }
+    assert_eq!(known(&s.snapshot(&blk(400, 0)).unwrap(), slot(5)), Some(10), "the live value survives");
+    s.archive_key(slot(5));
+    s.apply_block(blk(401, 0), writes(&[])).unwrap();
+    assert_eq!(s.archive_errors(), 0);
+    let ar = s.archive().unwrap();
+    for n in [400, 401] {
+        assert_eq!(ar.get_at(&slot(5), n, blk(n, 0).hash).unwrap(), archive::ArchiveRead::Value(U256::from(10)), "block {n}");
+    }
+    // Coverage starts no earlier than a block whose hash the store still knew.
+    assert!(matches!(ar.get_at(&slot(5), 1, blk(1, 0).hash).unwrap(), archive::ArchiveRead::NotCovered { .. }));
+}

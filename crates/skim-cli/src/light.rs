@@ -35,6 +35,10 @@ pub struct LightStatus {
     /// selected chain (`finalized`).
     pub finalized_block: Option<VerifiedBlock>,
     pub finalized_hash: Option<B256>,
+    /// Beacon slots of the newest verified attested / finalized headers: the hashes above only
+    /// move forward, whichever path (gossip or catch-up) verified them.
+    pub attested_slot: Option<u64>,
+    pub finalized_slot: Option<u64>,
     pub updates_verified: u64,
     pub updates_rejected: u64,
     pub last_error: Option<String>,
@@ -45,7 +49,8 @@ pub struct Light {
     committee: Mutex<Option<light::Committees>>,
     fetching_next: std::sync::atomic::AtomicBool,
     status: RwLock<LightStatus>,
-    cl: ClNode,
+    /// `None` only in tests: no network, updates are applied directly.
+    cl: Option<ClNode>,
     persist: Option<Arc<Persist>>,
     bootstrapping: std::sync::atomic::AtomicBool,
 }
@@ -58,7 +63,7 @@ impl Light {
             committee: Mutex::new(None),
             fetching_next: Default::default(),
             status: Default::default(),
-            cl,
+            cl: Some(cl),
             persist,
             bootstrapping: Default::default(),
         })
@@ -96,7 +101,8 @@ impl Light {
             return;
         }
         for attempt in 0..120 {
-            match self.cl.light_client_bootstrap(root.0).await.and_then(|b| light::bootstrap(&b, root).map_err(Into::into)) {
+            let Some(cl) = &self.cl else { break };
+            match cl.light_client_bootstrap(root.0).await.and_then(|b| light::bootstrap(&b, root).map_err(Into::into)) {
                 Ok((header, committee)) => {
                     tracing::info!(slot = header.beacon.slot, period = committee.period, "light client: sync committee verified");
                     self.status.write().period = Some(committee.period);
@@ -132,19 +138,8 @@ impl Light {
         };
         match res {
             Ok((attested, finalized)) => {
-                {
-                    let mut st = self.status.write();
-                    st.updates_verified += 1;
-                    st.verified_hash = Some(attested.execution_block_hash);
-                    if let Some(f) = &finalized {
-                        st.finalized_hash = Some(f.execution_block_hash);
-                    }
-                }
+                self.publish(Some(&attested), finalized.as_ref(), 1);
                 if let Some(f) = finalized {
-                    let root = B256::from(f.beacon.root());
-                    if let Some(p) = &self.persist {
-                        let _ = p.set_meta(FINALIZED_ROOT_META, root.as_slice());
-                    }
                     // Finality in the next period: its (already authenticated) committee becomes
                     // current, and the one after it is fetched.
                     let rotated = self.committee.lock().as_mut().and_then(|c| c.advance(f.beacon.slot).then_some(c.current.period));
@@ -186,25 +181,11 @@ impl Light {
                     break;
                 }
                 let count = (live.saturating_sub(period) + 1).min(128);
-                match me.cl.light_client_updates(period, count).await {
+                let Some(cl) = &me.cl else { break };
+                match cl.light_client_updates(period, count).await {
                     Ok(updates) => {
-                        let r = {
-                            let mut g = me.committee.lock();
-                            let Some(cs) = g.as_mut() else { break };
-                            light::apply_updates(cs, &updates, fv)
-                        };
-                        if r.rotations > 0 || r.applied > 0 {
-                            let (p, next) = me.committee.lock().as_ref().map(|c| (c.current.period, c.next.as_ref().map(|n| n.period))).unwrap_or_default();
-                            tracing::info!(applied = r.applied, rotations = r.rotations, period = p, ?next, "light client: caught up from updates");
-                            me.status.write().period = Some(p);
-                        }
-                        if let Some(f) = r.finalized
-                            && let Some(ps) = &me.persist
-                        {
-                            let _ = ps.set_meta(FINALIZED_ROOT_META, &f.beacon.root());
-                        }
-                        if let Some(e) = r.stopped {
-                            tracing::debug!("light client updates: stopped at an update that doesn't verify: {e}");
+                        if !me.apply_range(&updates, fv) {
+                            break;
                         }
                         // Progress (a rotation or a newly learned committee): more periods may follow
                         // right away. Anything else waits before asking again.
@@ -220,6 +201,49 @@ impl Light {
             }
             me.fetching_next.store(false, std::sync::atomic::Ordering::SeqCst);
         });
+    }
+
+    /// Applies a `LightClientUpdatesByRange` response (`light::apply_updates`) and publishes what
+    /// it verified, like gossip does. False if no committee is held.
+    fn apply_range(&self, updates: &[Vec<u8>], fv: [u8; 4]) -> bool {
+        let r = {
+            let mut g = self.committee.lock();
+            let Some(cs) = g.as_mut() else { return false };
+            light::apply_updates(cs, updates, fv)
+        };
+        if r.rotations > 0 || r.applied > 0 {
+            let (p, next) = self.committee.lock().as_ref().map(|c| (c.current.period, c.next.as_ref().map(|n| n.period))).unwrap_or_default();
+            tracing::info!(applied = r.applied, rotations = r.rotations, period = p, ?next, "light client: caught up from updates");
+            self.status.write().period = Some(p);
+        }
+        self.publish(r.attested.as_ref(), r.finalized.as_ref(), r.applied as u64);
+        if let Some(e) = r.stopped {
+            tracing::debug!("light client updates: stopped at an update that doesn't verify: {e}");
+        }
+        true
+    }
+
+    /// The one place verified headers take effect (gossip and catch-up alike): the attested and
+    /// finalized execution hashes move forward only (by beacon slot), the finalized root is
+    /// saved as the next run's trust anchor, and [`Self::on_block`] resolves the hashes to blocks.
+    fn publish(&self, attested: Option<&light::LcHeader>, finalized: Option<&light::LcHeader>, verified: u64) {
+        let mut st = self.status.write();
+        st.updates_verified += verified;
+        if let Some(a) = attested
+            && st.attested_slot.is_none_or(|s| s < a.beacon.slot)
+        {
+            st.attested_slot = Some(a.beacon.slot);
+            st.verified_hash = Some(a.execution_block_hash);
+        }
+        if let Some(f) = finalized
+            && st.finalized_slot.is_none_or(|s| s < f.beacon.slot)
+        {
+            st.finalized_slot = Some(f.beacon.slot);
+            st.finalized_hash = Some(f.execution_block_hash);
+            if let Some(p) = &self.persist {
+                let _ = p.set_meta(FINALIZED_ROOT_META, &f.beacon.root());
+            }
+        }
     }
 
     /// Resolves verified hashes to block numbers in the store's chain (blocks may arrive after
@@ -310,6 +334,52 @@ mod tests {
         assert_eq!(resolve(&store, &v), None, "must refuse, not return B100");
         // The next block drops the stale verified block instead of keeping its height.
         assert_eq!(advance(&store, Some(v), Some(a100.hash)), None);
+    }
+
+    #[test]
+    fn catch_up_from_range_updates_publishes_safe_and_finalized_without_gossip() {
+        // Seventh review, P2: catch-up verified headers but only gossip published them.
+        use skim_cl::light::{SLOTS_PER_PERIOD, testkit::*};
+        let (a, b, c, d) = (key(1), key(2), key(3), key(4));
+        let p1 = BOUNDARY;
+        let p2 = BOUNDARY + SLOTS_PER_PERIOD;
+        let lc = Arc::new(Light {
+            committee: Mutex::new(Some(bootstrapped(&a))),
+            fetching_next: Default::default(),
+            status: Default::default(),
+            cl: None,
+            persist: None,
+            bootstrapping: Default::default(),
+        });
+        let updates = vec![
+            update_with_finality(&a, &b, p1 - 200, p1 - 300, p1 - 199),
+            update_with_finality(&b, &c, p2 - 200, p2 - 300, p2 - 199),
+            update_with_finality(&c, &d, p2 + 50, p2 + 10, p2 + 51),
+        ];
+        assert!(lc.apply_range(&updates, FV));
+        // The execution blocks the newest headers commit to: finalized at 2, attested at 3.
+        let store = Store::new(64);
+        let mut parent = B256::repeat_byte(1);
+        for (n, hash) in [(1, B256::repeat_byte(2)), (2, exec_hash(p2 + 10)), (3, exec_hash(p2 + 50))] {
+            store.apply_block(BlockRef { number: n, hash, parent_hash: parent, state_root: B256::ZERO, timestamp: 0 }, Default::default()).unwrap();
+            parent = hash;
+        }
+        lc.on_block(&store);
+        let st = lc.status();
+        assert_eq!(st.period, Some(P + 2));
+        assert_eq!(st.updates_verified, 3);
+        assert_eq!(st.verified_block, Some(VerifiedBlock { number: 3, hash: exec_hash(p2 + 50) }));
+        assert_eq!(st.finalized_block, Some(VerifiedBlock { number: 2, hash: exec_hash(p2 + 10) }));
+        // An older verified header (e.g. late gossip) never moves them back.
+        let old = light::LcHeader {
+            beacon: light::BeaconHeader { slot: p2 - 200, proposer_index: 0, parent_root: [0; 32], state_root: [0; 32], body_root: [0; 32] },
+            execution_block_hash: B256::repeat_byte(2),
+        };
+        lc.publish(Some(&old), Some(&old), 1);
+        lc.on_block(&store);
+        let st = lc.status();
+        assert_eq!((st.verified_hash, st.finalized_hash), (Some(exec_hash(p2 + 50)), Some(exec_hash(p2 + 10))));
+        assert_eq!(st.verified_block.map(|v| v.number), Some(3));
     }
 
     #[test]

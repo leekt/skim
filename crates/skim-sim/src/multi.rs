@@ -368,8 +368,8 @@ impl Simulator {
     ) -> Result<(Vec<SimBlockResult>, db::Access), SimError> {
         use revm::Database;
         use revm_inspectors::transfer::TransferInspector;
-        let store = self.store.clone();
-        let block_hash = move |n: u64| store.block_hash(n);
+        let (store, at) = (self.store.clone(), *snap.block());
+        let block_hash = move |n: u64| store.block_hash_at(&at, n);
         let sdb = db::SnapDb { snap, block_hash: &block_hash, access: Default::default(), code_cache: &self.code_cache };
         let mut cache = CacheDB::new(&sdb);
         let base = env::block_env(header);
@@ -485,8 +485,8 @@ impl Simulator {
         let (snap, header) = self.snapshot_ctx(b)?;
         let mut list = tx.access_list.clone();
         for _ in 0..10 {
-            let store = self.store.clone();
-            let block_hash = move |n: u64| store.block_hash(n);
+            let (store, at) = (self.store.clone(), *snap.block());
+            let block_hash = move |n: u64| store.block_hash_at(&at, n);
             let sdb = db::SnapDb { snap: &snap, block_hash: &block_hash, access: Default::default(), code_cache: &self.code_cache };
             let mut cache = CacheDB::new(&sdb);
             if let Some(o) = &overrides {
@@ -584,8 +584,8 @@ impl Simulator {
         }
         let cfg = if base.validating { env::validating_cfg() } else { env::call_cfg() };
         let wants_prestate = matches!(opts.tracer, Some(GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::PreStateTracer)));
-        let store = self.store.clone();
-        let block_hash = move |n: u64| store.block_hash(n);
+        let (store, hash_at) = (self.store.clone(), *snap.block());
+        let block_hash = move |n: u64| store.block_hash_at(&hash_at, n);
         // 1. Plain runs until nothing is missing (prestate traces also report the fee recipient).
         let mut plain = None;
         let rounds = if base.prestate.is_some() { MAX_REPLAY_ROUNDS } else { MAX_ROUNDS };

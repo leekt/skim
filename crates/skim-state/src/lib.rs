@@ -195,6 +195,43 @@ impl Inner {
         self.watched_keys.contains(k) || self.tracked_by_address(k)
     }
 
+    /// The canonical hash this store holds for block `n` (state window or hash ring).
+    fn known_hash(&self, n: u64) -> Option<B256> {
+        self.chain.get(&n).map(|b| b.hash).or_else(|| self.hashes.get(&n).copied())
+    }
+
+    /// The lowest block in `from..to` whose canonical hash is known and passes `ok`.
+    fn first_known(&self, from: u64, to: u64, ok: &dyn Fn(u64, B256) -> bool) -> Option<(u64, B256)> {
+        let mut c: Vec<(u64, B256)> = self.chain.range(from..to).map(|(n, b)| (*n, b.hash)).collect();
+        c.extend(self.hashes.range(from..to).map(|(n, h)| (*n, *h)));
+        c.sort_unstable_by_key(|x| x.0);
+        c.into_iter().find(|(n, h)| ok(*n, *h))
+    }
+
+    /// `k`'s versions as archive writes `(block, hash, value)`, each under a hash this store
+    /// knows for its block. A version whose block hash is gone (pruned from the hash ring while
+    /// the value stayed, e.g. an unchanged key tracked for longer than both windows) is moved
+    /// up to the lowest later block with a known hash, where it is still the key's value, so the
+    /// archive starts there: never earlier, and never without a base.
+    /// `ok` admits a `(block, hash)` (the archive must hold that block).
+    fn archivable_versions(&self, k: &StateKey, ok: &dyn Fn(u64, B256) -> bool) -> Vec<(u64, B256, U256)> {
+        let Some(v) = self.versions.get(k) else { return vec![] };
+        let end = self.head().map_or(0, |h| h.number + 1);
+        let mut out = Vec::with_capacity(v.len());
+        for (i, (n, x)) in v.iter().enumerate() {
+            if let Some(h) = self.known_hash(*n).filter(|h| ok(*n, *h)) {
+                out.push((*n, h, *x));
+                continue;
+            }
+            // In effect until the next version (or the head).
+            let until = v.get(i + 1).map_or(end, |(m, _)| *m);
+            if let Some((m, h)) = self.first_known(*n + 1, until, ok) {
+                out.push((m, h, *x));
+            }
+        }
+        out
+    }
+
     /// The writes to `k` in the recent-BAL index, oldest first, if they are usable: every block
     /// from the first of them to the head is indexed (a gap could hide a write).
     fn bal_writes(&self, k: &StateKey) -> Vec<(u64, U256)> {
@@ -394,13 +431,10 @@ impl Store {
         if !st.archived.insert(k) {
             return true;
         }
-        // Versions go to the archive with the hash of their block on this chain (checked there);
-        // one whose block hash isn't known any more (collapsed below the window) is left out.
-        let mem: Vec<(u64, B256, U256)> = st
-            .versions
-            .get(&k)
-            .map(|v| v.iter().filter_map(|(n, x)| st.hashes.get(n).or_else(|| st.chain.get(n).map(|b| &b.hash)).map(|h| (*n, *h, *x))).collect())
-            .unwrap_or_default();
+        let mem = st.archivable_versions(&k, &|n, h| ar.hash(n).ok().flatten() == Some(h));
+        if mem.is_empty() && st.versions.get(&k).is_some_and(|v| !v.is_empty()) {
+            tracing::warn!(?k, "archive: a known value has no archived block to start from; archived from its next write");
+        }
         let r = match mem.split_first() {
             Some(((b0, h0, v0), rest)) => ar.write_base(&k, *b0, *h0, *v0, rest),
             None => ar.add_keys(&[k]),
@@ -789,6 +823,41 @@ impl Store {
 
     /// Block hash by number: the in-memory chain, the `BLOCKHASH` ring, then the archive.
     /// `None` means unknown, never zero.
+    /// `BLOCKHASH(n)` for a simulation at `at`: only a hash established as an ancestor of `at`.
+    /// In memory that is the canonical ring when `at` is on it. From the archive, a hash is
+    /// used only if the archive links it to a block known to be an ancestor of `at` (the oldest
+    /// in-memory hash above `n`, or `at` itself for an archived snapshot): an archived hash at
+    /// the right height can belong to a fork the chain abandoned (e.g. before reconciliation
+    /// after an offline reorg). Anything else is unknown, so the caller resolves headers.
+    pub fn block_hash_at(&self, at: &BlockRef, n: u64) -> Option<B256> {
+        if n > at.number {
+            return None;
+        }
+        if n == at.number {
+            return Some(at.hash);
+        }
+        let anchor = {
+            let st = self.inner.read();
+            let mem = |m: u64| st.chain.get(&m).map(|b| b.hash).or_else(|| st.hashes.get(&m).copied());
+            if mem(at.number) == Some(at.hash) {
+                if let Some(h) = mem(n) {
+                    return Some(h);
+                }
+                // The nearest in-memory ancestor above `n` (canonical, like `at`).
+                let k = st.hashes.range(n + 1..at.number).next().map(|(m, h)| (*m, *h));
+                let c = st.chain.range(n + 1..at.number).next().map(|(m, b)| (*m, b.hash));
+                match (k, c) {
+                    (Some(a), Some(b)) => if a.0 <= b.0 { a } else { b },
+                    (Some(a), None) | (None, Some(a)) => a,
+                    (None, None) => (at.number, at.hash),
+                }
+            } else {
+                (at.number, at.hash)
+            }
+        };
+        self.archive.as_ref().and_then(|a| a.ancestor_hash(n, anchor).ok().flatten())
+    }
+
     pub fn block_hash(&self, number: u64) -> Option<B256> {
         {
             let st = self.inner.read();
