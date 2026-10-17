@@ -224,6 +224,8 @@ restart_at = None  # time of the last restart while recovering
 promo = None  # (address, block it was subscribed at)
 senders_seen = []
 last_n = None
+CHAOS_CYCLE = ["switch-config", "sigkill", "graceful", "switch-config", "graceful", "sigkill"]
+chaos_n = 0
 wrong_log = open(os.path.join(OUT, "wrong.jsonl"), "a")
 status_log = open(os.path.join(OUT, "status.jsonl"), "a")
 events = open(os.path.join(OUT, "events.jsonl"), "a")
@@ -240,7 +242,10 @@ rnd = random.Random(7)
 
 while time.time() < t_end:
     if time.time() >= next_chaos:
-        kind = rnd.choice(["sigkill", "graceful", "switch-config"])
+        # A fixed cycle (not a random pick), so every run switches configs: config B's whole-
+        # storage promotion and the BAL -> archive promotion must happen, not just may.
+        kind = CHAOS_CYCLE[chaos_n % len(CHAOS_CYCLE)]
+        chaos_n += 1
         cfg = ("B" if skim.cfg == "A" else "A") if kind == "switch-config" else skim.cfg
         skim.stop(signal.SIGKILL if kind == "sigkill" else signal.SIGTERM)
         events.write(json.dumps({"t": time.time(), "event": kind, "config": cfg}) + "\n"); events.flush()
