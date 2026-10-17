@@ -58,6 +58,8 @@ pub enum DataError {
     /// Bad request: `-32602` / `-32005` range limit.
     Invalid(String),
     RangeTooLarge(u64),
+    /// Outside what skim serves at all (history before Amsterdam): `-32004`.
+    Unsupported(String),
 }
 
 struct Sent {
@@ -134,6 +136,9 @@ pub struct ChainData {
     bal_raw: Mutex<Cache<Bytes>>,
     pub max_log_range: u64,
     rr: AtomicUsize,
+    /// Post-Amsterdam headers on disk (`history.redb` in the data dir), so logs and receipts
+    /// cover the whole post-fork history. `None` with `--ephemeral`: memory only.
+    history: std::sync::OnceLock<crate::history::HeaderStore>,
 }
 
 fn tx_hashes(raw: &[Bytes]) -> Vec<B256> {
@@ -152,6 +157,7 @@ impl ChainData {
             bal_raw: Mutex::new(Cache::new(SERVE_BALS)),
             max_log_range,
             rr: AtomicUsize::new(0),
+            history: Default::default(),
         });
         let me = Arc::downgrade(&cd);
         tokio::spawn(async move {
@@ -162,6 +168,19 @@ impl ChainData {
             }
         });
         cd
+    }
+
+    /// Keeps post-Amsterdam headers in `store` from now on (and serves logs from them).
+    pub fn set_history(&self, store: crate::history::HeaderStore) {
+        let _ = self.history.set(store);
+    }
+
+    fn store_headers(&self, hs: &[(B256, &Header)]) {
+        if let Some(s) = self.history.get()
+            && let Err(e) = s.put(hs)
+        {
+            tracing::warn!("{e}");
+        }
     }
 
     // ---- ingestion -------------------------------------------------------------------------
@@ -184,6 +203,9 @@ impl ChainData {
             }
         }
         g.put_header(hash, Arc::new(h.clone()));
+        drop(g);
+        self.store_headers(&[(hash, h)]);
+        let mut g = self.inner.write();
         while g.headers.len() > HEADERS_MAX {
             let Some((&n, _)) = g.headers.first_key_value() else { break };
             g.drop_header(n);
@@ -321,8 +343,84 @@ impl ChainData {
         v
     }
 
-    /// Makes headers down to `number` available, walking back by hash from the oldest one.
+    /// Makes headers down to `number` available: in memory for recent blocks; below that, on
+    /// disk (post-Amsterdam history), walking back by hash from the lowest linked header.
     async fn ensure_headers(&self, number: u64) -> Result<(), DataError> {
+        let Some(store) = self.history.get() else { return self.ensure_headers_mem(number).await };
+        if let Ok(Some(floor)) = store.floor()
+            && number < floor
+        {
+            return Err(DataError::Unsupported(format!("block {number} is before Amsterdam (block {floor}): history before the fork isn't served")));
+        }
+        let (mut low, mut parent) = {
+            let g = self.inner.read();
+            let Some((n, (_, h))) = g.headers.first_key_value() else {
+                return Err(DataError::Unavailable("no headers yet".into()));
+            };
+            (*n, h.parent_hash)
+        };
+        let unavailable = |e: crate::history::StoreError| DataError::Unavailable(e.to_string());
+        while low > number {
+            // Already stored and linked: jump to the bottom of that run.
+            if let Some((hash, _)) = store.get(low - 1).map_err(unavailable)?
+                && hash == parent
+            {
+                let (l, p) = store.contiguous_low(low - 1).map_err(unavailable)?.expect("just read");
+                (low, parent) = (l, p);
+                continue;
+            }
+            let want = (low - number).min(1024);
+            let mut got = None;
+            for pass in 0..PASSES {
+                if pass > 0 {
+                    tokio::time::sleep(PASS_BACKOFF * pass).await;
+                }
+                for p in self.peers().into_iter().take(4) {
+                    let Ok(hs) = self.net.headers_falling(p, parent.into(), want).await.0 else { continue };
+                    let mut expect = parent;
+                    let mut ok = Vec::new();
+                    for h in hs {
+                        let hh = h.hash_slow();
+                        if hh != expect || h.number + 1 != low - ok.len() as u64 {
+                            break;
+                        }
+                        expect = h.parent_hash;
+                        ok.push((hh, h));
+                    }
+                    if !ok.is_empty() {
+                        got = Some(ok);
+                        break;
+                    }
+                }
+                if got.is_some() {
+                    break;
+                }
+            }
+            let Some(ok) = got else {
+                return Err(DataError::Unavailable(format!("headers below {low} not served by peers")));
+            };
+            if let Some(pre) = ok.iter().find(|(_, h)| !crate::history::post_fork(h)) {
+                let floor = pre.1.number + 1;
+                let _ = store.set_floor(floor);
+                tracing::info!(floor, "history: reached Amsterdam; earlier blocks aren't served");
+                store.put(&ok.iter().map(|(x, h)| (*x, h)).collect::<Vec<_>>()).map_err(unavailable)?;
+                if number < floor {
+                    return Err(DataError::Unsupported(format!("block {number} is before Amsterdam (block {floor}): history before the fork isn't served")));
+                }
+                return Ok(());
+            }
+            store.put(&ok.iter().map(|(x, h)| (*x, h)).collect::<Vec<_>>()).map_err(unavailable)?;
+            let last = &ok.last().expect("non-empty").1;
+            (low, parent) = (last.number, last.parent_hash);
+            if low % 16384 < 1024 {
+                tracing::info!(low, target = number, "history: headers walked back");
+            }
+        }
+        Ok(())
+    }
+
+    /// Without a header store: walk back in memory (about a day of headers).
+    async fn ensure_headers_mem(&self, number: u64) -> Result<(), DataError> {
         for _ in 0..64 {
             let (oldest, parent) = {
                 let g = self.inner.read();
@@ -697,12 +795,25 @@ impl ChainData {
             return Err(DataError::RangeTooLarge(self.max_log_range));
         }
         self.ensure_headers(from).await?;
+        // Below the in-memory window, headers come from the post-fork store.
+        let disk: HashMap<u64, (B256, Arc<Header>)> = {
+            let mem_low = self.inner.read().headers.first_key_value().map(|(n, _)| *n).unwrap_or(u64::MAX);
+            match self.history.get() {
+                Some(s) if from < mem_low => s
+                    .range(from, to.min(mem_low.saturating_sub(1)))
+                    .map_err(|e| DataError::Unavailable(e.to_string()))?
+                    .into_iter()
+                    .map(|(hash, h)| (h.number, (hash, Arc::new(h))))
+                    .collect(),
+                _ => HashMap::new(),
+            }
+        };
         let (candidates, scanned) = {
             let g = self.inner.read();
             let mut c = Vec::new();
             let mut scanned = 0u64;
             for n in from..=to {
-                let Some((bh, h)) = g.headers.get(&n).cloned() else {
+                let Some((bh, h)) = g.headers.get(&n).cloned().or_else(|| disk.get(&n).cloned()) else {
                     return Err(DataError::Unavailable(format!("no header for block {n}")));
                 };
                 scanned += 1;

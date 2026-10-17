@@ -19,7 +19,7 @@ skim serves standard Ethereum JSON-RPC over HTTP and WebSocket on the same addre
 | `eth_sendRawTransaction` | Checks chain id, signature, `nonce too low`, and `insufficient funds` against verified head state. Then gossips to all connected EL peers, re-broadcasting every 12 s until included (gives up after 30 min). Blob transactions are rejected. |
 | `eth_getTransactionByHash` | Transactions sent through skim (pending or included), and any transaction in the last 2,048 indexed blocks. |
 | `eth_getTransactionReceipt` | `null` until included. Then built from the block's receipts, fetched from peers and checked against `receiptsRoot`. |
-| `eth_getLogs` | Address / topics / `fromBlock`–`toBlock` / `blockHash`. Range ≤ `--max-logs-range` (2,048). Only blocks whose bloom (and, for followed blocks, BAL) can match have their receipts fetched; receipts are verified. |
+| `eth_getLogs` | Address / topics / `fromBlock`–`toBlock` / `blockHash`. Range ≤ `--max-logs-range` (2,048). Only blocks whose bloom (and, for followed blocks, BAL) can match have their receipts fetched; receipts are verified. Covers history back to Glamsterdam (Sepolia block 11,856,337): headers since the fork are kept in `history.redb` in the data dir, walked back hash by hash from peers on first use. Earlier blocks: `-32004`. With `--ephemeral`, about the last day only. |
 | `eth_getBlockByNumber`, `eth_getBlockByHash` | Header fields plus transaction hashes, or full transaction objects with `true`. Bodies are verified against `transactionsRoot`. |
 | `eth_blockNumber` | The latest **state-ready** block. |
 | `eth_chainId`, `net_version`, `net_listening`, `eth_syncing`, `web3_clientVersion` | |
@@ -57,6 +57,7 @@ viem's `watch*` helpers use these automatically with `webSocket(...)`.
 | `-32002` | Resource unavailable: no peer could serve the state, receipts or headers right now, or the block is outside the window and not archived. **skim never substitutes a guess**, so retrying later is safe. |
 | `-32004` | Not supported: `eth_sendTransaction` (skim holds no keys; sign in your client), filters and subscriptions. |
 | `-32005` | `eth_getLogs` range larger than `--max-logs-range`. |
+| `-32004` | History before Glamsterdam (`eth_getLogs` below the fork block): not served. |
 | `-32000` | Transaction rejected (`nonce too low`, `insufficient funds…`, invalid signature, wrong chain id), or EVM halt. |
 | `3` | Execution reverted. `data` carries the revert bytes, so viem/ethers decode custom errors as usual. |
 | `-32602` / `-32601` | Bad params / unknown method. |

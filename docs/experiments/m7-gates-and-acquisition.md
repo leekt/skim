@@ -137,4 +137,13 @@ The invariant from the fifth review, extended to every EVM input: **a known valu
 | P2: soak freshness measured arrival gaps, so a stream of old blocks arriving regularly passed. The timer also shared the probe loop | A separate thread samples every 2 s. A head is stale if its header timestamp is more than 3 slots old, or it is more than 3 blocks behind the reference head. The longest gap between heads is reported separately (`max_head_gap_s`) | `--selftest`: steady, regularly arriving 5-minute-old headers fail the gate (fails if the age check is removed) |
 
 ## Results
-(full soak: filled in when it completes)
+**Full soak (150 min, binary `c020e7d`, soak v2 harness before the seventh-review changes): FAIL on two gates, with no wrong answers.**
+- **Answers:** 7,235 matches, 0 wrong, 0 refusals. 43 answers were unavailable from the reference, and 22 skim requests failed in transport (counted as unanswered).
+- **Steady-state answer rate:** 99.2% or higher for every probe kind. Every required kind exceeded its minimum sample count (`restart_archive`: 264 samples).
+- **Promotion:** 18 keys moved from recent BALs to the archive during the run.
+- **Memory:** RSS stayed under 158 MB. The subscribed-key limit was never exceeded.
+- **Restarts:** 16 in total.
+  - 14 were ready again within 22–148 s.
+  - 2 missed the 180 s gate: 407 s and 215 s. Both were config switches, where the new config subscribes keys the snapshot doesn't hold, so readiness waits for SNAP fetches.
+- **Freshness:** the head was stale for 4.1% of steady-state time, over the 2% gate. This run measured gaps between head arrivals, the metric the seventh review replaced, so the figure includes the time the probe loop itself was busy.
+- **Next:** rerun with the new freshness sampler. If config-switch recovery still misses 180 s, time the SNAP fetch to see whether it is waiting for peers or fetching.

@@ -4,6 +4,7 @@
 mod bench_node;
 mod chain;
 mod chaindata;
+mod history;
 mod dashboard;
 mod persist;
 mod light;

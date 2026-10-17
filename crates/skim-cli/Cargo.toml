@@ -17,6 +17,8 @@ skim-el.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-rlp.workspace = true
+redb.workspace = true
+thiserror.workspace = true
 alloy-trie.workspace = true
 reth-eth-wire-types.workspace = true
 tokio.workspace = true
@@ -44,4 +46,5 @@ alloy-rpc-types-trace.workspace = true
 skim-cl.workspace = true
 
 [dev-dependencies]
+tempfile = "3"
 skim-cl = { workspace = true, features = ["testkit"] }

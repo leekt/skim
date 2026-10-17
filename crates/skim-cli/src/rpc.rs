@@ -221,6 +221,7 @@ impl From<DataError> for RpcError {
             DataError::Unavailable(m) => Self::unavailable(m),
             DataError::Invalid(m) => Self::new(-32000, m),
             DataError::RangeTooLarge(n) => Self::new(-32005, format!("block range too large: at most {n} blocks per eth_getLogs")),
+            DataError::Unsupported(m) => Self::new(-32004, m),
         }
     }
 }

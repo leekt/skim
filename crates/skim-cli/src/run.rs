@@ -317,6 +317,15 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let light = crate::light::Light::new(cl.clone(), persist.clone());
     light.start(args.checkpoint, args.checkpoint_url.clone());
     let chaindata = crate::chaindata::ChainData::new(net.clone(), args.max_logs_range);
+    if !args.ephemeral {
+        let dir = args.data_dir.clone().unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".skim/sepolia")
+        });
+        match crate::history::HeaderStore::open(dir.join("history.redb")) {
+            Ok(s) => chaindata.set_history(s),
+            Err(e) => tracing::warn!("post-fork header store unavailable ({e}); logs cover about a day"),
+        }
+    }
     let dash = Arc::new(crate::dashboard::Dashboard::default());
     if !args.no_serve {
         net.serve(Arc::new(crate::serving::Served { chain: chaindata.clone(), store: store.clone() }));
