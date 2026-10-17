@@ -168,8 +168,10 @@ impl Light {
         }
     }
 
-    /// Learns the next period's committee from a `LightClientUpdate` for the current period (in
-    /// the background, retrying; one fetch at a time).
+    /// Catches the committees up to the live period from `LightClientUpdatesByRange`, applying
+    /// each update in order (`light::apply_updates`): learns the next committee, applies
+    /// historical finality, rotates. A checkpoint several periods old ends at the live period
+    /// with its successor known, so live gossip verifies. In the background, one run at a time.
     fn fetch_next_committee(self: &Arc<Self>) {
         if self.fetching_next.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
@@ -177,31 +179,42 @@ impl Light {
         let me = self.clone();
         tokio::spawn(async move {
             let fv = skim_cl::node::SEPOLIA_GLOAS_VERSION;
-            for attempt in 0..60 {
-                let Some(period) = me.committee.lock().as_ref().filter(|c| c.next.is_none()).map(|c| c.current.period) else { break };
-                let res = me.cl.light_client_updates(period, 1).await;
-                let learned = res.as_ref().ok().and_then(|chunks| {
-                    let mut g = me.committee.lock();
-                    let cs = g.as_mut()?;
-                    chunks.iter().find_map(|u| match light::full_update(cs, u, fv) {
-                        Ok(up) => up.next,
-                        Err(e) => {
-                            tracing::debug!("light client update (next committee) rejected: {e}");
-                            None
+            for attempt in 0..120 {
+                let live = skim_cl::NodeConfig::sepolia(0).current_slot() / light::SLOTS_PER_PERIOD;
+                let Some((period, has_next)) = me.committee.lock().as_ref().map(|c| (c.current.period, c.next.is_some())) else { break };
+                if period >= live && has_next {
+                    break;
+                }
+                let count = (live.saturating_sub(period) + 1).min(128);
+                match me.cl.light_client_updates(period, count).await {
+                    Ok(updates) => {
+                        let r = {
+                            let mut g = me.committee.lock();
+                            let Some(cs) = g.as_mut() else { break };
+                            light::apply_updates(cs, &updates, fv)
+                        };
+                        if r.rotations > 0 || r.applied > 0 {
+                            let (p, next) = me.committee.lock().as_ref().map(|c| (c.current.period, c.next.as_ref().map(|n| n.period))).unwrap_or_default();
+                            tracing::info!(applied = r.applied, rotations = r.rotations, period = p, ?next, "light client: caught up from updates");
+                            me.status.write().period = Some(p);
                         }
-                    }).map(|n| {
-                        let p = n.period;
-                        cs.next = Some(n);
-                        p
-                    })
-                });
-                match (learned, res) {
-                    (Some(p), _) => {
-                        tracing::info!(period = p, "light client: next sync committee verified");
-                        break;
+                        if let Some(f) = r.finalized
+                            && let Some(ps) = &me.persist
+                        {
+                            let _ = ps.set_meta(FINALIZED_ROOT_META, &f.beacon.root());
+                        }
+                        if let Some(e) = r.stopped {
+                            tracing::debug!("light client updates: stopped at an update that doesn't verify: {e}");
+                        }
+                        // Progress (a rotation or a newly learned committee): more periods may follow
+                        // right away. Anything else waits before asking again.
+                        let after = me.committee.lock().as_ref().map(|c| (c.current.period, c.next.is_some()));
+                        if after != Some((period, has_next)) {
+                            continue;
+                        }
                     }
-                    (None, Err(e)) if attempt % 10 == 0 => tracing::debug!("light client updates: {e}"),
-                    _ => {}
+                    Err(e) if attempt % 10 == 0 => tracing::debug!("light client updates: {e}"),
+                    Err(_) => {}
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             }

@@ -343,6 +343,61 @@ pub fn full_update(cs: &Committees, b: &[u8], fork_version: [u8; 4]) -> Result<F
     Ok(FullUpdate { attested, finalized, next })
 }
 
+/// What [`apply_updates`] did.
+#[derive(Default)]
+pub struct Applied {
+    /// Updates verified and applied, in order.
+    pub applied: usize,
+    /// Committee rotations (periods advanced).
+    pub rotations: usize,
+    /// The newest attested and finalized headers among the applied updates.
+    pub attested: Option<LcHeader>,
+    pub finalized: Option<LcHeader>,
+    /// Why processing stopped early, if it did (later updates depend on this one).
+    pub stopped: Option<LcError>,
+}
+
+/// Processes `LightClientUpdate`s in order (as `LightClientUpdatesByRange` returns them),
+/// advancing `cs` the way the sync protocol does: each update must be signed by a held
+/// committee; one attested in the current period teaches the next committee; a finalized header
+/// in the next period rotates it to current, after which the same update's next committee is
+/// for the new current period. This lets a client that bootstrapped periods ago catch up to the
+/// live period, instead of holding P / P+1 while the network signs with P+2's committee.
+pub fn apply_updates(cs: &mut Committees, updates: &[Vec<u8>], fork_version: [u8; 4]) -> Applied {
+    let mut out = Applied::default();
+    for u in updates {
+        let up = match full_update(cs, u, fork_version) {
+            Ok(up) => up,
+            Err(e) => {
+                out.stopped = Some(e);
+                break;
+            }
+        };
+        if cs.next.is_none() {
+            cs.next = up.next;
+        }
+        if let Some(f) = up.finalized {
+            if cs.advance(f.beacon.slot) {
+                out.rotations += 1;
+                // The update's committee (proven against its attested state) is the next one now.
+                if cs.next.is_none()
+                    && let Ok(again) = full_update(cs, u, fork_version)
+                {
+                    cs.next = again.next;
+                }
+            }
+            if out.finalized.is_none_or(|x| x.beacon.slot < f.beacon.slot) {
+                out.finalized = Some(f);
+            }
+        }
+        if out.attested.is_none_or(|x| x.beacon.slot < up.attested.beacon.slot) {
+            out.attested = Some(up.attested);
+        }
+        out.applied += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +588,97 @@ mod tests {
         // An attested header from an earlier period doesn't say what comes after P.
         let up = full_update(&cs, &update(&a, &bk, BOUNDARY - SLOTS_PER_PERIOD - 10, BOUNDARY - 49, false), FV).unwrap();
         assert!(up.next.is_none());
+    }
+
+    // ---- Catch-up from an old checkpoint (sequential full updates) ----------------------------
+
+    /// A state root committing to two leaves at `g1` and `g2`, with their branches (other
+    /// subtrees are filler).
+    fn two_leaf_root(g1: u64, l1: [u8; 32], g2: u64, l2: [u8; 32]) -> ([u8; 32], Vec<[u8; 32]>, Vec<[u8; 32]>) {
+        fn value(g: u64, g1: u64, l1: [u8; 32], g2: u64, l2: [u8; 32]) -> [u8; 32] {
+            if g == g1 {
+                return l1;
+            }
+            if g == g2 {
+                return l2;
+            }
+            let under = |x: u64| {
+                let mut x = x;
+                while x > g {
+                    x >>= 1;
+                }
+                x == g
+            };
+            if under(g1) || under(g2) {
+                sha(&value(2 * g, g1, l1, g2, l2), &value(2 * g + 1, g1, l1, g2, l2))
+            } else {
+                [0x5a; 32]
+            }
+        }
+        let branch = |g: u64| {
+            let mut out = Vec::new();
+            let mut x = g;
+            while x > 1 {
+                out.push(value(x ^ 1, g1, l1, g2, l2));
+                x >>= 1;
+            }
+            out
+        };
+        (value(1, g1, l1, g2, l2), branch(g1), branch(g2))
+    }
+
+    /// A full update attested at `attested_slot`, carrying `next`'s committee and a finalized
+    /// header at `finalized_slot`, signed by `signer` at `signature_slot`.
+    fn update_with_finality(signer: &SecretKey, next: &SecretKey, attested_slot: u64, finalized_slot: u64, signature_slot: u64) -> Vec<u8> {
+        let (cb, croot) = committee_bytes(next);
+        let (fb, fh) = lc_header(finalized_slot, [9; 32]);
+        let (state_root, nb, finb) = two_leaf_root(NEXT_SYNC_COMMITTEE_GINDEX, croot, FINALIZED_ROOT_GINDEX, fh.root());
+        let (mut b, h) = lc_header(attested_slot, state_root);
+        b.extend_from_slice(&cb);
+        nb.iter().for_each(|n| b.extend_from_slice(n));
+        b.extend_from_slice(&fb);
+        finb.iter().for_each(|n| b.extend_from_slice(n));
+        b.extend_from_slice(&aggregate(signer, &h));
+        b.extend_from_slice(&signature_slot.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn a_client_two_periods_behind_catches_up_from_full_updates() {
+        // Review finding: checkpoint in P, network in P + 2. Fetching only P + 1's committee
+        // left the client at P / P + 1, rejecting all live gossip.
+        let (a, b, c, d) = (key(1), key(2), key(3), key(4)); // committees of P .. P + 3
+        let mut cs = bootstrapped(&a);
+        let p1 = BOUNDARY; // first slot of P + 1
+        let p2 = BOUNDARY + SLOTS_PER_PERIOD;
+        let live = optimistic(&c, p2 + 100, p2 + 101); // signed by P + 2's committee
+        assert!(optimistic_update(&cs, &live, FV).is_err());
+        // LightClientUpdatesByRange(P, 3): one update per period, in order.
+        let updates = vec![
+            update_with_finality(&a, &b, p1 - 200, p1 - 300, p1 - 199), // P: teaches P + 1
+            update_with_finality(&b, &c, p2 - 200, p2 - 300, p2 - 199), // P + 1: finality in P + 1, teaches P + 2
+            update_with_finality(&c, &d, p2 + 50, p2 + 10, p2 + 51),    // P + 2: finality in P + 2, teaches P + 3
+        ];
+        let r = apply_updates(&mut cs, &updates, FV);
+        assert!(r.stopped.is_none(), "{:?}", r.stopped);
+        assert_eq!((r.applied, r.rotations), (3, 2));
+        assert_eq!(cs.current.period, P + 2);
+        assert_eq!(cs.next.as_ref().map(|n| n.period), Some(P + 3));
+        assert_eq!(r.finalized.map(|f| f.beacon.slot), Some(p2 + 10));
+        // Live gossip from P + 2 verifies now.
+        assert!(optimistic_update(&cs, &live, FV).is_ok());
+    }
+
+    #[test]
+    fn catch_up_stops_at_the_first_update_it_cannot_verify() {
+        let (a, b, c) = (key(1), key(2), key(3));
+        let mut cs = bootstrapped(&a);
+        let p2 = BOUNDARY + SLOTS_PER_PERIOD;
+        // The update for P is missing: P + 1's update can't be checked (its committee is unknown).
+        let updates = vec![update_with_finality(&b, &c, p2 - 200, p2 - 300, p2 - 199)];
+        let r = apply_updates(&mut cs, &updates, FV);
+        assert_eq!(r.applied, 0);
+        assert!(matches!(r.stopped, Some(LcError::Period(..))));
+        assert_eq!((cs.current.period, cs.next.is_none()), (P, true));
     }
 }
