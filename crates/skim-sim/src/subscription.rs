@@ -268,6 +268,11 @@ impl Subscriptions {
 
     async fn maintain_inner(&self, sim: &Simulator, head: &BlockRef) {
         sim.store.set_max_subscribed(self.max_keys);
+        // Without a SNAP peer nothing can be fetched: don't wait for one (that wait is for
+        // interactive requests). Run on what is held (e.g. a restart snapshot) and let the next
+        // pass, a block later, fetch the rest. Measured: waiting made the first pass after a
+        // restart take 40 s and readiness ~2 min, though the snapshot was restored in seconds.
+        let fetch = !skim_snap::Transport::snap_peers(sim.sched.transport()).is_empty();
         // 1. Declared keys: subscribe (or archive) and fetch whatever is unknown.
         let declared: Vec<StateKey> = self.declared.values().flat_map(|k| k.iter().copied()).collect();
         let archived_specs: HashSet<&str> = self.specs.iter().filter(|s| s.archive()).map(|s| s.name.as_str()).collect();
@@ -282,7 +287,7 @@ impl Subscriptions {
         }
         if let Ok(snap) = sim.store.snapshot(head) {
             let (accts, slots) = crate::unknown_split(&snap, &declared);
-            if !accts.is_empty() || !slots.is_empty() {
+            if fetch && (!accts.is_empty() || !slots.is_empty()) {
                 let at = if sim.miss_at_parent { sim.store.block(head.number.saturating_sub(1)).unwrap_or(*head) } else { *head };
                 prefetch::resolve_retained(&sim.store, &sim.sched, &at, &accts, &slots, &[], skim_snap::Priority::High, Retention::Subscribed)
                     .await;
@@ -393,7 +398,8 @@ impl Subscriptions {
                     .gas_price(0)
                     .build()
                     .unwrap_or_default();
-                match sim.call(head, tx, Mode::Resolve { max_rounds: 8 }).await {
+                let mode = if fetch { Mode::Resolve { max_rounds: 8 } } else { Mode::WarmOnly };
+                match sim.call(head, tx, mode).await {
                     Ok(o) => {
                         for a in &o.access.accounts {
                             learned.extend(account_keys(*a));
@@ -452,7 +458,7 @@ impl Subscriptions {
         if let Ok(snap) = sim.store.snapshot(head) {
             let all: Vec<StateKey> = self.required.read().values().flat_map(|k| k.iter().copied()).collect();
             let hashes = missing_code(sim, &snap, &all);
-            if !hashes.is_empty() {
+            if fetch && !hashes.is_empty() {
                 let at = if sim.miss_at_parent { sim.store.block(head.number.saturating_sub(1)).unwrap_or(*head) } else { *head };
                 prefetch::resolve_retained(&sim.store, &sim.sched, &at, &[], &[], &hashes, skim_snap::Priority::High, Retention::Subscribed).await;
             }
