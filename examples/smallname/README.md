@@ -1,8 +1,8 @@
 # smallname
 
-A self-hosted ENS read API for Sepolia, with local contract execution through skim and a small index for discovery and history. It serves the routes an ENS frontend uses, in the shape of [bigname](https://github.com/ensdomains/bigname)'s `/v1` API: about 1,700 lines of JavaScript and one SQLite file.
+**bigname, but small.** The same kind of ENS API ([bigname](https://github.com/ensdomains/bigname)'s `/v1` shape, Sepolia), with skim serving current state and a small SQLite index handling discovery and history, instead of a full application-side state projection.
 
-It's a reference app for skim, not a replacement for a full indexer. bigname covers more: all history, more naming systems, verified reads, and replayable, auditable projections. What smallname shows is a different split. Current values are read from contract state at one block hash per response; an index is kept only to find names and to answer history questions.
+Smaller infrastructure and implementation (about 1,700 lines of JavaScript, one SQLite file, one skim node), but not feature-for-feature parity yet: see [Routes](#routes) and the history limits below.
 
 ```bash
 ../target/release/skim run --config bigname/skim.yaml          # terminal 1: skim, ENS kept warm
