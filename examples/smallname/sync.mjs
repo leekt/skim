@@ -160,7 +160,13 @@ export async function follow(store, url, { fromBlock, log = console.log, onBlock
       for (let n = last + 1; n <= Math.min(target, last + 256); n++) {
         const src = url;
         const h = await rpc(src, "eth_getBlockByNumber", [hex(n), false]);
-        if (!h) break;
+        if (!h) {
+          // skim doesn't hold this block's header any more (e.g. it restarted since): index
+          // the gap with range scans (eth_getLogs reaches older headers), then follow again.
+          log(`block ${n} not held by skim: catching up by range`);
+          await catchUp(store, ingest, url, Math.max(n, target - 8), log, 512);
+          break;
+        }
         const prev = store.get("SELECT hash FROM blocks WHERE number = ?", n - 1)?.hash;
         if (prev && prev !== h.parentHash) {
           const at = await ancestor(store, url, n - 1);
