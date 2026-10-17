@@ -285,8 +285,8 @@ while time.time() < t_end:
     # BAL-first: balances of this block's senders (written by this block, not tracked).
     reqs += [("bal_first", "eth_getBalance", [a, tag]) for a in senders[:3]]
     # BAL -> archive: the promoted account's balance at blocks after its promotion, from disk.
-    if promo and n - promo[1] > 40:
-        reqs += [("promo_archived", "eth_getBalance", [promo[0], hex(rnd.randrange(promo[1], n - 35))])]
+    if promo and n - promo[1] > 34:  # older than the 32-block window: served from the archive
+        reqs += [("promo_archived", "eth_getBalance", [promo[0], hex(rnd.randrange(promo[1], n - 33))])]
     # TTL -> whole storage (config B): random pool slots, read on demand from the first block.
     if skim.cfg == "B":
         reqs += [("promo_slot", "eth_getStorageAt", [POOL, hex(rnd.randrange(0, 16)), tag])]

@@ -30,7 +30,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         let mut trace = crate::persist::CatchupTrace::default();
         let want = args.blocks;
         let mut found = 0usize;
-        let r = crate::persist::walk_envelopes(&cl, slot, (want as u64) * 4, &mut trace, |_, _| {
+        let r = crate::persist::walk_envelopes(&cl, slot, (want as u64) * 4, want as u64, &mut trace, |_, _| {
             found += 1;
             found >= want
         })

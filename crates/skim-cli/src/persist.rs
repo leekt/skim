@@ -242,6 +242,7 @@ pub async fn walk_envelopes(
     cl: &skim_cl::ClNode,
     head_slot: u64,
     max_slots: u64,
+    expected_blocks: u64,
     trace: &mut CatchupTrace,
     mut keep: impl FnMut(alloy_consensus::Header, BlockWrites) -> bool,
 ) -> anyhow::Result<()> {
@@ -283,9 +284,12 @@ pub async fn walk_envelopes(
     let mut next_end = Some(head_slot);
     let mut inflight = FuturesUnordered::new();
     let mut lowest_started = head_slot + 1;
+    // Start only as many windows as the gap can need (a 3-block gap: 2, not 8 x 32 slots of
+    // payloads); widen to CATCHUP_PARALLEL once a window has come back without finishing.
+    let mut parallel = (expected_blocks.div_ceil(CHUNK) as usize + 1).min(CATCHUP_PARALLEL);
     let r: anyhow::Result<()> = async {
         loop {
-            while inflight.len() < CATCHUP_PARALLEL
+            while inflight.len() < parallel
                 && let Some(end) = next_end
             {
                 let start = end.saturating_sub(CHUNK - 1).max(lowest_slot);
@@ -317,6 +321,7 @@ pub async fn walk_envelopes(
             if finished {
                 return Ok(());
             }
+            parallel = CATCHUP_PARALLEL;
         }
     }
     .await;
@@ -334,7 +339,7 @@ async fn fetch_via_cl(cl: &skim_cl::ClNode, saved: &Saved, head: &BlockRef) -> a
     let mut got: std::collections::BTreeMap<u64, (alloy_consensus::Header, BlockWrites)> = Default::default();
     let mut trace = CatchupTrace::default();
     // Slots >= blocks (some slots are empty), so walk back until the lowest needed block shows up.
-    let r = walk_envelopes(cl, head_slot, MAX_REPLAY * 2, &mut trace, |h, w| {
+    let r = walk_envelopes(cl, head_slot, MAX_REPLAY * 2, head.number - saved.number, &mut trace, |h, w| {
         let n = h.number;
         if n >= lowest_needed && n <= head.number {
             got.insert(n, (h, w));

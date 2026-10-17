@@ -257,6 +257,16 @@ impl Subscriptions {
     /// only keys admitted under `max_keys` become subscribed. Keys a call no longer reads are
     /// unsubscribed (except archived ones, whose history must stay continuous).
     pub async fn maintain(&self, sim: &Simulator, head: &BlockRef) {
+        let t0 = std::time::Instant::now();
+        self.maintain_inner(sim, head).await;
+        let st = self.status.read();
+        tracing::debug!(block = head.number, ms = t0.elapsed().as_millis() as u64,
+            ready = st.values().filter(|s| s.ready).count(), of = st.len(),
+            missing = st.values().map(|s| s.missing_keys).sum::<usize>(),
+            head_moved = sim.store.head().is_some_and(|h| h.number > head.number), "subscription pass");
+    }
+
+    async fn maintain_inner(&self, sim: &Simulator, head: &BlockRef) {
         sim.store.set_max_subscribed(self.max_keys);
         // 1. Declared keys: subscribe (or archive) and fetch whatever is unknown.
         let declared: Vec<StateKey> = self.declared.values().flat_map(|k| k.iter().copied()).collect();
