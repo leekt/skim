@@ -551,6 +551,56 @@ impl ChainData {
         Err(DataError::Unavailable(format!("block {} receipts not served by peers", header.number)))
     }
 
+    /// Receipts of many blocks (verified against each `receipts_root`), fetched in batches of
+    /// hashes per request and several requests in flight: for range scans, where one request
+    /// per block would be hundreds of round trips. Blocks no peer served are left out; callers
+    /// fall back to [`Self::block_receipts`].
+    async fn receipts_many(&self, blocks: &[(B256, Arc<Header>)]) -> HashMap<B256, Arc<Vec<Receipt>>> {
+        const PER_REQUEST: usize = 32;
+        let mut out = HashMap::new();
+        let mut todo = Vec::new();
+        for (hash, h) in blocks {
+            if h.receipts_root == alloy_consensus::EMPTY_ROOT_HASH {
+                out.insert(*hash, Arc::new(Vec::new()));
+            } else if let Some(r) = self.receipts.lock().get(hash) {
+                out.insert(*hash, r);
+            } else {
+                todo.push((*hash, h.clone()));
+            }
+        }
+        for _pass in 0..PASSES {
+            if todo.is_empty() {
+                break;
+            }
+            let chunks: Vec<Vec<(B256, Arc<Header>)>> = todo.chunks(PER_REQUEST).map(|c| c.to_vec()).collect();
+            let got: Vec<Vec<(B256, Arc<Vec<Receipt>>)>> = futures::stream::iter(chunks)
+                .map(|chunk| async move {
+                    let hashes: Vec<B256> = chunk.iter().map(|(h, _)| *h).collect();
+                    for p in self.peers().into_iter().take(3) {
+                        let Ok(rs) = self.net.blocks_receipts(p, &hashes).await.0 else { continue };
+                        let ok: Vec<_> = rs
+                            .into_iter()
+                            .zip(chunk.iter())
+                            .filter(|(r, (_, h))| Receipt::calculate_receipt_root_no_memo(r) == h.receipts_root)
+                            .map(|(r, (hash, _))| (*hash, Arc::new(r)))
+                            .collect();
+                        if !ok.is_empty() {
+                            return ok;
+                        }
+                    }
+                    Vec::new()
+                })
+                .buffer_unordered(16)
+                .collect()
+                .await;
+            for (hash, r) in got.into_iter().flatten() {
+                out.insert(hash, r);
+            }
+            todo.retain(|(h, _)| !out.contains_key(h));
+        }
+        out
+    }
+
     /// Where a transaction is: (number, block hash, header, index), if skim indexed it.
     /// A block's access list, verified against its header (gossip cache, else eth/71 peers).
     pub async fn block_bal(&self, hash: B256, header: &Header) -> Result<Arc<skim_bal::BlockAccessList>, DataError> {
@@ -832,9 +882,19 @@ impl ChainData {
             (c, scanned)
         };
         let t = Instant::now();
+        // Many candidates (a range scan): fetch their receipts in batches first.
+        let batch = if candidates.len() > 4 {
+            self.receipts_many(&candidates.iter().map(|(_, bh, h)| (*bh, h.clone())).collect::<Vec<_>>()).await
+        } else {
+            HashMap::new()
+        };
+        let batch = &batch;
         let fetched: Vec<_> = futures::stream::iter(candidates.iter().cloned())
             .map(|(n, bh, h)| async move {
-                let r = self.block_receipts(bh, &h).await?;
+                let r = match batch.get(&bh) {
+                    Some(r) => r.clone(),
+                    None => self.block_receipts(bh, &h).await?,
+                };
                 let has = r.iter().any(|r| r.logs.iter().any(|l| filter.matches(l)));
                 let hashes = if has {
                     match self.block_tx_hashes(n, bh) {

@@ -549,6 +549,47 @@ impl ElNet {
         (Err(ReqError::Peer("receipts: too many partial responses".into())), start.elapsed())
     }
 
+    /// Receipts of several blocks in one `GetReceipts` exchange (continuing partial responses).
+    /// Returns receipts for a prefix of `hashes`, in order: a peer may stop early (response size
+    /// limits, or blocks it doesn't have). Callers verify each against its `receipts_root`.
+    pub async fn blocks_receipts(&self, peer: PeerId, hashes: &[B256]) -> Timed<Vec<Vec<Receipt>>> {
+        let start = Instant::now();
+        let mut out: Vec<Vec<Receipt>> = Vec::new();
+        let mut cur: Vec<Receipt> = Vec::new();
+        for _ in 0..256 {
+            if out.len() == hashes.len() {
+                break;
+            }
+            let request = GetReceipts70 { first_block_receipt_index: cur.len() as u64, block_hashes: hashes[out.len()..].to_vec() };
+            let (r, _) = self.send(peer, |response| PeerRequest::GetReceipts70 { request, response }).await;
+            let m = match r {
+                Ok(m) => m,
+                Err(e) if out.is_empty() => return (Err(e), start.elapsed()),
+                Err(_) => break,
+            };
+            if m.receipts.is_empty() {
+                break;
+            }
+            let k = m.receipts.len();
+            let mut progressed = false;
+            for (i, r) in m.receipts.into_iter().enumerate() {
+                progressed |= !r.is_empty() || i > 0;
+                if i == 0 {
+                    cur.extend(r);
+                } else {
+                    cur = r;
+                }
+                if i + 1 < k || !m.last_block_incomplete {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            if !progressed && m.last_block_incomplete {
+                break;
+            }
+        }
+        (Ok(out), start.elapsed())
+    }
+
     /// Sends full transactions to every connected peer. Returns how many peers got them.
     pub fn broadcast(&self, txs: Vec<SignedTx>) -> usize {
         let txs: Vec<Arc<SignedTx>> = txs.into_iter().map(Arc::new).collect();
