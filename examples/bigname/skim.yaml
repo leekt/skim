@@ -1,0 +1,52 @@
+# ENS on Sepolia for bigname: verified lookups and hydration, served locally by skim.
+#
+#   skim run --config examples/bigname/skim.yaml
+#
+# Point bigname at it:
+#   BIGNAME_API_CHAIN_RPC_URLS=ethereum-sepolia=http://<skim-host>:8545
+#   BIGNAME_PHASE_RUNNER_HYDRATION_RPC_URLS=ethereum-sepolia=http://<skim-host>:8545
+#
+# What this keeps ready:
+#   - the accounts and code of the ENS contracts bigname's Sepolia manifests declare
+#     (ENSv1 registry, registrar, wrapper, resolvers, reverse; ENSv2 root, .eth registry,
+#     registrar, resolvers; the Universal Resolver proxies and implementation)
+#   - two Universal Resolver lookups re-run every block, so the shared resolution path
+#     (proxy -> implementation -> root registry -> .eth registry -> ENSv1 fallback) stays warm;
+#     any other name then only needs its own few slots
+network: sepolia
+state:
+  subscriptions:
+    # Universal Resolver: the entrypoint bigname's verified lookups call.
+    - { name: ur-proxy, address: "0xeEeEEEeE14D718C2B47D9923Deab1335E144EeEe", account: true }
+    - { name: ur-managed-proxy, address: "0x6d80F2172CFdEc5730fE683860C33d26fC42e6F1", account: true }
+    - { name: ur-v2-impl, address: "0x24e1d8e068620b647ca097f961a61055f4f42d72", account: true }
+    # ENSv2
+    - { name: v2-root-registry, address: "0xb458d6a3a77919449d03e7a6903c26827c1ec43f", account: true }
+    - { name: v2-eth-registry, address: "0xd4ebcbbdf463c9c45784603db0ddd499bc44a8b4", account: true }
+    - { name: v2-eth-registrar, address: "0xf633e7fc17e2bbe0d0965d18ec1821dcb754a3d3", account: true }
+    - { name: v2-ensv1-resolver, address: "0x322b7581ca210a69c6d0e0d7c88a7688d2789cb0", account: true }
+    - { name: v2-public-resolver, address: "0xdc4a563d00f5c3012b699794eb9e13a561be386f", account: true }
+    - { name: v2-permissioned-resolver-impl, address: "0x115eb53f0c60696633855f90b138178fb40b2b2c", account: true }
+    # ENSv1
+    - { name: v1-registry, address: "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e", account: true }
+    - { name: v1-registry-old, address: "0x94f523b8261B815b87EFfCf4d18E6aBeF18d6e4b", account: true }
+    - { name: v1-base-registrar, address: "0x57f1887a8BF19b14fC0dF6Fd9B2acc9Af147eA85", account: true }
+    - { name: v1-name-wrapper, address: "0x0635513f179D50A207757E05759CbD106d7dFcE8", account: true }
+    - { name: v1-public-resolver, address: "0xE99638b40E4Fff0129D56f03b55b6bbC4BBE49b5", account: true }
+    - { name: v1-public-resolver-8948458, address: "0x8948458626811dd0c23EB25Cc74291247077cC51", account: true }
+    - { name: v1-public-resolver-8fade66, address: "0x8FADE66B79cC9f707aB26799354482EB93a5B7dD", account: true }
+    - { name: v1-public-resolver-0ceec52, address: "0x0CeEC524b2807841739D3B5E161F5bf1430FFA48", account: true }
+    - { name: v1-reverse-registrar, address: "0xA0a1AbcDAe1a2a4A2EF8e9113Ff0e02DD81DC0C6", account: true }
+    - { name: v1-default-reverse-registrar, address: "0x4F382928805ba0e23B30cFB75fC9E848e82DFD47", account: true }
+    # Warm path: UniversalResolver.resolve(dnsEncode(name), addr(namehash(name))).
+    - name: resolve-warm
+      calls:
+        - to: "0xeEeEEEeE14D718C2B47D9923Deab1335E144EeEe"   # ens.eth
+          data: "0x9061b92300000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000903656e730365746800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000243b3b57de4e34d3a81dc3a20f71bbdf2160492ddaa17ee7e5523757d47153379c13cb46df00000000000000000000000000000000000000000000000000000000"
+        - to: "0xeEeEEEeE14D718C2B47D9923Deab1335E144EeEe"   # nick.eth
+          data: "0x9061b92300000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000a046e69636b03657468000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000243b3b57de05a67c0ee82964c4f7394cdd47fee7f4d9503a23c09c38341779ea012afe6e0000000000000000000000000000000000000000000000000000000000"
+      on_block: true
+  on_demand:
+    enabled: true
+    cache_ttl_blocks: 32          # names bigname hydrates stay local for ~6 minutes
+    max_fetch_rounds: 24          # a cold name walks proxy -> impl -> v2 root -> registry -> v1 fallback -> resolver

@@ -12,6 +12,7 @@ cd examples && npm install                              # viem 2.57.1, pinned
 | [`uniswap-v3/`](uniswap-v3) | pool state, quotes for any amount, a quote every block, `Swap` logs, readiness |
 | [`uniswap-v4/`](uniswap-v4) | `StateView` pool state, V4 quoter in both directions, `PoolManager` logs filtered by pool id |
 | [`websocket/`](websocket) | live pushes over WebSocket: new blocks, `Swap` logs, and every block's subscription readiness and `on_block` quote |
+| [`bigname/`](bigname) | ENS for the [bigname](https://github.com/ensdomains/bigname) indexer: skim as its verified-lookup and hydration RPC, checked name by name against a reference node |
 | [`send-transaction/`](send-transaction) | sign locally, `sendTransaction` → skim gossips it → `waitForTransactionReceipt` |
 
 ## Uniswap V3

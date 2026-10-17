@@ -160,7 +160,7 @@ The dashboard shows:
 <img src="assets/grafana-dashboard.png" alt="skim Grafana dashboard" width="100%">
 
 **Next steps:**
-- **[Examples](examples):** Uniswap V3, Uniswap V4 and sending transactions, all with viem.
+- **[Examples](examples):** Uniswap V3, Uniswap V4, sending transactions (all with viem), and ENS resolution for the [bigname](examples/bigname) indexer.
 - **[Docs](docs):** [getting started](docs/guide/getting-started.md), [how it works](docs/guide/how-it-works.md), [configuration](docs/guide/configuration.md), [JSON-RPC](docs/guide/json-rpc.md), [archive](docs/guide/archive.md), [trust](docs/guide/trust-and-correctness.md), [troubleshooting](docs/guide/troubleshooting.md).
 
 **Supported methods:**
