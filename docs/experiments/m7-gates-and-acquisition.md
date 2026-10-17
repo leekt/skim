@@ -95,5 +95,17 @@ Each block in the recent-BAL index holds, on Sepolia:
 
 Only the writes are read again after a block is applied, so the index now keeps only those: about 44% fewer entries, ~14 MB less with the default 256-block window. This estimate comes from entry counts and in-memory sizes, not a measured RSS difference. `skim_status.store.recent_index` shows the breakdown.
 
+## Fifth review: archive continuity, scan scope, commit races, committee rollover
+The invariant behind the first three: **archive coverage belongs to one verified chain and one fixed key set**, not to a run of block numbers.
+
+| Finding | Fix | Regression test |
+|---|---|---|
+| P1: after an offline reorg (A100 → B100), the first block after a restart (B101) extended the archived segment by number, so K at B101 could inherit A100's value | `write_block` extends a segment only if the block's parent is the archived block at the segment's end; otherwise a new segment starts and nothing carries over. The healer reconciles such boundaries: it walks the current chain back with EL headers to the newest block the archive agrees with, removes the orphaned tail (`truncate_range`), and the gap fill brings the current chain's blocks. A gap whose fetched chain doesn't link is reconciled the same way | `a_restart_after_an_offline_reorg_never_inherits_the_old_fork` (fails with the fix removed): refused, then 20 after reconciliation, never 10 |
+| P1: a key archived while a backfill scan was running was evaluated against blocks whose writes the scan had filtered out, and could be extended back as "unchanged" | Scans freeze the archived key set when they start. Backfill skips keys outside that set (a later pass picks them up). A gap fill aborts and retries if a key outside its set is covered from before the end of the gap | `a_key_archived_during_a_backfill_scan_is_not_extended_by_it` (fails with the fix removed) |
+| P1: backfill and gap fill validated segments and hashes, then opened the write transaction, so a rollback and fork switch could land in between and leave old-fork values under new hashes | All validation runs inside the committing write transaction. redb serializes writers, and rollback truncation is one too: it lands either before (validation fails) or after (it truncates what was written, through the journal) | `a_fork_switch_during_a_backfill_never_leaves_old_fork_values_under_new_hashes` (a hook switches forks between the checks and the commit) |
+| P2: the light client held one committee, picked it with `(signature_slot - 1) / period`, and could only roll forward through a finalized header that the next committee itself had to sign | `Committees` (current + next). The committee is chosen by `signature_slot / period`. The next committee is learned from a `LightClientUpdate` (`LightClientUpdatesByRange`) signed by a held committee, with its branch proven against the attested state (gindex `current + 1`), and only if the attested header is in the current period. Finality in the next period rotates it to current | `the_committee_rolls_into_the_next_period` (bootstrap late in P, authenticate P+1, the last slot of P and the first slot of P+1, rotation; fails with the old period rule), `a_next_committee_must_be_proven_and_belong_to_the_current_period` |
+
+The light-client tests use generated fixtures (BLS keys, Merkle branches), so they need no Sepolia light-client data.
+
 ## Results
 (full soak: filled in when it completes)

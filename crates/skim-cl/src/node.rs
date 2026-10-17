@@ -208,6 +208,7 @@ struct Behaviour {
     envelopes: request_response::Behaviour<rpc::EnvelopesCodec>,
     envelopes_by_root: request_response::Behaviour<rpc::EnvelopesCodec>,
     lc_bootstrap: request_response::Behaviour<rpc::EnvelopesCodec>,
+    lc_updates: request_response::Behaviour<rpc::EnvelopesCodec>,
 }
 
 /// Requests from the owner of a [`ClNode`] to its swarm task.
@@ -220,6 +221,7 @@ enum Cmd {
         asked: Option<tokio::sync::oneshot::Sender<PeerId>>,
     },
     Bootstrap { root: [u8; 32], reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>> },
+    LcUpdates { start_period: u64, count: u64, reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>> },
     Serve { slot: u64, env: crate::serve::Served },
     EnvelopesByRoot { roots: Vec<B256>, reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>> },
 }
@@ -281,6 +283,14 @@ impl ClNode {
     }
 
     /// `LightClientBootstrap(block_root)` from one connected peer (SSZ, unverified).
+    /// `LightClientUpdatesByRange(start_period, count)` from one connected peer: the SSZ of each
+    /// `LightClientUpdate` (unverified; see `light::full_update`).
+    pub async fn light_client_updates(&self, start_period: u64, count: u64) -> anyhow::Result<Vec<Vec<u8>>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.cmd.send(Cmd::LcUpdates { start_period, count, reply }).await.map_err(|_| anyhow::anyhow!("CL node stopped"))?;
+        tokio::time::timeout(Duration::from_secs(20), rx).await.map_err(|_| anyhow::anyhow!("light client updates timed out"))??
+    }
+
     pub async fn light_client_bootstrap(&self, root: [u8; 32]) -> anyhow::Result<Vec<u8>> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.cmd.send(Cmd::Bootstrap { root, reply }).await.map_err(|_| anyhow::anyhow!("CL node stopped"))?;
@@ -451,6 +461,10 @@ impl ClNode {
             ),
             lc_bootstrap: request_response::Behaviour::new(
                 [(StreamProtocol::new(rpc::LIGHT_CLIENT_BOOTSTRAP), ProtocolSupport::Outbound)],
+                request_response::Config::default().with_request_timeout(Duration::from_secs(15)),
+            ),
+            lc_updates: request_response::Behaviour::new(
+                [(StreamProtocol::new(rpc::LIGHT_CLIENT_UPDATES_BY_RANGE), ProtocolSupport::Outbound)],
                 request_response::Config::default().with_request_timeout(Duration::from_secs(15)),
             ),
         };
@@ -679,6 +693,21 @@ impl Runner {
             Cmd::Serve { slot, env } => {
                 self.served.insert(slot, env);
                 self.stats.lock().unwrap().envelopes_from_slot = self.served.oldest_slot();
+            }
+            Cmd::LcUpdates { start_period, count, reply } => {
+                let mut cands: Vec<PeerId> = self.peers.iter().filter(|(_, p)| p.status.is_some()).map(|(id, _)| *id).collect();
+                if cands.is_empty() {
+                    let _ = reply.send(Err(anyhow::anyhow!("no CL peers yet")));
+                    return;
+                }
+                cands.sort();
+                self.env_rr = self.env_rr.wrapping_add(1);
+                let peer = cands[self.env_rr % cands.len()];
+                let mut req = Vec::with_capacity(16);
+                req.extend_from_slice(&start_period.to_le_bytes());
+                req.extend_from_slice(&count.to_le_bytes());
+                let id = self.swarm.behaviour_mut().lc_updates.send_request(&peer, req);
+                self.env_reqs.insert(id, reply);
             }
             Cmd::Bootstrap { root, reply } => {
                 let mut cands: Vec<PeerId> = self.peers.iter().filter(|(_, p)| p.status.is_some()).map(|(id, _)| *id).collect();
@@ -1014,6 +1043,16 @@ impl Runner {
             BehaviourEvent::EnvelopesByRoot(R::OutboundFailure { request_id, error, .. }) => {
                 if let Some(reply) = self.env_reqs.remove(&request_id) {
                     let _ = reply.send(Err(anyhow::anyhow!("envelopes request failed: {error}")));
+                }
+            }
+            BehaviourEvent::LcUpdates(R::Message { message: M::Response { request_id, response }, .. }) => {
+                if let Some(reply) = self.env_reqs.remove(&request_id) {
+                    let _ = reply.send(Ok(response));
+                }
+            }
+            BehaviourEvent::LcUpdates(R::OutboundFailure { request_id, error, .. }) => {
+                if let Some(reply) = self.env_reqs.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("light client updates request failed: {error}")));
                 }
             }
             BehaviourEvent::LcBootstrap(R::Message { message: M::Response { request_id, response }, .. }) => {

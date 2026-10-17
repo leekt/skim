@@ -259,6 +259,7 @@ impl request_response::Codec for Codec {
 pub const ENVELOPES_BY_RANGE: &str = "/eth2/beacon_chain/req/execution_payload_envelopes_by_range/1/ssz_snappy";
 pub const ENVELOPES_BY_ROOT: &str = "/eth2/beacon_chain/req/execution_payload_envelopes_by_root/1/ssz_snappy";
 pub const LIGHT_CLIENT_BOOTSTRAP: &str = "/eth2/beacon_chain/req/light_client_bootstrap/1/ssz_snappy";
+pub const LIGHT_CLIENT_UPDATES_BY_RANGE: &str = "/eth2/beacon_chain/req/light_client_updates_by_range/1/ssz_snappy";
 /// Spec limit per request (`MAX_REQUEST_PAYLOADS`).
 pub const MAX_REQUEST_PAYLOADS: u64 = 128;
 const MAX_ENVELOPE_RESPONSE_BYTES: u64 = 256 << 20;

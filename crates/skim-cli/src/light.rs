@@ -3,8 +3,9 @@
 //!
 //! Trust starts from a checkpoint block root: `--checkpoint`, else the last finalized root
 //! this node verified itself (saved in the data dir), else a checkpoint-sync URL. From there,
-//! every update must carry a valid sync-committee signature; committees roll forward only via
-//! finalized headers those committees signed.
+//! every update must carry a valid sync-committee signature. The next period's committee is
+//! learned from a `LightClientUpdate` signed by a held committee (proven against its attested
+//! state), and becomes current once finality reaches that period.
 
 use std::sync::Arc;
 
@@ -41,7 +42,8 @@ pub struct LightStatus {
 }
 
 pub struct Light {
-    committee: Mutex<Option<light::Committee>>,
+    committee: Mutex<Option<light::Committees>>,
+    fetching_next: std::sync::atomic::AtomicBool,
     status: RwLock<LightStatus>,
     cl: ClNode,
     persist: Option<Arc<Persist>>,
@@ -54,6 +56,7 @@ impl Light {
     pub fn new(cl: ClNode, persist: Option<Arc<Persist>>) -> Arc<Self> {
         Arc::new(Self {
             committee: Mutex::new(None),
+            fetching_next: Default::default(),
             status: Default::default(),
             cl,
             persist,
@@ -88,7 +91,7 @@ impl Light {
         });
     }
 
-    async fn bootstrap(&self, root: B256) {
+    async fn bootstrap(self: &Arc<Self>, root: B256) {
         if self.bootstrapping.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
@@ -97,7 +100,8 @@ impl Light {
                 Ok((header, committee)) => {
                     tracing::info!(slot = header.beacon.slot, period = committee.period, "light client: sync committee verified");
                     self.status.write().period = Some(committee.period);
-                    *self.committee.lock() = Some(committee);
+                    *self.committee.lock() = Some(light::Committees::new(committee));
+                    self.fetch_next_committee();
                     break;
                 }
                 Err(e) => {
@@ -141,12 +145,17 @@ impl Light {
                     if let Some(p) = &self.persist {
                         let _ = p.set_meta(FINALIZED_ROOT_META, root.as_slice());
                     }
-                    // A finalized header in a newer period carries the next committee.
-                    let held = self.committee.lock().as_ref().map(|c| c.period);
-                    if held.is_some_and(|p| f.beacon.slot / light::SLOTS_PER_PERIOD > p) {
-                        let me = self.clone();
-                        tokio::spawn(async move { me.bootstrap(root).await });
+                    // Finality in the next period: its (already authenticated) committee becomes
+                    // current, and the one after it is fetched.
+                    let rotated = self.committee.lock().as_mut().and_then(|c| c.advance(f.beacon.slot).then_some(c.current.period));
+                    if let Some(p) = rotated {
+                        tracing::info!(period = p, "light client: sync committee period advanced");
+                        self.status.write().period = Some(p);
+                        self.fetch_next_committee();
                     }
+                }
+                if self.committee.lock().as_ref().is_some_and(|c| c.next.is_none()) {
+                    self.fetch_next_committee();
                 }
                 self.on_block(store);
             }
@@ -157,6 +166,47 @@ impl Light {
                 tracing::debug!(topic, "light client update rejected: {e}");
             }
         }
+    }
+
+    /// Learns the next period's committee from a `LightClientUpdate` for the current period (in
+    /// the background, retrying; one fetch at a time).
+    fn fetch_next_committee(self: &Arc<Self>) {
+        if self.fetching_next.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            let fv = skim_cl::node::SEPOLIA_GLOAS_VERSION;
+            for attempt in 0..60 {
+                let Some(period) = me.committee.lock().as_ref().filter(|c| c.next.is_none()).map(|c| c.current.period) else { break };
+                let res = me.cl.light_client_updates(period, 1).await;
+                let learned = res.as_ref().ok().and_then(|chunks| {
+                    let mut g = me.committee.lock();
+                    let cs = g.as_mut()?;
+                    chunks.iter().find_map(|u| match light::full_update(cs, u, fv) {
+                        Ok(up) => up.next,
+                        Err(e) => {
+                            tracing::debug!("light client update (next committee) rejected: {e}");
+                            None
+                        }
+                    }).map(|n| {
+                        let p = n.period;
+                        cs.next = Some(n);
+                        p
+                    })
+                });
+                match (learned, res) {
+                    (Some(p), _) => {
+                        tracing::info!(period = p, "light client: next sync committee verified");
+                        break;
+                    }
+                    (None, Err(e)) if attempt % 10 == 0 => tracing::debug!("light client updates: {e}"),
+                    _ => {}
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+            me.fetching_next.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
     }
 
     /// Resolves verified hashes to block numbers in the store's chain (blocks may arrive after

@@ -4,13 +4,15 @@
 use std::sync::OnceLock;
 use skim_cl::light;
 
-fn committee() -> &'static light::Committee {
-    static C: OnceLock<light::Committee> = OnceLock::new();
+fn committee() -> &'static light::Committees {
+    static C: OnceLock<light::Committees> = OnceLock::new();
     C.get_or_init(|| {
-        let pks = (0..light::SYNC_COMMITTEE_SIZE)
+        let pks: Vec<_> = (0..light::SYNC_COMMITTEE_SIZE)
             .map(|i| blst::min_pk::SecretKey::key_gen(&[(i % 251) as u8 + 1; 32], &[]).unwrap().sk_to_pk())
             .collect();
-        light::Committee::from_pubkeys(0, pks).unwrap()
+        let mut c = light::Committees::new(light::Committee::from_pubkeys(0, pks.clone()).unwrap());
+        c.next = light::Committee::from_pubkeys(1, pks);
+        c
     })
 }
 
@@ -28,4 +30,5 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     let _ = light::optimistic_update(committee(), &fit(data, light::OPTIMISTIC_UPDATE_LEN), fv);
     let _ = light::finality_update(committee(), &fit(data, light::FINALITY_UPDATE_LEN), fv);
     let _ = light::optimistic_update(committee(), data, fv);
+    let _ = light::full_update(committee(), &fit(data, light::UPDATE_LEN), fv);
 });
