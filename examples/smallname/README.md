@@ -1,6 +1,8 @@
 # smallname
 
-ENS on Sepolia from a skim node: [bigname](https://github.com/ensdomains/bigname)'s `/v1` API, the routes an ENS frontend uses, in about 1,700 lines of JavaScript and one SQLite file.
+A self-hosted ENS read API for Sepolia, with local contract execution through skim and a small index for discovery and history. It serves the routes an ENS frontend uses, in the shape of [bigname](https://github.com/ensdomains/bigname)'s `/v1` API: about 1,700 lines of JavaScript and one SQLite file.
+
+It's a reference app for skim, not a replacement for a full indexer. bigname covers more: all history, more naming systems, verified reads, and replayable, auditable projections. What smallname shows is a different split. Current values are read from contract state at one block hash per response; an index is kept only to find names and to answer history questions.
 
 ```bash
 ../target/release/skim run --config bigname/skim.yaml          # terminal 1: skim, ENS kept warm
@@ -12,17 +14,20 @@ curl localhost:8787/v1/names/nick.eth
 curl localhost:8787/v1/addresses/0x179A862703a4adfb29896552DF9e307980D19285/names
 ```
 
-## How it's smaller
-bigname stores ENS state: owners, resolvers, records and expiries, projected from every event since block 0 into PostgreSQL. smallname doesn't store state.
+## The split
+smallname avoids maintaining a complete current-state projection. Each kind of answer comes from one place:
 
 | | bigname | smallname |
 |---|---|---|
 | **Current values** (owner, manager, expiry, status, resolver, records, primary name) | projected from events | **read live from skim** at one block hash per response (`meta.as_of`), through the registries, NameWrapper and the Universal Resolver |
-| **Lists and history** (subnames, names by address, search, expiry lists, timelines) | PostgreSQL | an SQLite index of events, label preimages, the name tree and **candidates**; every listed name is re-checked live before it's returned |
+| **Lists and history** (subnames, names by address, search, expiry lists, timelines) | PostgreSQL | an SQLite index of events, label preimages, the name tree, and candidates: relationships, expiries and record keys. Every listed name is re-checked live before it's returned |
 | **History** | every block from 0 (`eth_getBlockByNumber` for each block, plus logs) | **from Glamsterdam on**, through skim's `eth_getLogs` |
 | **Chain access** | an archive / log provider | skim only |
 
-Because the index holds candidates rather than answers, a stale or over-inclusive entry costs a dropped row, never a wrong one.
+**What this guarantees, and what it doesn't:**
+- **Returned values are current and consistent:** every value in a response comes from contract state at the block in `meta.as_of`.
+- **A stale or over-inclusive candidate** is dropped by the live check, so it can't put a wrong row in a list.
+- **Lists aren't guaranteed complete.** If Alice transfers a name to Bob and the index hasn't processed that block yet, a lookup of the name shows Bob, Alice's list drops it, and Bob's list doesn't have it yet. Every response that uses the index reports `meta.index.indexed_block` and `lag_blocks`, next to `meta.as_of` (where values were read). Coverage before `history_from_block` is a separate limit, marked as described below.
 
 **ENS rules come from the chain.** The Universal Resolver applies ENSv1/ENSv2 resolution. For ownership, smallname follows bigname's [ADR 0007](https://github.com/ensdomains/bigname) ("follow the chain"):
 1. A registered ENSv2 entry decides.
@@ -108,6 +113,10 @@ Same machine as skim, after the catch-up. **Cold** is the first request after sk
 | `GET /v1/search?q=test` | 8 | 857 ms | 27 ms |
 | `GET /v1/names?namespace=ens&expires_after=…` (30 days) | 20 | 731 ms | 34 ms |
 | `POST /v1/lookup` (3 names, 1 address) | | 299 ms | |
+
+## Open questions
+- **List routes under load are unmeasured.** The latencies above are single requests. Search, names by address and expiry lists check candidates live, so a page with many stale candidates checks more names than it returns. That needs an end-to-end benchmark: concurrent users, cold and warm state, and candidate sets with many rejections.
+- **The read architecture isn't tied to skim.** The same live reads would work against any RPC; what skim changes is the infrastructure needed to run it.
 
 ## Compared with bigname on a local node
 bigname was also set up locally, with Nethermind for live reads. It didn't index:

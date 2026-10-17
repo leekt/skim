@@ -100,7 +100,15 @@ export function serve(store, { skim, port, host }) {
       .sort();
   }
 
-  const asOf = (rd) => ({ as_of: { [CHAIN_ID]: rd.head } });
+  // Two positions in every response that reads both: `as_of` is the block the live values were
+  // read at; `index` is how far the event index (lists, history) has processed. Lists can miss
+  // names whose events the index hasn't reached yet (a transfer to the address after
+  // `indexed_block`), and anything before `history_from_block`.
+  const indexMeta = (head) => {
+    const indexed = Number(store.meta("indexed_block") ?? 0);
+    return { indexed_block: indexed, history_from_block: historyFrom(), lag_blocks: head ? Math.max(0, head - indexed) : null };
+  };
+  const asOf = (rd) => ({ as_of: { [CHAIN_ID]: rd.head }, index: indexMeta(rd.head.block_number) });
   // History and lists come from events since Glamsterdam only (skim serves logs from the fork).
   // History starts where this index started (the fork at the earliest; later if peers had
   // already expired older receipts, or the index was started later).
@@ -310,7 +318,7 @@ export function serve(store, { skim, port, host }) {
     const last = rows[size - 1];
     let total = null;
     if (inc.has("total_count")) total = store.get(`SELECT count(*) c FROM events WHERE ${conds.slice(0, cursor ? -1 : undefined).join(" AND ")}`, ...a.slice(0, cursor ? -3 : undefined)).c;
-    return { data, page: page(cursor, more ? enc({ s: sc, b: last.block, l: last.log_index }) : null, size, total), meta: { ...partialMeta() } };
+    return { data, page: page(cursor, more ? enc({ s: sc, b: last.block, l: last.log_index }) : null, size, total), meta: { ...partialMeta(), index: indexMeta(null) } };
   }
 
   async function addressNames(rd, q, address, cursor) {
