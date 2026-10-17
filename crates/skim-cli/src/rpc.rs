@@ -695,6 +695,7 @@ impl Rpc {
                         "code": z.code, "code_bytes": z.code_bytes, "admissions_refused": z.admissions_refused,
                         "on_demand_evicted": z.on_demand_evicted, "recent_bal_bytes": z.recent_bal_bytes,
                         "resolved_from_bal": z.resolved_from_bal,
+                        "recent_index": {"blocks": z.recent_bals, "writes": z.recent_writes, "reads": z.recent_reads, "touched": z.recent_touched, "code_bytes": z.recent_code_bytes},
                     },
                     "light_client": self.light.as_ref().map(|l| l.status()),
                     "el_peers": peers.len(),

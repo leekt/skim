@@ -578,3 +578,19 @@ fn install_counts_slots_written_during_the_download_toward_the_budget() {
     let r = s.install_complete_storage(&blk(1, 0), A, vec![(h(1), U256::from(1)), (h(2), U256::from(2))]);
     assert!(matches!(r, Err(StateError::LimitReached(4))), "{r:?}");
 }
+
+#[test]
+fn the_recent_index_keeps_only_writes() {
+    let s = Store::new(64);
+    let full = BlockWrites {
+        writes: vec![(slot(1), U256::from(5))],
+        storage_reads: vec![(A, U256::from(9)); 10],
+        touched: vec![A; 4],
+        code: vec![(B256::repeat_byte(1), alloy_primitives::Bytes::from(vec![0u8; 1000]))],
+    };
+    s.apply_block(blk(1, 0), Arc::new(full)).unwrap();
+    let z = s.sizes();
+    assert_eq!((z.recent_writes, z.recent_reads, z.recent_touched, z.recent_code_bytes), (1, 0, 0, 0));
+    // The writes still answer lookups.
+    assert_eq!(known(&s.snapshot(&blk(1, 0)).unwrap(), slot(1)), Some(5));
+}

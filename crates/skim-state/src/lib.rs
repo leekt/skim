@@ -77,6 +77,11 @@ pub struct StoreSizes {
     /// needed to replay fetched values to the head). Scales with chain activity, not with
     /// your keys; `--window` bounds it.
     pub recent_bal_bytes: usize,
+    /// What the recent-BAL index holds, by part (entries, and bytecode bytes).
+    pub recent_writes: usize,
+    pub recent_reads: usize,
+    pub recent_touched: usize,
+    pub recent_code_bytes: usize,
 }
 
 /// How long a fetched value is kept current.
@@ -569,7 +574,15 @@ impl Store {
             if let Some(p) = block.number.checked_sub(1) {
                 st.hashes.insert(p, block.parent_hash);
             }
-            st.recent.insert(block.number, writes);
+            // The index only ever needs the writes (BAL-first lookups, promotion, replaying
+            // fetched values): keep those, not the block's reads, touched addresses or new code
+            // (~44% of a Sepolia block's entries).
+            let compact = if writes.storage_reads.is_empty() && writes.touched.is_empty() && writes.code.is_empty() {
+                writes
+            } else {
+                Arc::new(BlockWrites { writes: writes.writes.clone(), ..Default::default() })
+            };
+            st.recent.insert(block.number, compact);
             self.gc(&mut st);
             StateReady { block, changed_keys: Arc::new(changed), touched }
         };
@@ -673,6 +686,10 @@ impl Store {
             on_demand_evicted: self.on_demand_evicted.load(std::sync::atomic::Ordering::Relaxed),
             complete_slots: st.complete.values().map(Complete::len).sum(),
             recent_bal_bytes: st.recent.values().map(|w| (w.writes.len() + w.touched.len() + w.storage_reads.len()) * BAL_ENTRY_BYTES).sum(),
+            recent_writes: st.recent.values().map(|w| w.writes.len()).sum(),
+            recent_reads: st.recent.values().map(|w| w.storage_reads.len()).sum(),
+            recent_touched: st.recent.values().map(|w| w.touched.len()).sum(),
+            recent_code_bytes: st.recent.values().map(|w| w.code.iter().map(|(_, c)| c.len()).sum::<usize>()).sum(),
         }
     }
 
