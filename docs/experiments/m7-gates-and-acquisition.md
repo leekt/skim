@@ -95,6 +95,17 @@ Each block in the recent-BAL index holds, on Sepolia:
 
 Only the writes are read again after a block is applied, so the index now keeps only those: about 44% fewer entries, ~14 MB less with the default 256-block window. This estimate comes from entry counts and in-memory sizes, not a measured RSS difference. `skim_status.store.recent_index` shows the breakdown.
 
+## Throughput
+`skim bench-node` with `--no-call-cache` (every call executes), Uniswap V3 config, same machine and node, 5–6 sweeps per build, medians:
+
+| In flight | thin LTO (before) | full LTO | Change |
+|---|---|---|---|
+| 1 | 1.9k calls/s | 2.4k | +24% |
+| 10 | 14.8k | 19.0k | +28% |
+| 100 | 16.9k | 21.0k | +24% |
+
+The interpreter dominates CPU, so cross-crate inlining into revm pays off. `release` is now full LTO; CI tests use a thin-LTO `ci` profile to stay quick. Single sweeps vary by about ±20% (different blocks and calls), so the table compares medians. For reference, Nethermind measured 16.8k at 100 in flight in [M5](m5-predictors-and-chain-data.md#5-throughput-under-concurrency), on the same machine but on a different day.
+
 ## Fifth review: archive continuity, scan scope, commit races, committee rollover
 The invariant behind the first three: **archive coverage belongs to one verified chain and one fixed key set**, not to a run of block numbers.
 

@@ -26,9 +26,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@aa7c1c80a07a27a84c0aa76d0cef0aad3830e330 # v2.7.8
       - name: Test
-        run: cargo test --workspace --release --locked
+        run: cargo test --workspace --profile ci --locked
       - name: Clippy (report only)
-        run: cargo clippy --workspace --release --locked
+        run: cargo clippy --workspace --profile ci --locked
         continue-on-error: true
 
   fuzz-regressions:

@@ -55,5 +55,12 @@ skim-sim = { path = "crates/skim-sim" }
 skim-cl = { path = "crates/skim-cl" }
 
 [profile.release]
-lto = "thin"
+# Full LTO: +24-28% eth_call throughput over thin LTO (M7), at a slower clean build.
+lto = "fat"
 codegen-units = 1
+
+# CI's test builds: optimized, but quicker to build than a release.
+[profile.ci]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
