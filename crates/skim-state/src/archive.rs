@@ -556,11 +556,23 @@ impl Archive {
         Ok(())
     }
 
-    /// A key's value became known at `block` (e.g. a verified SNAP base), plus any writes to it
-    /// in later, already-archived blocks. Coverage starts at the earliest such block.
-    pub fn write_base(&self, key: &StateKey, block: u64, value: U256, later: &[(u64, U256)]) -> Result<(), ArchiveError> {
+    /// A key's value became known at block `block` with hash `hash` (e.g. a verified SNAP base),
+    /// plus its writes in later blocks `(number, hash, value)`. Every block must be the one the
+    /// archive holds at that height (checked in the committing transaction): a value from another
+    /// fork is never stored under this fork's header. Coverage starts at the earliest such block.
+    pub fn write_base(&self, key: &StateKey, block: u64, hash: B256, value: U256, later: &[(u64, B256, U256)]) -> Result<(), ArchiveError> {
         let ek = encode_key(key);
         let tx = self.db.begin_write()?;
+        {
+            let hashes = tx.open_table(HASHES)?;
+            for (n, h) in std::iter::once((block, hash)).chain(later.iter().map(|(n, h, _)| (*n, *h))) {
+                if hashes.get(n)?.map(|g| B256::from(*g.value())) != Some(h) {
+                    return Err(ArchiveError::GapMismatch(format!("block {n} ({h}) is not the archived block at that height")));
+                }
+            }
+        }
+        let later: Vec<(u64, U256)> = later.iter().map(|(n, _, v)| (*n, *v)).collect();
+        let later = later.as_slice();
         {
             let mut versions = tx.open_table(VERSIONS)?;
             // A BAL write at `block` is authoritative; don't overwrite it with the base.
@@ -742,7 +754,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let a = Archive::open(d.path().join("a.redb")).unwrap();
         blk(&a, 100, &[]);
-        a.write_base(&slot(1), 100, U256::from(10), &[]).unwrap();
+        a.write_base(&slot(1), 100, B256::with_last_byte(100), U256::from(10), &[]).unwrap();
         blk(&a, 101, &[]);
         blk(&a, 102, &[(slot(1), 20)]);
         blk(&a, 103, &[]);
@@ -762,7 +774,7 @@ mod tests {
         for n in 1..=5 {
             blk(&a, n, &[]);
         }
-        a.write_base(&slot(3), 4, U256::from(7), &[]).unwrap();
+        a.write_base(&slot(3), 4, B256::with_last_byte(4), U256::from(7), &[]).unwrap();
         assert_eq!(val(&a, slot(3), 3), None);
         assert!(matches!(a.get(&slot(3), 3).unwrap(), ArchiveRead::NotCovered { from: Some(4) }));
         assert_eq!(val(&a, slot(3), 5), Some(7));
@@ -773,7 +785,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let a = Archive::open(d.path().join("a.redb")).unwrap();
         blk(&a, 1, &[]);
-        a.write_base(&slot(1), 1, U256::from(1), &[]).unwrap();
+        a.write_base(&slot(1), 1, B256::with_last_byte(1), U256::from(1), &[]).unwrap();
         blk(&a, 2, &[(slot(1), 2)]);
         blk(&a, 3, &[(slot(1), 3), (slot(9), 9)]);
         a.truncate_above(2).unwrap();
@@ -793,13 +805,13 @@ mod tests {
         let a = Archive::open(d.path().join("a.redb")).unwrap();
         blk(&a, 100, &[]);
         blk(&a, 101, &[]);
-        a.write_base(&slot(1), 100, U256::from(10), &[(101, U256::from(20))]).unwrap();
+        a.write_base(&slot(1), 100, B256::with_last_byte(100), U256::from(10), &[(101, B256::with_last_byte(101), U256::from(20))]).unwrap();
         assert_eq!(val(&a, slot(1), 101), Some(20));
         a.truncate_above(100).unwrap();
         blk(&a, 101, &[]); // 101' doesn't touch the key
         assert_eq!(val(&a, slot(1), 101), Some(10));
         // A base above the rollback point is withdrawn entirely, not left dangling.
-        a.write_base(&slot(2), 101, U256::from(5), &[]).unwrap();
+        a.write_base(&slot(2), 101, B256::with_last_byte(101), U256::from(5), &[]).unwrap();
         a.truncate_above(100).unwrap();
         blk(&a, 101, &[]);
         assert_eq!(val(&a, slot(2), 101), None);
@@ -811,12 +823,12 @@ mod tests {
         let a = Archive::open(d.path().join("a.redb")).unwrap();
         // Archive starts at 100: slot 1 = 10, slot 2 = 20 (bases); slot 3 discovered late at 103.
         blk(&a, 100, &[]);
-        a.write_base(&slot(1), 100, U256::from(10), &[]).unwrap();
-        a.write_base(&slot(2), 100, U256::from(20), &[]).unwrap();
+        a.write_base(&slot(1), 100, B256::with_last_byte(100), U256::from(10), &[]).unwrap();
+        a.write_base(&slot(2), 100, B256::with_last_byte(100), U256::from(20), &[]).unwrap();
         for n in 101..=104 {
             blk(&a, n, &[]);
         }
-        a.write_base(&slot(3), 103, U256::from(30), &[]).unwrap();
+        a.write_base(&slot(3), 103, B256::with_last_byte(103), U256::from(30), &[]).unwrap();
         // Scan BALs 90..=103 (through slot 3's base block): slot 2 written at 95 (=21) and 97
         // (=20); slot 3 written at 101 (=30).
         let (w95, w97, w101) = ([(slot(2), U256::from(21))], [(slot(2), U256::from(20))], [(slot(3), U256::from(30))]);
@@ -866,7 +878,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let a = Archive::open(d.path().join("a.redb")).unwrap();
         blk(&a, 99, &[]);
-        a.write_base(&slot(1), 99, U256::from(1), &[]).unwrap();
+        a.write_base(&slot(1), 99, B256::with_last_byte(99), U256::from(1), &[]).unwrap();
         blk(&a, 100, &[(slot(1), 2)]);
         let a100 = B256::with_last_byte(100);
         assert_eq!(a.get_at(&slot(1), 100, a100).unwrap(), ArchiveRead::Value(U256::from(2)));
@@ -887,8 +899,8 @@ mod tests {
         for n in 100..=103 {
             blk(&a, n, &[]); // K not archived yet when these were written
         }
-        a.write_base(&slot(1), 100, U256::from(20), &[]).unwrap(); // late key, base at 100
-        a.write_base(&slot(2), 100, U256::from(7), &[]).unwrap(); // late key, unchanged since 90
+        a.write_base(&slot(1), 100, B256::with_last_byte(100), U256::from(20), &[]).unwrap(); // late key, base at 100
+        a.write_base(&slot(2), 100, B256::with_last_byte(100), U256::from(7), &[]).unwrap(); // late key, unchanged since 90
         let w100 = [(slot(1), U256::from(20))];
         let blocks: Vec<ArchiveBlock<'_>> = (90..=100u64)
             .map(|n| ArchiveBlock { number: n, hash: B256::with_last_byte(n as u8), parent_hash: B256::with_last_byte((n - 1) as u8), header_rlp: &[0xc0], writes: if n == 100 { &w100 } else { &[] } })
@@ -911,13 +923,13 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let a = Archive::open(d.path().join("a.redb")).unwrap();
         blk(&a, 10, &[]);
-        a.write_base(&slot(1), 10, U256::from(5), &[]).unwrap();
+        a.write_base(&slot(1), 10, B256::with_last_byte(10), U256::from(5), &[]).unwrap();
         blk(&a, 11, &[]);
         // restart: 12..14 missing. Block 15's header names 14 as its parent.
         let h15 = alloy_rlp::encode(alloy_consensus::Header { number: 15, parent_hash: B256::with_last_byte(14), ..Default::default() });
         a.write_block(&ArchiveBlock { number: 15, hash: B256::with_last_byte(15), parent_hash: B256::with_last_byte(14), header_rlp: &h15, writes: &[] })
             .unwrap();
-        a.write_base(&slot(1), 15, U256::from(8), &[]).unwrap();
+        a.write_base(&slot(1), 15, B256::with_last_byte(15), U256::from(8), &[]).unwrap();
         assert_eq!(val(&a, slot(1), 13), None);
         let w13 = [(slot(1), U256::from(8))];
         let gap = [
@@ -942,7 +954,7 @@ mod tests {
         {
             let a = Archive::open(&path).unwrap();
             blk(&a, 10, &[]);
-            a.write_base(&slot(1), 10, U256::from(5), &[]).unwrap();
+            a.write_base(&slot(1), 10, B256::with_last_byte(10), U256::from(5), &[]).unwrap();
             blk(&a, 11, &[]);
         }
         let a = Archive::open(&path).unwrap(); // restart
@@ -952,7 +964,7 @@ mod tests {
         assert_eq!(val(&a, slot(1), 11), Some(5));
         assert_eq!(val(&a, slot(1), 13), None); // inside the gap
         assert_eq!(val(&a, slot(1), 15), None); // writes in the gap are unknown
-        a.write_base(&slot(1), 15, U256::from(6), &[]).unwrap(); // refetched after restart
+        a.write_base(&slot(1), 15, B256::with_last_byte(15), U256::from(6), &[]).unwrap(); // refetched after restart
         assert_eq!(val(&a, slot(1), 15), Some(6));
         assert!(a.archived_keys().unwrap().contains(&slot(1)));
     }
@@ -973,7 +985,7 @@ mod tests {
         {
             let a = Archive::open(&path).unwrap();
             blk(&a, 99, &[]);
-            a.write_base(&slot(1), 99, U256::from(10), &[]).unwrap();
+            a.write_base(&slot(1), 99, B256::with_last_byte(99), U256::from(10), &[]).unwrap();
             blk(&a, 100, &[]);
         }
         let a = Archive::open(&path).unwrap();
@@ -1007,7 +1019,7 @@ mod tests {
         }
         let scope = a.archived_keys().unwrap(); // frozen when the scan started: K not in it
         assert!(!scope.contains(&slot(7)));
-        a.write_base(&slot(7), 121, U256::from(20), &[]).unwrap(); // archived mid-scan
+        a.write_base(&slot(7), 121, B256::with_last_byte(121), U256::from(20), &[]).unwrap(); // archived mid-scan
         let blocks: Vec<ArchiveBlock<'_>> = (100..=121u64)
             .map(|n| ArchiveBlock { number: n, hash: B256::with_last_byte(n as u8), parent_hash: B256::with_last_byte((n - 1) as u8), header_rlp: &[0xc0], writes: &[] })
             .collect();
@@ -1034,7 +1046,7 @@ mod tests {
         for n in 100..=110 {
             blk(&a, n, &[]);
         }
-        a.write_base(&slot(9), 108, U256::from(50), &[]).unwrap();
+        a.write_base(&slot(9), 108, B256::with_last_byte(108), U256::from(50), &[]).unwrap();
         let w104 = [(slot(9), U256::from(40))];
         let blocks: Vec<ArchiveBlock<'_>> = (100..=108u64)
             .map(|n| ArchiveBlock { number: n, hash: B256::with_last_byte(n as u8), parent_hash: B256::with_last_byte((n - 1) as u8), header_rlp: &[0xc0], writes: if n == 104 { &w104 } else { &[] } })

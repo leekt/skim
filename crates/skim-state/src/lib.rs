@@ -372,9 +372,15 @@ impl Store {
         if !st.archived.insert(k) {
             return true;
         }
-        let mem = st.versions.get(&k).cloned().unwrap_or_default();
+        // Versions go to the archive with the hash of their block on this chain (checked there);
+        // one whose block hash isn't known any more (collapsed below the window) is left out.
+        let mem: Vec<(u64, B256, U256)> = st
+            .versions
+            .get(&k)
+            .map(|v| v.iter().filter_map(|(n, x)| st.hashes.get(n).or_else(|| st.chain.get(n).map(|b| &b.hash)).map(|h| (*n, *h, *x))).collect())
+            .unwrap_or_default();
         let r = match mem.split_first() {
-            Some(((b0, v0), rest)) => ar.write_base(&k, *b0, *v0, rest),
+            Some(((b0, h0, v0), rest)) => ar.write_base(&k, *b0, *h0, *v0, rest),
             None => ar.add_keys(&[k]),
         };
         self.archive_try(r);
@@ -555,13 +561,25 @@ impl Store {
                 let aw: Vec<(StateKey, U256)> = writes.writes.iter().filter(|(k, _)| st.archived.contains(k)).copied().collect();
                 let rlp = st.pending_headers.remove(&block.hash).unwrap_or_default();
                 st.pending_headers.retain(|_, _| false);
-                let r = ar.write_block(&archive::ArchiveBlock {
+                // A height the archive already has (e.g. the first block after a restart): the
+                // same block is already archived; another block means the archive holds an
+                // abandoned fork from here up. Drop it before writing, so this fork's values are
+                // never stored under that fork's headers. (A fork deeper than this height leaves
+                // an unlinked segment boundary, which the healer reconciles.)
+                let overlap = ar.last_block().ok().flatten().is_some_and(|end| end >= block.number);
+                let already = overlap && ar.hash(block.number).ok().flatten() == Some(block.hash);
+                if overlap && !already {
+                    tracing::warn!(block = block.number, "archive: holds another block at this height; dropping it and everything above");
+                    let r = ar.truncate_above(block.number.saturating_sub(1));
+                    self.archive_try(r);
+                }
+                let r = if already { Ok(()) } else { ar.write_block(&archive::ArchiveBlock {
                     number: block.number,
                     hash: block.hash,
                     parent_hash: block.parent_hash,
                     header_rlp: &rlp,
                     writes: &aw,
-                });
+                }) };
                 self.archive_try(r);
                 for (h, c) in &writes.code {
                     if aw.iter().any(|(k, v)| matches!(k, StateKey::CodeHash(_)) && B256::from(*v) == *h) {
@@ -661,7 +679,9 @@ impl Store {
             // Written while still holding the lock: the chain check above and the archive write
             // are one step, so a rollback can't land between them and leave old-fork data.
             if let (Some(ar), Some((n, v))) = (&self.archive, base) {
-                let r = ar.write_base(&key, n, v, &later);
+                let later: Vec<(u64, B256, U256)> =
+                    later.iter().filter_map(|(m, x)| st.chain.get(m).map(|b| (*m, b.hash, *x))).collect();
+                let r = ar.write_base(&key, n, at.hash, v, &later);
                 self.archive_try(r);
             }
         }

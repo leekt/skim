@@ -594,3 +594,46 @@ fn the_recent_index_keeps_only_writes() {
     // The writes still answer lookups.
     assert_eq!(known(&s.snapshot(&blk(1, 0)).unwrap(), slot(1)), Some(5));
 }
+
+// ---- Sixth review: a restart at a height the archive already holds -----------------------------
+
+fn archive_with_a(path: &std::path::Path) {
+    // Disk: A99 -> A100, K = 10 known at A99.
+    let s = Store::with_archive(64, archive::Archive::open(path).unwrap()).unwrap();
+    s.apply_block(blk(99, 0), writes(&[])).unwrap();
+    s.insert_base(&blk(99, 0), slot(5), U256::from(10)).unwrap();
+    s.archive_key(slot(5));
+    s.apply_block(blk(100, 0), writes(&[])).unwrap();
+    assert_eq!(s.archive_errors(), 0);
+}
+
+#[test]
+fn a_restart_at_an_archived_height_never_stores_the_new_fork_under_the_old_hash() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("a.redb");
+    archive_with_a(&path);
+    // Offline, B99 -> B100 replaced A99 -> A100, and K became 20 in B99. The restarted store's
+    // first block is B100; a fresh, verified lookup then proves K = 20 at B100.
+    let s = Store::with_archive(64, archive::Archive::open(&path).unwrap()).unwrap();
+    s.apply_block(blk(100, 1), writes(&[])).unwrap();
+    s.insert_base_with(&blk(100, 1), slot(5), U256::from(20), Retention::Subscribed).unwrap();
+    let ar = s.archive().unwrap();
+    let (a99, a100, b100) = (blk(99, 0).hash, blk(100, 0).hash, blk(100, 1).hash);
+    assert_ne!(ar.get_at(&slot(5), 100, a100).unwrap(), archive::ArchiveRead::Value(U256::from(20)), "B100's state under A100's hash");
+    assert_eq!(ar.get_at(&slot(5), 99, a99).unwrap(), archive::ArchiveRead::Value(U256::from(10)));
+    assert_eq!(ar.get_at(&slot(5), 100, b100).unwrap(), archive::ArchiveRead::Value(U256::from(20)));
+}
+
+#[test]
+fn a_restart_at_the_same_archived_block_keeps_continuity() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("a.redb");
+    archive_with_a(&path);
+    let s = Store::with_archive(64, archive::Archive::open(&path).unwrap()).unwrap();
+    s.apply_block(blk(100, 0), writes(&[])).unwrap(); // A100 again: already archived
+    s.apply_block(blk(101, 0), writes(&[])).unwrap();
+    let ar = s.archive().unwrap();
+    assert_eq!(ar.segments().unwrap(), vec![(99, 101)]);
+    assert_eq!(ar.get_at(&slot(5), 101, blk(101, 0).hash).unwrap(), archive::ArchiveRead::Value(U256::from(10)));
+    assert_eq!(s.archive_errors(), 0);
+}
