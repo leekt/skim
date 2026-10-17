@@ -38,7 +38,8 @@ export class Ingest {
   constructor(store) {
     this.s = store;
     for (const [a, parent] of [[V2.rootRegistry, ROOT], [V2.ethRegistry, ETH_NODE]]) {
-      store.run("INSERT OR IGNORE INTO registries (address, parent_node, block) VALUES (?, ?, 0)", lower(a), parent);
+      store.run("INSERT OR IGNORE INTO registries (address, parent_node, block, fixed) VALUES (?, ?, 0, 1)", lower(a), parent);
+      store.run("UPDATE registries SET parent_node = ?, fixed = 1 WHERE address = ?", parent, lower(a));
     }
   }
 
@@ -82,6 +83,16 @@ export class Ingest {
       "INSERT INTO record_keys (node, resolver, key, block, log_index) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET block = excluded.block, log_index = excluded.log_index",
       node, lower(resolver), key, l.block, l.logIndex);
   }
+  /** Whether `node` is in the subtree that `registry` names (walking up the name tree). */
+  underRegistry(node, registry) {
+    const tokens = new Set(this.s.all("SELECT node FROM v2_tokens WHERE registry = ? AND node IS NOT NULL", registry).map((t) => t.node));
+    for (let n = node, i = 0; n && n !== ROOT && i < 64; i++) {
+      if (tokens.has(n)) return true;
+      n = this.s.get("SELECT parent FROM names WHERE node = ?", n)?.parent;
+    }
+    return false;
+  }
+
   registryNode(registry) {
     return this.s.get("SELECT parent_node FROM registries WHERE address = ?", lower(registry))?.parent_node ?? null;
   }
@@ -92,9 +103,20 @@ export class Ingest {
     return this.s.all("SELECT DISTINCT node FROM v2_links WHERE resolver = ? AND record_id = ?", lower(resolver), BigInt(recordId).toString(16)).map((r) => r.node);
   }
 
-  /** A registry learned its parent node: name its tokens. */
-  mount(registry, parentNode, block) {
-    this.s.run("INSERT INTO registries (address, parent_node, block) VALUES (?, ?, ?) ON CONFLICT (address) DO UPDATE SET parent_node = excluded.parent_node", lower(registry), parentNode, block);
+  /**
+   * A registry's place in the tree (the node its labels are under), then its tokens are named.
+   * A settled place (`fixed`: seeded, or a parent claim the parent confirmed) never moves; an
+   * unsettled one keeps its first mount, unless `fix` settles it. A mount under the registry's
+   * own subtree (e.g. a token whose subregistry is the registry itself) is refused.
+   */
+  mount(registry, parentNode, block, fix = false) {
+    const r = lower(registry);
+    const cur = this.s.get("SELECT parent_node, fixed FROM registries WHERE address = ?", r);
+    if (cur?.fixed || (cur?.parent_node && !fix)) return;
+    if (this.underRegistry(parentNode, r)) return;
+    this.s.run(
+      "INSERT INTO registries (address, parent_node, block, fixed) VALUES (?, ?, ?, ?) ON CONFLICT (address) DO UPDATE SET parent_node = excluded.parent_node, fixed = excluded.fixed",
+      r, parentNode, block, fix ? 1 : 0);
     for (const t of this.s.all("SELECT label_id, labelhash FROM v2_tokens WHERE registry = ?", lower(registry))) {
       const node = child(parentNode, t.labelhash);
       this.s.run("UPDATE v2_tokens SET node = ? WHERE registry = ? AND label_id = ?", node, lower(registry), t.label_id);
@@ -299,7 +321,10 @@ export class Ingest {
         if (n && lower(args.subregistry) !== ZERO) {
           if (!this.s.get("SELECT 1 FROM registries WHERE address = ?", lower(args.subregistry)))
             this.s.run("INSERT INTO registries (address, parent_node, block) VALUES (?, NULL, ?)", lower(args.subregistry), l.block);
-          this.mount(args.subregistry, n, l.block);
+          // Confirms the subregistry's own earlier claim to this place, if it made one.
+          const claimed = this.s.get(
+            "SELECT 1 FROM events WHERE kind = 'ParentUpdated' AND address = ? AND node = ?", lower(args.subregistry), n);
+          this.mount(args.subregistry, n, l.block, !!claimed);
         }
         ev("subregistry", n, args.subregistry);
         break;
@@ -313,10 +338,16 @@ export class Ingest {
         break;
       }
       case "ParentUpdated": {
+        // A registry's claim about its own parent counts only if the parent points back (has
+        // mounted it at that label, SubregistryUpdated); the mount itself is what places it.
+        // That makes the tree independent of the order events are processed in.
         const parentNode = this.registryNode(args.parent);
         this.preimage(args.label);
-        if (parentNode) this.mount(addr, child(parentNode, lh(args.label)), l.block);
-        ev("subregistry", parentNode ? child(parentNode, lh(args.label)) : null);
+        const n = parentNode ? child(parentNode, lh(args.label)) : null;
+        const pointsBack = n && this.s.get(
+          "SELECT 1 FROM events WHERE kind = 'SubregistryUpdated' AND address = ? AND node = ? AND actor = ?", lower(args.parent), n, addr);
+        if (pointsBack) this.mount(addr, n, l.block, true);
+        ev("subregistry", n);
         break;
       }
       case "EACRolesChanged":

@@ -59,6 +59,11 @@ export class Store {
     // Unknown labels sort and display as `[labelhash]` until their preimage is learned.
     this.db.exec("UPDATE names SET label = '[' || substr(labelhash, 3) || ']' WHERE label IS NULL");
     this.db.exec("CREATE INDEX IF NOT EXISTS names_parent_label ON names (parent, label)");
+    // registries.fixed: the registry's place is settled (seeded, or its own parent claim was
+    // confirmed by the parent's mount); later mounts elsewhere don't move it.
+    if (!this.db.prepare("SELECT 1 FROM pragma_table_info('registries') WHERE name = 'fixed'").get()) {
+      this.db.exec("ALTER TABLE registries ADD COLUMN fixed INTEGER NOT NULL DEFAULT 0");
+    }
     this.stmts = new Map();
   }
 

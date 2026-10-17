@@ -20,6 +20,7 @@ mod rpc;
 mod run;
 mod serving;
 mod stats;
+mod stream;
 
 use clap::{Parser, Subcommand};
 

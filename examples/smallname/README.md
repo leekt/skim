@@ -40,7 +40,9 @@ History comes from what skim can fetch when the index starts, and then the index
 - **Never before what peers still serve.** Receipts come from peers, and each peer announces the oldest block it still serves (eth/69 `earliest_block`). skim reports the result in `skim_status.history.logs_from` and refuses older ranges.
   - On 2026-10-18, every connected peer reported `0` (full history), so the index reached back to the fork.
   - Once peers expire history (a couple of weeks), a new index starts later than the fork.
-- **After that, the index keeps it.** smallname catches up in 2,048-block ranges, then follows the head block by block, by block hash, rolling back on reorgs. Indexed events stay indexed however old they get.
+- **After that, the index keeps it.** Indexed events stay indexed however old they get.
+
+**skim does the block work.** smallname reads skim's block stream (`skim_streamNext`): logs matching its filters, batch by batch from its cursor, with `rewind` after a reorg and `gap` where skim can no longer serve logs. Catch-up over history, the head, retries and reorg detection all live in skim; smallname only turns ENS events into index rows. Each batch is applied in one SQLite transaction together with the new cursor, so a crash re-delivers a batch (applying is idempotent) and never skips one.
 
 Anything earlier is marked, not guessed:
 - **History, events and lists:** `meta.completeness: "partial"` and `history_from_block`, which is where this index starts. `unsupported_reason` is `pre_glamsterdam_history` when the index starts at the fork, or `history_before_index_start` when it starts later.
@@ -85,7 +87,7 @@ A name created before the index starts still resolves and has a full profile; th
 |---|---|
 | `contracts.mjs` | Sepolia ENS contracts and events, taken from bigname's Sepolia manifests |
 | `ingest.mjs` | logs → index rows: preimages (hash-checked), name tree, history, candidates |
-| `sync.mjs` | catch-up and head following through skim, with reorg rollback |
+| `sync.mjs` | a consumer of skim's block stream (`skim_streamNext`): applies `apply` / `rewind` / `gap` events with the cursor in the same SQLite transaction |
 | `live.mjs` | live reads at a block hash: name state, records, primary names |
 | `api.mjs` | the `/v1` routes |
 | `store.mjs` | SQLite schema; every row carries its block, so a reorg is one `DELETE … WHERE block > n` per table |

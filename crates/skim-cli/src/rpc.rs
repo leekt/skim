@@ -206,6 +206,9 @@ impl CallCache {
     }
 }
 
+/// Requests of one JSON-RPC batch answered at the same time.
+const BATCH_CONCURRENCY: usize = 8;
+
 /// What WebSocket subscribers are told about.
 #[derive(Debug, Clone)]
 pub enum WsEvent {
@@ -718,6 +721,13 @@ impl Rpc {
                 }))
             }
             "skim_dashboard" => Ok(self.dashboard_json()),
+            "skim_streamNext" => {
+                let chain = self.chain()?;
+                let req: crate::stream::Request = need(params, 0)?;
+                let finalized = self.light.as_ref().and_then(|l| l.status().finalized_block).map(|b| json!({"number": b.number, "hash": b.hash}));
+                let store = sim.store.clone();
+                Ok(crate::stream::next(chain, move || store.head().map(|h| h.number), finalized, req).await?)
+            }
             "skim_archiveCoverage" => {
                 let a: Address = need(params, 0)?;
                 Ok(Value::Array(
@@ -732,6 +742,15 @@ impl Rpc {
             m if OUT_OF_SCOPE.contains(&m) => Err(RpcError::unsupported(m)),
             m => Err(RpcError::new(-32601, format!("method {m} not found"))),
         }
+    }
+
+    /// A JSON-RPC batch: independent requests, answered concurrently (up to
+    /// `BATCH_CONCURRENCY` at a time) against the same `latest` block, in request order. A batch
+    /// of cold reads then overlaps its network waits instead of queueing them.
+    async fn batch<'a>(&'a self, reqs: Vec<&'a Value>, latest: &'a Option<BlockRef>) -> Vec<Value> {
+        use futures::StreamExt;
+        let calls: Vec<_> = reqs.into_iter().map(|r| self.one(r, latest)).collect();
+        futures::stream::iter(calls).buffered(BATCH_CONCURRENCY).collect().await
     }
 
     async fn one(&self, req: &Value, latest: &Option<BlockRef>) -> Value {
@@ -1013,9 +1032,7 @@ async fn handle(State(rpc): State<Arc<Rpc>>, Json(body): Json<Value>) -> Json<Va
     match body {
         Value::Array(reqs) => {
             let mut out = Vec::with_capacity(reqs.len());
-            for r in &reqs {
-                out.push(rpc.one(r, &latest).await);
-            }
+            out.extend(rpc.batch(reqs.iter().collect(), &latest).await);
             Json(Value::Array(out))
         }
         req => Json(rpc.one(&req, &latest).await),
@@ -1093,14 +1110,15 @@ async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
                 };
                 let reply = match &body {
                     Value::Array(reqs) => {
-                        let mut out = Vec::with_capacity(reqs.len());
-                        for r in reqs {
-                            match one(r) {
-                                Some(v) => out.push(v),
-                                None => out.push(rpc.one(r, &latest).await),
-                            }
+                        // Subscription changes first (in order, they touch this session), then the
+                        // other requests concurrently.
+                        let mut out: Vec<Option<Value>> = reqs.iter().map(&mut one).collect();
+                        let rest: Vec<&Value> = reqs.iter().zip(&out).filter(|(_, o)| o.is_none()).map(|(r, _)| r).collect();
+                        let mut answered = rpc.batch(rest, &latest).await.into_iter();
+                        for o in out.iter_mut().filter(|o| o.is_none()) {
+                            *o = answered.next();
                         }
-                        Value::Array(out)
+                        Value::Array(out.into_iter().map(|o| o.unwrap_or(Value::Null)).collect())
                     }
                     req => match one(req) {
                         Some(v) => v,

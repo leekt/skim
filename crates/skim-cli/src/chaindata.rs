@@ -141,6 +141,21 @@ pub struct ChainData {
     history: std::sync::OnceLock<crate::history::HeaderStore>,
 }
 
+/// A block with logs matching a scan's filters.
+pub struct ScanBlock {
+    pub number: u64,
+    pub hash: B256,
+    pub parent_hash: B256,
+    pub timestamp: u64,
+    pub logs: Vec<Value>,
+}
+
+/// A log scan: the blocks with matches, and the last block scanned `(number, hash)`.
+pub struct Scan {
+    pub blocks: Vec<ScanBlock>,
+    pub last: (u64, B256),
+}
+
 fn tx_hashes(raw: &[Bytes]) -> Vec<B256> {
     raw.iter().map(keccak256).collect()
 }
@@ -873,6 +888,31 @@ impl ChainData {
         if to - from + 1 > self.max_log_range {
             return Err(DataError::RangeTooLarge(self.max_log_range));
         }
+        let scan = self.scan(std::slice::from_ref(filter), from, to, at).await?;
+        Ok(Value::Array(scan.blocks.into_iter().flat_map(|b| b.logs).collect()))
+    }
+
+    /// The canonical hash at `n`, if skim holds that header: in memory, or on disk hash-linked to
+    /// the oldest in-memory header.
+    pub fn canonical_hash(&self, n: u64) -> Option<B256> {
+        let g = self.inner.read();
+        if let Some((h, _)) = g.headers.get(&n) {
+            return Some(*h);
+        }
+        let (mem_low, parent) = g.headers.first_key_value().map(|(n, (_, hd))| (*n, hd.parent_hash))?;
+        drop(g);
+        if n >= mem_low {
+            return None;
+        }
+        let run = self.history.get()?.linked_range(n, n, mem_low, parent).ok()??;
+        run.first().map(|(h, _)| *h)
+    }
+
+    /// Logs of `[from, to]` matching any of `filters`, grouped by block (blocks without a match
+    /// are left out), plus the hash of `to`: one consistent chain (headers in memory, or on disk
+    /// hash-linked to it). With `at`, the single block must be that block. Shared by
+    /// `eth_getLogs` and block streams.
+    pub async fn scan(&self, filters: &[Filter], from: u64, to: u64, at: Option<B256>) -> Result<Scan, DataError> {
         self.ensure_headers(from).await?;
         // Receipts older than every connected peer serves (history expiry) can't be fetched;
         // say so instead of asking each peer for blocks it has dropped.
@@ -897,10 +937,12 @@ impl ChainData {
                 _ => HashMap::new(),
             }
         };
-        let (candidates, scanned) = {
+        let (candidates, scanned, last) = {
             let g = self.inner.read();
             let mut c = Vec::new();
             let mut scanned = 0u64;
+            let mut last = None;
+            let mut prev: Option<B256> = None;
             for n in from..=to {
                 let Some((bh, h)) = g.headers.get(&n).cloned().or_else(|| disk.get(&n).cloned()) else {
                     return Err(DataError::Unavailable(format!("no header for block {n}")));
@@ -908,20 +950,23 @@ impl ChainData {
                 if at.is_some_and(|want| want != bh) {
                     return Err(DataError::Unavailable(format!("block {} is no longer on the chain", at.unwrap())));
                 }
+                // One chain across the range (a reorg between reads would break the links).
+                if prev.is_some_and(|p| p != h.parent_hash) {
+                    return Err(DataError::Unavailable(format!("chain changed at block {n} during the scan; retry")));
+                }
+                prev = Some(bh);
+                last = Some((n, bh));
                 scanned += 1;
-                if !filter.matches_bloom(h.logs_bloom) {
-                    continue;
+                let touched = g.touched.get(&n).filter(|(th, _)| *th == bh).map(|(_, t)| t.clone());
+                let maybe = filters.iter().any(|f| {
+                    f.matches_bloom(h.logs_bloom)
+                        && (f.address.is_empty() || touched.as_ref().is_none_or(|t| f.address.iter().any(|a| t.contains(a))))
+                });
+                if maybe {
+                    c.push((n, bh, h));
                 }
-                if !filter.address.is_empty()
-                    && let Some((th, t)) = g.touched.get(&n)
-                    && *th == bh
-                    && !filter.address.iter().any(|a| t.contains(a))
-                {
-                    continue;
-                }
-                c.push((n, bh, h));
             }
-            (c, scanned)
+            (c, scanned, last.expect("from <= to"))
         };
         let t = Instant::now();
         // Many candidates (a range scan): fetch their receipts in batches first.
@@ -931,13 +976,14 @@ impl ChainData {
             HashMap::new()
         };
         let batch = &batch;
+        let matches = |l: &alloy_primitives::Log| filters.iter().any(|f| f.matches(l));
         let fetched: Vec<_> = futures::stream::iter(candidates.iter().cloned())
             .map(|(n, bh, h)| async move {
                 let r = match batch.get(&bh) {
                     Some(r) => r.clone(),
                     None => self.block_receipts(bh, &h).await?,
                 };
-                let has = r.iter().any(|r| r.logs.iter().any(|l| filter.matches(l)));
+                let has = r.iter().any(|r| r.logs.iter().any(matches));
                 let hashes = if has {
                     match self.block_tx_hashes(n, bh) {
                         Some(hs) => Some(hs),
@@ -951,22 +997,26 @@ impl ChainData {
             .buffered(8)
             .collect()
             .await;
-        let mut out = Vec::new();
+        let mut blocks = Vec::new();
+        let mut count = 0usize;
         for res in fetched {
             let (n, bh, h, receipts, hashes) = res?;
             let Some(hashes) = hashes else { continue };
+            let mut logs = Vec::new();
             let mut li = 0u64;
             for (ti, r) in receipts.iter().enumerate() {
                 for l in &r.logs {
-                    if filter.matches(l) {
-                        out.push(Self::log_json(l, bh, n, h.timestamp, hashes[ti], ti as u32, li));
+                    if matches(l) {
+                        logs.push(Self::log_json(l, bh, n, h.timestamp, hashes[ti], ti as u32, li));
                     }
                     li += 1;
                 }
             }
+            count += logs.len();
+            blocks.push(ScanBlock { number: n, hash: bh, parent_hash: h.parent_hash, timestamp: h.timestamp, logs });
         }
-        tracing::debug!(scanned, candidates = candidates.len(), logs = out.len(), ms = t.elapsed().as_millis() as u64, "eth_getLogs");
-        Ok(Value::Array(out))
+        tracing::debug!(scanned, candidates = candidates.len(), logs = count, ms = t.elapsed().as_millis() as u64, "log scan");
+        Ok(Scan { blocks, last })
     }
 
     /// Block range of a filter, with tags resolved against `head`.

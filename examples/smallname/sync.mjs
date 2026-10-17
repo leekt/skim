@@ -71,48 +71,6 @@ function parseLog(l) {
   };
 }
 
-/** eth_getLogs over [from, to], split while skim says the range is too large. */
-async function logsRange(url, filter, from, to) {
-  try {
-    return (await rpc(url, "eth_getLogs", [{ ...filter, fromBlock: hex(from), toBlock: hex(to) }], { timeout: 600_000 })).map(parseLog);
-  } catch (e) {
-    if (from < to && (e.rpc?.code === -32005 || /range|exceed|more than/i.test(String(e.message)))) {
-      const mid = Math.floor((from + to) / 2);
-      return [...(await logsRange(url, filter, from, mid)), ...(await logsRange(url, filter, mid + 1, to))];
-    }
-    throw e;
-  }
-}
-
-/** History in ranges, up to `to` (a block well behind the head, so it won't reorg). */
-async function catchUp(store, ingest, url, to, log, step = 2048) {
-  let from = Number(store.meta("indexed_block")) + 1;
-  const t0 = Date.now();
-  while (from <= to) {
-    const b = Math.min(from + step - 1, to);
-    // Two queries: every known contract by address (declared and discovered), and the ENSv2
-    // announcement topics from any emitter. ENSv2 contracts announced in this range have their
-    // other events fetched with the next range's address list, so the range is re-read once.
-    const before = discovered(store).length;
-    const logs = (await Promise.all(queries(store).map((f) => logsRange(url, f, from, b)))).flat();
-    store.tx(() => applyAll(store, ingest, logs));
-    if (discovered(store).length > before) {
-      const more = await logsRange(url, { address: discovered(store) }, from, b);
-      store.tx(() => applyAll(store, ingest, more));
-    }
-    // The range end's hash, where skim still has the block (older ranges don't need it: reorgs
-    // are checked from the followed window on).
-    const h = await rpc(url, "eth_getBlockByNumber", [hex(b), false]).catch(() => null);
-    store.tx(() => {
-      if (h) store.run("INSERT OR REPLACE INTO blocks (number, hash, parent, ts) VALUES (?, ?, ?, ?)", b, h.hash, h.parentHash, num(h.timestamp));
-      store.meta("indexed_block", b);
-      store.meta("indexed_hash", h?.hash ?? "");
-    });
-    log(`history ${b} (${(((b - AMSTERDAM_BLOCK) / (to - AMSTERDAM_BLOCK)) * 100).toFixed(1)}%)  ${store.get("SELECT count(*) c FROM events").c} events  ${((Date.now() - t0) / 1000).toFixed(0)} s`);
-    from = b + 1;
-  }
-}
-
 const byPosition = (a, b) => a.blockNumber - b.blockNumber || a.logIndex - b.logIndex;
 
 function applyAll(store, ingest, logs, tsOf) {
@@ -128,81 +86,74 @@ function applyAll(store, ingest, logs, tsOf) {
 }
 
 /**
- * Follows the head through `url` (skim). Each block is fetched by hash, so logs and header always
- * belong together; a parent mismatch walks back to the common ancestor and rolls the index back.
+ * Follows the chain through skim's block stream (`skim_streamNext`). skim does the block work:
+ * catch-up over history, the head, reorgs (`rewind`), and data it can no longer serve (`gap`).
+ * smallname only applies events. Each response is applied in one SQLite transaction together
+ * with the new cursor, so a crash re-delivers a batch (applying is idempotent) and never skips
+ * one.
  */
-export async function follow(store, url, { fromBlock, log = console.log, onBlock, signal } = {}) {
+export async function follow(store, url, { fromBlock, log = console.log, signal } = {}) {
   const ingest = new Ingest(store);
   while (!signal?.aborted) {
     try {
-      const head = await rpc(url, "eth_getBlockByNumber", ["latest", false]);
-      const target = num(head.number);
-      let last = Number(store.meta("indexed_block") ?? 0);
-      if (!last) {
-        // A new index starts as far back as skim can still serve logs: the fork at the earliest,
-        // and no earlier than what connected peers keep (history expiry). FROM_BLOCK can start
-        // it later. From then on the index keeps what it indexed.
-        const served = (await rpc(url, "skim_status", []).catch(() => null))?.history?.logs_from ?? AMSTERDAM_BLOCK;
-        last = Math.max(fromBlock ?? 0, served, AMSTERDAM_BLOCK) - 1;
-        store.meta("indexed_block", last);
-        store.meta("started_at_block", last + 1);
-        log(`new index: from block ${last + 1}`);
-      }
-      // Far behind: history in ranges first (up to 64 blocks behind the head).
-      if (target - last > 128) {
-        await catchUp(store, ingest, url, target - 64, log);
-        continue;
-      }
-      if (target <= last && store.meta("indexed_hash") === head.hash) {
-        await sleep(2000);
-        continue;
-      }
-      for (let n = last + 1; n <= Math.min(target, last + 256); n++) {
-        const src = url;
-        const h = await rpc(src, "eth_getBlockByNumber", [hex(n), false]);
-        if (!h) {
-          // skim doesn't hold this block's header any more (e.g. it restarted since): index
-          // the gap with range scans (eth_getLogs reaches older headers), then follow again.
-          log(`block ${n} not held by skim: catching up by range`);
-          await catchUp(store, ingest, url, Math.max(n, target - 8), log, 512);
-          break;
+      const cursorNumber = store.meta("indexed_block");
+      const cursorHash = store.meta("indexed_hash");
+      const cursor = cursorNumber && cursorHash ? { number: Number(cursorNumber), hash: cursorHash } : null;
+      const recent = store.all("SELECT number, hash FROM blocks ORDER BY number DESC LIMIT 128");
+      const first = !cursorNumber;
+      const start = cursor ? undefined : Number(store.meta("next_from") || Math.max(fromBlock ?? 0, AMSTERDAM_BLOCK));
+      const before = discovered(store).length;
+      const r = await rpc(url, "skim_streamNext", [{
+        cursor,
+        recent,
+        // A new index: from the fork (or FROM_BLOCK); skim reports what it can't serve as a gap.
+        fromBlock: start,
+        filters: queries(store),
+        maxBlocks: 2048,
+        waitMs: 10_000,
+      }], { timeout: 900_000 });
+      let applied = 0;
+      store.tx(() => {
+        for (const e of r.events) {
+          if (e.type === "rewind") {
+            log(`reorg: rewinding to ${e.to.number}`);
+            store.rollback(e.to.number);
+            store.meta("indexed_hash", e.to.hash);
+          } else if (e.type === "gap") {
+            log(`gap ${e.from}..${e.to}: ${e.reason}`);
+            if (first) store.meta("started_at_block", e.to + 1); // history starts after it
+            else store.meta("gaps", JSON.stringify([...JSON.parse(store.meta("gaps") || "[]"), [e.from, e.to]])); // a hole
+          } else if (e.type === "apply") {
+            const b = e.block;
+            const ts = Number(b.timestamp);
+            applied += applyAll(store, ingest, e.logs.map(parseLog), () => ts);
+            store.run("INSERT OR REPLACE INTO blocks (number, hash, parent, ts) VALUES (?, ?, ?, ?)", b.number, b.hash, b.parentHash, ts);
+          }
         }
-        const prev = store.get("SELECT hash FROM blocks WHERE number = ?", n - 1)?.hash;
-        if (prev && prev !== h.parentHash) {
-          const at = await ancestor(store, url, n - 1);
-          log(`reorg: rolling back to ${at}`);
-          store.rollback(at);
-          break;
+        if (first && !store.meta("started_at_block")) store.meta("started_at_block", start);
+        // New ENSv2 contracts were announced in this batch: re-read it with them in the filter
+        // (keep the old cursor; re-applying is idempotent).
+        if (discovered(store).length > before) {
+          if (!cursor) store.meta("next_from", start); // first batch: from the start again
+          return;
         }
-        const logs = (await Promise.all(queries(store).map((f) => rpc(src, "eth_getLogs", [{ ...f, blockHash: h.hash }])))).flat().map(parseLog);
-        const ts = num(h.timestamp);
-        const applied = store.tx(() => {
-          const k = applyAll(store, ingest, logs, () => ts);
-          store.run("INSERT OR REPLACE INTO blocks (number, hash, parent, ts) VALUES (?, ?, ?, ?)", n, h.hash, h.parentHash, ts);
-          store.meta("indexed_block", n);
-          store.meta("indexed_hash", h.hash);
-          return k;
-        });
-        if (applied) log(`block ${n}: ${applied} ENS events`);
-        onBlock?.(n, h.hash);
-      }
-      store.pruneBlocks(Number(store.meta("indexed_block")));
+        if (r.cursor) {
+          store.run("INSERT OR REPLACE INTO blocks (number, hash, parent, ts) VALUES (?, ?, NULL, NULL)", r.cursor.number, r.cursor.hash);
+          store.meta("indexed_block", r.cursor.number);
+          store.meta("indexed_hash", r.cursor.hash);
+          store.meta("next_from", "");
+        } else {
+          store.meta("next_from", r.nextFrom);
+        }
+      });
+      if (applied || r.events.length) log(`${r.cursor?.number ?? r.nextFrom - 1}: ${applied} ENS events (head ${r.head}${r.finalized ? `, finalized ${r.finalized.number}` : ""})`);
+      if (r.finalized) store.meta("finalized_block", r.finalized.number);
+      store.pruneBlocks(Number(store.meta("indexed_block") ?? 0));
     } catch (e) {
-      log(`follow: ${e.message}`);
+      log(`stream: ${e.message}`);
       await sleep(5000);
     }
   }
-}
-
-/** The newest indexed block that is still on `url`'s chain. */
-async function ancestor(store, url, from) {
-  for (let n = from; n > 0; n--) {
-    const ours = store.get("SELECT hash FROM blocks WHERE number = ?", n)?.hash;
-    if (!ours) return n; // older than the followed window: nothing indexed there can be checked
-    const theirs = await rpc(url, "eth_getBlockByNumber", [hex(n), false]);
-    if (theirs?.hash === ours) return n;
-  }
-  return 0;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

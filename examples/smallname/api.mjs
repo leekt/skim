@@ -106,7 +106,8 @@ export function serve(store, { skim, port, host }) {
   // `indexed_block`), and anything before `history_from_block`.
   const indexMeta = (head) => {
     const indexed = Number(store.meta("indexed_block") ?? 0);
-    return { indexed_block: indexed, history_from_block: historyFrom(), lag_blocks: head ? Math.max(0, head - indexed) : null };
+    const gaps = JSON.parse(store.meta("gaps") || "[]");
+    return { indexed_block: indexed, history_from_block: historyFrom(), lag_blocks: head ? Math.max(0, head - indexed) : null, ...(gaps.length && { gaps }) };
   };
   const asOf = (rd) => ({ as_of: { [CHAIN_ID]: rd.head }, index: indexMeta(rd.head.block_number) });
   // History and lists come from events since Glamsterdam only (skim serves logs from the fork).
