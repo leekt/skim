@@ -558,6 +558,7 @@ impl Store {
                 let r = ar.write_block(&archive::ArchiveBlock {
                     number: block.number,
                     hash: block.hash,
+                    parent_hash: block.parent_hash,
                     header_rlp: &rlp,
                     writes: &aw,
                 });

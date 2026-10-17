@@ -574,9 +574,24 @@ fn spawn_archive_healer(store: Arc<Store>, net: ElNet, backfill: u64) {
                 }
             }
             for w in segs.windows(2) {
-                let ((_, a_end), (b_start, _)) = (w[0], w[1]);
+                let ((a_start, a_end), (b_start, _)) = (w[0], w[1]);
+                if a_end + 1 == b_start {
+                    // Adjacent but not merged: b_start doesn't link to a_end (a fork the archive
+                    // missed, e.g. while skim was offline). Drop the orphaned tail of segment a.
+                    match reconcile(&store, &net, a_start, a_end, b_start).await {
+                        Ok(n) => tracing::info!(from = n, to = a_end, "archive: orphaned blocks removed; gap will be refilled from the current chain"),
+                        Err(e) => tracing::debug!(at = b_start, "archive boundary not reconciled yet: {e}"),
+                    }
+                    continue;
+                }
                 match heal_gap(&store, &net, a_end + 1, b_start - 1).await {
                     Ok(()) => tracing::info!(from = a_end + 1, to = b_start - 1, "archive gap healed from eth/71"),
+                    Err(e) if e.to_string().contains("does not link to the previous segment") => {
+                        match reconcile(&store, &net, a_start, a_end, b_start).await {
+                            Ok(n) => tracing::info!(from = n, to = a_end, "archive: orphaned blocks removed; gap will be refilled from the current chain"),
+                            Err(e) => tracing::debug!(at = a_end, "archive boundary not reconciled yet: {e}"),
+                        }
+                    }
                     Err(e) => tracing::debug!(from = a_end + 1, to = b_start - 1, "archive gap not healed yet: {e}"),
                 }
             }
@@ -587,9 +602,9 @@ fn spawn_archive_healer(store: Arc<Store>, net: ElNet, backfill: u64) {
 async fn heal_gap(store: &Store, net: &ElNet, from: u64, to: u64) -> anyhow::Result<()> {
     use reth_eth_wire_types::BlockHashOrNumber;
     let ar = store.archive().ok_or_else(|| anyhow::anyhow!("no archive"))?;
+    // The key set this job covers, fixed now: keys archived during the scan wait for the next.
+    let scope = ar.archived_keys()?;
     let first_parent = ar.hash(from - 1)?.ok_or_else(|| anyhow::anyhow!("no hash at {}", from - 1))?;
-    let next_rlp = ar.header_rlp(to + 1)?.ok_or_else(|| anyhow::anyhow!("no header at {}", to + 1))?;
-    let next_parent = <alloy_consensus::Header as alloy_rlp::Decodable>::decode(&mut next_rlp.as_slice())?.parent_hash;
     let peers: Vec<_> = net.peers().into_iter().filter(|(_, p)| p.eth_version >= 71).map(|(id, _)| id).collect();
     if peers.is_empty() {
         anyhow::bail!("no EL peers yet");
@@ -611,11 +626,11 @@ async fn heal_gap(store: &Store, net: &ElNet, from: u64, to: u64) -> anyhow::Res
                 let bal = skim_bal::decode_verified(&raw, h.block_access_list_hash.unwrap_or_default())?;
                 let w = BlockWrites::from_bal(&bal);
                 for (ch, c) in &w.code {
-                    if w.writes.iter().any(|(k, v)| store.is_archived(k) && alloy_primitives::B256::from(*v) == *ch) {
+                    if w.writes.iter().any(|(k, v)| scope.contains(k) && alloy_primitives::B256::from(*v) == *ch) {
                         ar.put_code(*ch, c)?;
                     }
                 }
-                let aw: Vec<_> = w.writes.iter().filter(|(k, _)| store.is_archived(k)).copied().collect();
+                let aw: Vec<_> = w.writes.iter().filter(|(k, _)| scope.contains(k)).copied().collect();
                 let rlp = alloy_rlp::encode(&h);
                 next = h.number + 1;
                 collected.push((h, aw, rlp));
@@ -624,18 +639,66 @@ async fn heal_gap(store: &Store, net: &ElNet, from: u64, to: u64) -> anyhow::Res
         }
         anyhow::bail!("no EL peer served headers+BALs from {next}");
     }
-    // Hash links inside the gap; the archive checks both ends.
-    let mut prev = first_parent;
-    for (h, _, _) in &collected {
-        anyhow::ensure!(h.parent_hash == prev, "gap chain does not link at {}", h.number);
-        prev = h.hash_slow();
+    // The current chain must continue the archived one at `from - 1`, or the archive holds a
+    // fork the chain has left: reconciliation, not a gap fill.
+    if collected.first().is_some_and(|(h, _, _)| h.parent_hash != first_parent) {
+        anyhow::bail!("first block does not link to the previous segment");
     }
     let blocks: Vec<skim_state::archive::ArchiveBlock<'_>> = collected
         .iter()
-        .map(|(h, aw, rlp)| skim_state::archive::ArchiveBlock { number: h.number, hash: h.hash_slow(), header_rlp: rlp, writes: aw })
+        .map(|(h, aw, rlp)| skim_state::archive::ArchiveBlock { number: h.number, hash: h.hash_slow(), parent_hash: h.parent_hash, header_rlp: rlp, writes: aw })
         .collect();
-    ar.fill_gap(&blocks, first_parent, next_parent)?;
+    // Links inside the gap and at both ends, the key scope and the segment layout are checked in
+    // the archive's committing transaction.
+    ar.fill_gap(&blocks, &scope)?;
     Ok(())
+}
+
+/// The archive's segment `a_start..=a_end` is followed by blocks (from `b_start`) of a chain
+/// that doesn't continue it. Walks the current chain back from block `b_start`'s parent with EL
+/// headers to the newest block the archive agrees with, and removes the archived blocks after
+/// it (the orphaned fork). Returns the first removed block. The gap left behind is filled by the
+/// normal gap fill, with the current chain's blocks.
+async fn reconcile(store: &Store, net: &ElNet, a_start: u64, a_end: u64, b_start: u64) -> anyhow::Result<u64> {
+    use reth_eth_wire_types::BlockHashOrNumber;
+    let ar = store.archive().ok_or_else(|| anyhow::anyhow!("no archive"))?;
+    let rlp = ar.header_rlp(b_start)?.ok_or_else(|| anyhow::anyhow!("no header at {b_start}"))?;
+    let mut want = <alloy_consensus::Header as alloy_rlp::Decodable>::decode(&mut rlp.as_slice())?.parent_hash;
+    let mut n = b_start - 1;
+    let peers: Vec<_> = net.peers().into_iter().filter(|(_, p)| p.eth_version >= 69).map(|(id, _)| id).collect();
+    anyhow::ensure!(!peers.is_empty(), "no EL peers yet");
+    // Above a_end the archive has nothing to compare (a gap): walk down to a_end first.
+    let ancestor = 'walk: loop {
+        let mut progressed = false;
+        for &peer in &peers {
+            let Ok(hs) = net.headers_falling(peer, BlockHashOrNumber::Hash(want), 64).await.0 else { continue };
+            if hs.is_empty() {
+                continue;
+            }
+            for h in hs {
+                // Each header must be the one asked for (by hash and height): a linked walk.
+                if h.number != n || h.hash_slow() != want {
+                    break;
+                }
+                progressed = true;
+                if h.number <= a_end && ar.hash(h.number)? == Some(want) {
+                    break 'walk h.number;
+                }
+                if h.number <= a_start {
+                    break 'walk a_start - 1; // the whole segment is on the abandoned fork
+                }
+                want = h.parent_hash;
+                n -= 1;
+            }
+            if progressed {
+                break;
+            }
+        }
+        anyhow::ensure!(progressed, "no EL peer served headers back from {n}");
+    };
+    anyhow::ensure!(ancestor < a_end, "the archive agrees with the chain at {a_end}; nothing to reconcile");
+    ar.truncate_range(ancestor + 1, a_end)?;
+    Ok(ancestor + 1)
 }
 
 /// M4.2: scans BALs from `from` up to the latest coverage start of any archived key and extends
@@ -643,6 +706,8 @@ async fn heal_gap(store: &Store, net: &ElNet, from: u64, to: u64) -> anyhow::Res
 async fn backfill_archive(store: &Store, net: &ElNet, from: u64) -> anyhow::Result<skim_state::archive::BackfillReport> {
     use reth_eth_wire_types::BlockHashOrNumber;
     let ar = store.archive().ok_or_else(|| anyhow::anyhow!("no archive"))?;
+    // The key set this job covers, fixed now (see `Archive::backfill`).
+    let scope = ar.archived_keys()?;
     let segs = ar.segments()?;
     let (s, e) = *segs.first().ok_or_else(|| anyhow::anyhow!("empty archive"))?;
     let c_max = ar.coverages()?.iter().filter(|(_, _, ext)| *ext).map(|(_, c, _)| *c).max().unwrap_or(s);
@@ -673,7 +738,7 @@ async fn backfill_archive(store: &Store, net: &ElNet, from: u64) -> anyhow::Resu
                 let Some(raw) = raw else { break }; // pruned or truncated: retry from here
                 let bal = skim_bal::decode_verified(&raw, h.block_access_list_hash.unwrap_or_default())?;
                 let w = BlockWrites::from_bal(&bal);
-                let aw: Vec<_> = w.writes.iter().filter(|(k, _)| store.is_archived(k)).copied().collect();
+                let aw: Vec<_> = w.writes.iter().filter(|(k, _)| scope.contains(k)).copied().collect();
                 next = h.number + 1;
                 progressed = true;
                 collected.push((h.number, h.hash_slow(), alloy_rlp::encode(&h), aw, h.parent_hash));
@@ -689,7 +754,7 @@ async fn backfill_archive(store: &Store, net: &ElNet, from: u64) -> anyhow::Resu
     }
     let blocks: Vec<skim_state::archive::ArchiveBlock<'_>> = collected
         .iter()
-        .map(|(n, h, rlp, aw, _)| skim_state::archive::ArchiveBlock { number: *n, hash: *h, header_rlp: rlp, writes: aw })
+        .map(|(n, h, rlp, aw, p)| skim_state::archive::ArchiveBlock { number: *n, hash: *h, parent_hash: *p, header_rlp: rlp, writes: aw })
         .collect();
-    Ok(ar.backfill(&blocks, s_parent)?)
+    Ok(ar.backfill(&blocks, s_parent, &scope)?)
 }
