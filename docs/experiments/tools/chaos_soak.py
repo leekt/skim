@@ -12,8 +12,12 @@ Each answer is MATCH, REFUSED (skim returned an error, e.g. -32002), or WRONG (s
 value the reference contradicts). WRONG is the failure this soak exists to catch.
 
   - balances of the current block's senders (untracked: answered from the recent BAL index)
-  - an archived subscription created at each restart for an account whose balance, at that
-    moment, is only in recent BALs (BAL -> archive promotion), read back at older blocks
+  - restart_archive: an archived subscription created at each restart for an account that just
+    transacted, read back at blocks older than the in-memory window, only from where skim reports
+    its coverage starting (skim_archiveCoverage), so a refusal inside coverage is a failure. This
+    is a restart-plus-archive probe: whether the value came from a recent BAL (promotion) or a
+    fetch is reported (skim_status.store.bal_promotions), not assumed; BAL -> archive promotion
+    itself is covered by deterministic tests
   - config B puts the pool under `storage: all` while its keys come back from the restart
     snapshot as provisional TTL entries, and random pool slots are read on demand right away
     (TTL -> whole-storage promotion); those slots keep being compared long after the TTLs
@@ -26,8 +30,11 @@ Gates (exit status nonzero on any):
   - any WRONG answer
   - subscribed keys over max_subscribed_keys, or RSS over RSS_LIMIT_MB if set
   - availability: outside the recovery window after each restart, subscribed probes answered
-    >= 95% and cold probes >= 80% (refusing everything fails), and every probe kind matched at
-    least once
+    >= 95% and cold probes >= 80%, counting skim timeouts and connection failures as unanswered
+    (refusing or timing out on everything fails); every required probe kind sampled at least
+    its minimum number of times
+  - freshness: outside recovery windows, no more than 2% of the time with a head older than
+    3 slots (wall clock; a stalled skim can't hide behind "no new block, no probes")
   - recovery: subscriptions ready again within RECOVERY_LIMIT_S (default 180) of each restart
 
 `--selftest` checks the classification rules (reverts and halts are outcomes to compare).
@@ -43,7 +50,11 @@ MINUTES = float(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[1] != "--selftest
 REF = os.environ.get("REF_URL", "")
 PORT = 8547
 RECOVERY_LIMIT_S = float(os.environ.get("RECOVERY_LIMIT_S", "180"))
-SUBSCRIBED_KINDS = ("quote_sub", "slot_sub", "archived", "promo_archived")
+SUBSCRIBED_KINDS = ("quote_sub", "slot_sub", "archived", "restart_archive")
+# Every run must exercise these, at least this many times (outside recovery windows).
+REQUIRED_KINDS = {"quote": 100, "quote_sub": 50, "slot_sub": 50, "slot_cold": 50, "blockhash": 50, "gasprice": 50,
+                  "bal_first": 50, "archived": 20, "restart_archive": 10, "promo_slot": 10}
+STALE_AFTER_S = 36
 SUBSCRIBED_MIN, COLD_MIN = 0.95, 0.80
 SKIM = f"http://127.0.0.1:{PORT}"
 MAX_KEYS = 60
@@ -216,7 +227,7 @@ if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
     selftest()
 
 
-counts = {"match": 0, "refused": 0, "WRONG": 0, "ref_unavailable": 0}
+counts = {"match": 0, "refused": 0, "WRONG": 0, "ref_unavailable": 0, "skim_transport": 0}
 by_kind = {}
 steady = {}  # kind -> [answered, refused] outside recovery windows
 recoveries = []  # per restart: seconds until subscriptions were ready again (None = never)
@@ -224,6 +235,12 @@ restart_at = None  # time of the last restart while recovering
 promo = None  # (address, block it was subscribed at)
 senders_seen = []
 last_n = None
+last_head_t = time.time()  # wall clock of the last new head
+stale_s = 0.0  # time outside recovery with a head older than STALE_AFTER_S
+steady_s = 0.0
+last_tick = time.time()
+promo_from = None  # first block skim reports the restart_archive key covered from
+bal_promotions = {"start": None, "end": None}
 CHAOS_CYCLE = ["switch-config", "sigkill", "graceful", "switch-config", "graceful", "sigkill"]
 chaos_n = 0
 wrong_log = open(os.path.join(OUT, "wrong.jsonl"), "a")
@@ -252,20 +269,33 @@ while time.time() < t_end:
         print(f"chaos: {kind} -> config {cfg}", flush=True)
         time.sleep(rnd.uniform(5, 40))
         # BAL -> archive promotion: archive the balance of an account that just transacted.
-        promo = (senders_seen[-1], last_n) if senders_seen else None
+        promo = (senders_seen[-1], None) if senders_seen else None
+        promo_from = None
         skim.start(cfg, promo[0] if promo else None)
         if restart_at is not None:
             recoveries.append(None)  # the previous restart never recovered
         restart_at = time.time()
         next_chaos = time.time() + rnd.uniform(6, 12) * 60
     head = rpc(SKIM, "eth_getBlockByNumber", ["latest", False], timeout=5).get("result")
+    now = time.time()
+    if restart_at is None:
+        steady_s += now - last_tick
+        if now - last_head_t > STALE_AFTER_S:
+            stale_s += now - max(last_tick, last_head_t + STALE_AFTER_S)
+    last_tick = now
     if not head or head["hash"] == last:
         time.sleep(1)
         continue
+    last_head_t = now
     last = head["hash"]
     n = int(head["number"], 16)
     last_n = n
     first_block = first_block or n
+    if promo and promo_from is None:
+        cov = rpc(SKIM, "skim_archiveCoverage", [promo[0]], timeout=5).get("result") or []
+        bal = [c for c in cov if c["key"].startswith("Balance")]
+        if bal:
+            promo_from = bal[0]["from"]
     tag = {"blockHash": head["hash"]}
     sub = rpc(SKIM, "skim_subscriptionStatus", [], timeout=5).get("result")
     ready = bool(sub) and all(x.get("ready") for x in sub)
@@ -290,27 +320,30 @@ while time.time() < t_end:
     # BAL-first: balances of this block's senders (written by this block, not tracked).
     reqs += [("bal_first", "eth_getBalance", [a, tag]) for a in senders[:3]]
     # BAL -> archive: the promoted account's balance at blocks after its promotion, from disk.
-    if promo and n - promo[1] > 34:  # older than the 32-block window: served from the archive
-        reqs += [("promo_archived", "eth_getBalance", [promo[0], hex(rnd.randrange(promo[1], n - 33))])]
+    if promo and promo_from is not None and n - 33 > promo_from:  # older than the window: from disk
+        reqs += [("restart_archive", "eth_getBalance", [promo[0], hex(rnd.randrange(promo_from, n - 33))])]
     # TTL -> whole storage (config B): random pool slots, read on demand from the first block.
     if skim.cfg == "B":
         reqs += [("promo_slot", "eth_getStorageAt", [POOL, hex(rnd.randrange(0, 16)), tag])]
     for kind, m, p in reqs:
         s = rpc(SKIM, m, p)
-        if s.get("error", {}).get("code") == "transport":
-            continue
         r = rpc(REF, m, p)
-        c = classify(s, r)
+        # A skim timeout or connection failure is an unanswered request, not a skipped one.
+        c = "skim_transport" if s.get("error", {}).get("code") == "transport" and r.get("error") is None else classify(s, r)
         counts[c] += 1
         by_kind.setdefault(kind, {}).setdefault(c, 0)
         by_kind[kind][c] += 1
-        if not recovering and c in ("match", "refused"):
+        if not recovering and c in ("match", "refused", "skim_transport"):
             st_k = steady.setdefault(kind, [0, 0])
             st_k[0 if c == "match" else 1] += 1
         if c == "WRONG":
             wrong_log.write(json.dumps({"block": n, "kind": kind, "method": m, "params": p, "skim": s, "ref": r}) + "\n")
             wrong_log.flush()
     st = rpc(SKIM, "skim_status", [], timeout=5).get("result")
+    if st:
+        bp = st["store"].get("bal_promotions", 0)
+        bal_promotions["start"] = bal_promotions["start"] if bal_promotions["start"] is not None else bp
+        bal_promotions["end"] = bp
     rss = subprocess.run(["ps", "-o", "rss=", "-p", str(skim.proc.pid)], capture_output=True, text=True).stdout.strip()
     rss_max = max(rss_max, int(rss or 0) / 1024)
     if st and st["store"]["subscribed_keys"] > LIMITS[skim.cfg]:
@@ -328,21 +361,36 @@ if over_limit:
     failures.append(f"subscribed keys over the limit in {over_limit} samples")
 if RSS_LIMIT_MB and rss_max > RSS_LIMIT_MB:
     failures.append(f"RSS {rss_max:.0f} MB over the {RSS_LIMIT_MB:.0f} MB limit")
+pending_recovery = None
 if restart_at is not None:
-    recoveries.append(None)
+    # Still recovering when the run ended: unknown unless it already exceeded the limit.
+    waited = time.time() - restart_at
+    if waited > RECOVERY_LIMIT_S:
+        recoveries.append(None)
+    else:
+        pending_recovery = round(waited, 1)
 answer_rate = {k: round(a / (a + r), 4) for k, (a, r) in steady.items() if a + r}
 for k, rate in answer_rate.items():
     need = SUBSCRIBED_MIN if k in SUBSCRIBED_KINDS else COLD_MIN
     if rate < need:
         failures.append(f"{k}: answered {rate:.1%} in steady state (< {need:.0%})")
-for k, c in by_kind.items():
-    if not c.get("match"):
+for k, need in REQUIRED_KINDS.items():
+    got = sum(steady.get(k, [0, 0]))
+    if got < need:
+        failures.append(f"{k}: {got} steady-state samples (< {need})")
+    if not by_kind.get(k, {}).get("match"):
         failures.append(f"{k}: never matched")
+stale_share = stale_s / steady_s if steady_s else 0.0
+if stale_share > 0.02:
+    failures.append(f"head older than {STALE_AFTER_S} s for {stale_share:.1%} of steady-state time")
 slow = [r for r in recoveries if r is None or r > RECOVERY_LIMIT_S]
 if slow:
     failures.append(f"{len(slow)} restart(s) not ready within {RECOVERY_LIMIT_S:.0f} s: {slow}")
 summary = {"minutes": MINUTES, "counts": counts, "by_kind": by_kind, "steady_answer_rate": answer_rate,
-           "recoveries_s": [None if r is None else round(r, 1) for r in recoveries], "subscribed_over_limit_samples": over_limit,
+           "steady_samples": {k: sum(v) for k, v in steady.items()}, "stale_share": round(stale_share, 4),
+           "bal_promotions_during_run": (bal_promotions["end"] or 0) - (bal_promotions["start"] or 0),
+           "recoveries_s": [None if r is None else round(r, 1) for r in recoveries], "pending_recovery_s": pending_recovery,
+           "subscribed_over_limit_samples": over_limit,
            "rss_max_mb": rss_max, "verdict": "FAIL" if failures else "PASS", "failures": failures}
 json.dump(summary, open(os.path.join(OUT, "summary.json"), "w"), indent=2)
 print(json.dumps(summary, indent=2))

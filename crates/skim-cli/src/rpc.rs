@@ -695,6 +695,7 @@ impl Rpc {
                         "code": z.code, "code_bytes": z.code_bytes, "admissions_refused": z.admissions_refused,
                         "on_demand_evicted": z.on_demand_evicted, "recent_bal_bytes": z.recent_bal_bytes,
                         "resolved_from_bal": z.resolved_from_bal,
+                        "bal_promotions": z.bal_promotions,
                         "recent_index": {"blocks": z.recent_bals, "writes": z.recent_writes, "reads": z.recent_reads, "touched": z.recent_touched, "code_bytes": z.recent_code_bytes},
                     },
                     "light_client": self.light.as_ref().map(|l| l.status()),
@@ -712,6 +713,16 @@ impl Rpc {
                 }))
             }
             "skim_dashboard" => Ok(self.dashboard_json()),
+            "skim_archiveCoverage" => {
+                let a: Address = need(params, 0)?;
+                Ok(Value::Array(
+                    sim.store
+                        .archive_coverage(&a)
+                        .into_iter()
+                        .map(|(k, from, write)| json!({"key": format!("{k:?}"), "from": from, "starts_at_write": write}))
+                        .collect(),
+                ))
+            }
             "skim_subscriptionStatus" => Ok(serde_json::to_value(self.subs.as_ref().map(|s| s.status()).unwrap_or_default()).unwrap()),
             m if OUT_OF_SCOPE.contains(&m) => Err(RpcError::unsupported(m)),
             m => Err(RpcError::new(-32601, format!("method {m} not found"))),

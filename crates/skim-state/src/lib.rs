@@ -71,6 +71,8 @@ pub struct StoreSizes {
     pub on_demand_evicted: u64,
     /// Reads of untracked keys answered from a recent BAL write instead of a fetch.
     pub resolved_from_bal: u64,
+    /// Keys given a retention (on-demand, subscribed, archived) from recent BALs, no fetch.
+    pub bal_promotions: u64,
     /// Slots held for fully downloaded contracts (`storage: all`).
     pub complete_slots: usize,
     /// Estimated bytes held by the recent-BAL index (all writes of the last `window` blocks,
@@ -208,13 +210,15 @@ impl Inner {
     /// archived) and holds no versions, the values it only had in recent BALs become its
     /// versions, at the blocks that wrote them. From there BAL writes keep it current like any
     /// fetched key, and archiving persists them.
-    fn seed_from_bal(&mut self, k: &StateKey) {
+    fn seed_from_bal(&mut self, k: &StateKey) -> bool {
         if self.versions.get(k).is_some_and(|v| !v.is_empty()) {
-            return;
+            return false;
         }
-        for (n, v) in self.bal_writes(k) {
-            self.put(*k, n, v);
+        let w = self.bal_writes(k);
+        for (n, v) in &w {
+            self.put(*k, *n, *v);
         }
+        !w.is_empty()
     }
 
     fn put(&mut self, key: StateKey, number: u64, value: U256) {
@@ -241,6 +245,8 @@ pub struct Store {
     on_demand_evicted: std::sync::atomic::AtomicU64,
     /// Reads of untracked keys answered from a recent block's BAL write (no fetch needed).
     resolved_from_bal: std::sync::atomic::AtomicU64,
+    /// Keys given a retention whose value came from recent BALs (promotion, no fetch).
+    bal_promotions: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     pub(crate) test_hook: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
@@ -268,6 +274,7 @@ impl Store {
             max_on_demand: std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_ON_DEMAND),
             on_demand_evicted: Default::default(),
             resolved_from_bal: Default::default(),
+            bal_promotions: Default::default(),
             #[cfg(test)]
             test_hook: Default::default(),
         })
@@ -289,6 +296,7 @@ impl Store {
             max_on_demand: std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_ON_DEMAND),
             on_demand_evicted: Default::default(),
             resolved_from_bal: Default::default(),
+            bal_promotions: Default::default(),
             #[cfg(test)]
             test_hook: Default::default(),
         }))
@@ -296,6 +304,18 @@ impl Store {
 
     pub fn archive(&self) -> Option<&Arc<archive::Archive>> {
         self.archive.as_ref()
+    }
+
+    /// Archive coverage of an address's archived keys: (key, first covered block, whether that
+    /// start is a write).
+    pub fn archive_coverage(&self, a: &Address) -> Vec<(StateKey, u64, bool)> {
+        let Some(ar) = &self.archive else { return vec![] };
+        ar.coverages()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(k, _, _)| matches!(k, StateKey::Balance(x) | StateKey::Nonce(x) | StateKey::CodeHash(x) | StateKey::Storage(x, _) if x == a))
+            .map(|(k, c, ext)| (k, c, !ext))
+            .collect()
     }
 
     pub fn archive_errors(&self) -> u64 {
@@ -368,7 +388,9 @@ impl Store {
         st.temp.remove(&k);
         st.watched_keys.insert(k);
         // Seed before archiving, so the archive starts at the block that wrote the value.
-        st.seed_from_bal(&k);
+        if st.seed_from_bal(&k) {
+            self.bal_promotions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if !st.archived.insert(k) {
             return true;
         }
@@ -392,7 +414,9 @@ impl Store {
         let mut st = self.inner.write();
         st.temp.remove(&k);
         st.watched_keys.insert(k);
-        st.seed_from_bal(&k);
+        if st.seed_from_bal(&k) {
+            self.bal_promotions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         true
     }
 
@@ -423,7 +447,9 @@ impl Store {
         }
         st.temp.remove(&k);
         st.watched_keys.insert(k);
-        st.seed_from_bal(&k);
+        if st.seed_from_bal(&k) {
+            self.bal_promotions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         true
     }
 
@@ -461,7 +487,9 @@ impl Store {
                 *e = (*e).max(head + n);
             } else if !st.tracked(k) && !st.bal_writes(k).is_empty() {
                 self.admit_temp(&mut st, *k, head + n);
-                st.seed_from_bal(k);
+                if st.seed_from_bal(k) {
+                    self.bal_promotions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     }
@@ -704,6 +732,7 @@ impl Store {
             code_bytes: st.code.values().map(|c| c.len()).sum(),
             admissions_refused: self.admissions_refused.load(std::sync::atomic::Ordering::Relaxed),
             resolved_from_bal: self.resolved_from_bal.load(std::sync::atomic::Ordering::Relaxed),
+            bal_promotions: self.bal_promotions.load(std::sync::atomic::Ordering::Relaxed),
             on_demand_evicted: self.on_demand_evicted.load(std::sync::atomic::Ordering::Relaxed),
             complete_slots: st.complete.values().map(Complete::len).sum(),
             recent_bal_bytes: st.recent.values().map(|w| (w.writes.len() + w.touched.len() + w.storage_reads.len()) * BAL_ENTRY_BYTES).sum(),

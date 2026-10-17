@@ -505,6 +505,7 @@ fn a_bal_only_value_is_promoted_when_a_key_is_subscribed() {
     s.apply_block(blk(1, 0), writes(&[])).unwrap();
     s.apply_block(blk(2, 0), writes(&[(slot(6), 60)])).unwrap(); // untracked: BAL index only
     assert!(s.watch_key(slot(6)));
+    assert_eq!(s.sizes().bal_promotions, 1);
     for n in 3..=12 {
         s.apply_block(blk(n, 0), writes(&[])).unwrap(); // block 2 leaves the 4-block window
     }
