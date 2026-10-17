@@ -175,9 +175,9 @@ impl ChainData {
         let _ = self.history.set(store);
     }
 
-    fn store_headers(&self, hs: &[(B256, &Header)]) {
+    fn store_tip(&self, hash: B256, h: &Header) {
         if let Some(s) = self.history.get()
-            && let Err(e) = s.put(hs)
+            && let Err(e) = s.put_tip(hash, h)
         {
             tracing::warn!("{e}");
         }
@@ -204,7 +204,7 @@ impl ChainData {
         }
         g.put_header(hash, Arc::new(h.clone()));
         drop(g);
-        self.store_headers(&[(hash, h)]);
+        self.store_tip(hash, h);
         let mut g = self.inner.write();
         while g.headers.len() > HEADERS_MAX {
             let Some((&n, _)) = g.headers.first_key_value() else { break };
@@ -391,11 +391,8 @@ impl ChainData {
         };
         let unavailable = |e: crate::history::StoreError| DataError::Unavailable(e.to_string());
         while low > number {
-            // Already stored and linked: jump to the bottom of that run.
-            if let Some((hash, _)) = store.get(low - 1).map_err(unavailable)?
-                && hash == parent
-            {
-                let (l, p) = store.contiguous_low(low - 1).map_err(unavailable)?.expect("just read");
+            // Already stored and on this chain (by hash): jump to the bottom of that run.
+            if let Some((l, p)) = store.linked_low(low - 1, parent).map_err(unavailable)? {
                 (low, parent) = (l, p);
                 continue;
             }
@@ -433,13 +430,13 @@ impl ChainData {
                 let floor = pre.1.number + 1;
                 let _ = store.set_floor(floor);
                 tracing::info!(floor, "history: reached Amsterdam; earlier blocks aren't served");
-                store.put(&ok.iter().map(|(x, h)| (*x, h)).collect::<Vec<_>>()).map_err(unavailable)?;
+                store.put_run(&ok.iter().map(|(x, h)| (*x, h)).collect::<Vec<_>>()).map_err(unavailable)?;
                 if number < floor {
                     return Err(DataError::Unsupported(format!("block {number} is before Amsterdam (block {floor}): history before the fork isn't served")));
                 }
                 return Ok(());
             }
-            store.put(&ok.iter().map(|(x, h)| (*x, h)).collect::<Vec<_>>()).map_err(unavailable)?;
+            store.put_run(&ok.iter().map(|(x, h)| (*x, h)).collect::<Vec<_>>()).map_err(unavailable)?;
             let last = &ok.last().expect("non-empty").1;
             (low, parent) = (last.number, last.parent_hash);
             if low % 16384 < 1024 {
@@ -866,8 +863,10 @@ impl ChainData {
         self.inner.read().txs.get(&number).filter(|(h, _)| *h == hash).map(|(_, v)| v.clone())
     }
 
-    /// `eth_getLogs` over `[from, to]` (already resolved; `to` ≤ head).
-    pub async fn logs(&self, filter: &Filter, from: u64, to: u64) -> Result<Value, DataError> {
+    /// `eth_getLogs` over `[from, to]` (already resolved; `to` ≤ head). With `at`, the single
+    /// block must be that block (by hash), or the query is refused: never another block at the
+    /// same height.
+    pub async fn logs(&self, filter: &Filter, from: u64, to: u64, at: Option<B256>) -> Result<Value, DataError> {
         if to < from {
             return Err(DataError::Invalid("fromBlock is after toBlock".into()));
         }
@@ -883,13 +882,15 @@ impl ChainData {
         {
             return Err(DataError::Unavailable(format!("block {from} is older than connected peers serve (earliest {p}); receipts before it have expired")));
         }
-        // Below the in-memory window, headers come from the post-fork store.
+        // Below the in-memory window, headers come from the post-fork store: only those hash-linked
+        // to the oldest in-memory (canonical) header, read in one transaction.
         let disk: HashMap<u64, (B256, Arc<Header>)> = {
-            let mem_low = self.inner.read().headers.first_key_value().map(|(n, _)| *n).unwrap_or(u64::MAX);
-            match self.history.get() {
-                Some(s) if from < mem_low => s
-                    .range(from, to.min(mem_low.saturating_sub(1)))
+            let anchor = self.inner.read().headers.first_key_value().map(|(n, (_, hd))| (*n, hd.parent_hash));
+            match (self.history.get(), anchor) {
+                (Some(s), Some((mem_low, parent))) if from < mem_low => s
+                    .linked_range(from, to.min(mem_low - 1), mem_low, parent)
                     .map_err(|e| DataError::Unavailable(e.to_string()))?
+                    .ok_or_else(|| DataError::Unavailable(format!("headers below {mem_low} changed (reorg); retry")))?
                     .into_iter()
                     .map(|(hash, h)| (h.number, (hash, Arc::new(h))))
                     .collect(),
@@ -904,6 +905,9 @@ impl ChainData {
                 let Some((bh, h)) = g.headers.get(&n).cloned().or_else(|| disk.get(&n).cloned()) else {
                     return Err(DataError::Unavailable(format!("no header for block {n}")));
                 };
+                if at.is_some_and(|want| want != bh) {
+                    return Err(DataError::Unavailable(format!("block {} is no longer on the chain", at.unwrap())));
+                }
                 scanned += 1;
                 if !filter.matches_bloom(h.logs_bloom) {
                     continue;

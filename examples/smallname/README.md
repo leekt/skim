@@ -89,7 +89,7 @@ A name created before the index starts still resolves and has a full profile; th
 Env:
 - `SKIM_RPC` (default `http://localhost:8545`)
 - `DB` (default `smallname.db`)
-- `PORT` (default `8787`)
+- `PORT` (default `8787`); `HOST` to bind one interface (e.g. `127.0.0.1` behind a proxy)
 - `FROM_BLOCK`: start a new index later than the fork
 
 Node 23+, run with `--experimental-sqlite` (the npm script passes it).

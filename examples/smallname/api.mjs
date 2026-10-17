@@ -34,7 +34,7 @@ function dec(c, scope) {
   }
 }
 
-export function serve(store, { skim, port }) {
+export function serve(store, { skim, port, host }) {
   const html = (() => {
     try {
       return readFileSync(new URL("./page.html", import.meta.url));
@@ -523,7 +523,7 @@ export function serve(store, { skim, port }) {
       res.writeHead(err.status, { ...cors, "content-type": "application/json" }).end(JSON.stringify({ error: { code: err.code, message: err.message, details: err.details } }));
     }
   });
-  server.listen(port, () => console.log(`smallname API on :${port} (skim ${skim})`));
+  server.listen(port, host, () => console.log(`smallname API on ${host ?? ""}:${port} (skim ${skim})`));
   return server;
 }
 

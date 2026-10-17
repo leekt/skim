@@ -563,14 +563,17 @@ impl Rpc {
                 let chain = self.chain()?;
                 let filter: alloy_rpc_types_eth::Filter = need(params, 0)?;
                 let head = self.resolve_block(None, latest)?.number;
-                let (from, to) = match filter.block_option {
+                let (from, to, at) = match filter.block_option {
                     alloy_rpc_types_eth::FilterBlockOption::AtBlockHash(h) => {
                         let n = chain.number_of(&h).ok_or_else(|| RpcError::unavailable(format!("block {h} is not known")))?;
-                        (n, n)
+                        (n, n, Some(h))
                     }
-                    _ => ChainData::range(&filter, head)?,
+                    _ => {
+                        let (a, b) = ChainData::range(&filter, head)?;
+                        (a, b, None)
+                    }
                 };
-                Ok(chain.logs(&filter, from, to).await?)
+                Ok(chain.logs(&filter, from, to, at).await?)
             }
             "eth_simulateV1" => {
                 let payload: alloy_rpc_types_eth::simulate::SimulatePayload = need(params, 0)?;
@@ -1117,7 +1120,7 @@ async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
                 for (sid, sub) in &subs {
                     // Logs: one notification per log, as clients expect.
                     if let (Sub::Logs(f), WsEvent::NewHead(b), Some(c)) = (sub, &ev, &rpc.chain) {
-                        if let Ok(Value::Array(logs)) = c.logs(f, b.number, b.number).await {
+                        if let Ok(Value::Array(logs)) = c.logs(f, b.number, b.number, Some(b.hash)).await {
                             for log in logs {
                                 let msg = json!({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": sid, "result": log}});
                                 if tx.send(Message::Text(msg.to_string().into())).await.is_err() {

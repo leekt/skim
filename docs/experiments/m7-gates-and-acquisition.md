@@ -143,6 +143,17 @@ The invariant from the fifth review, extended to every EVM input: **a known valu
 | P2: the soak's freshness sampler counted the scheduled downtime between stop and relaunch as steady-state staleness | A shared `Phase`: a disruption starts just before the process is stopped and ends at recovery; recovery is still timed from the relaunch. The probe loop and the sampler read the same phase | `--selftest`: scheduled downtime adds no stale time, and an unexpected outage after recovery does (fails with the exclusion removed) |
 | P2: a run whose only miss was an ancestor header still waited for a SNAP peer (headers come from any eth peer), and could be refused with `NoStatePeers` | Header-only misses resolve the headers and run again, without the SNAP wait (calls, `eth_simulateV1`, traces). Header-only retries count toward the round limit | No end-to-end test (it needs a peer that serves headers but not SNAP); `Access::has_state_misses` separates the two |
 
+## Ninth review: post-fork history must stay on one chain
+The history added after the soak (`eth_getLogs` over post-fork headers on disk) repeated the archive's old mistake: trusting rows by height.
+
+| Finding | Fix | Regression test |
+|---|---|---|
+| P1: the header store linked runs by consecutive height, so after an offline reorg (A98-A100 on disk, restart at B101), a query for 99 after one for 100 read A99 as B100's parent: logs from the abandoned fork, or a wrong empty result | Nothing on disk is trusted by height. Reads walk down by hash from the oldest in-memory (canonical) header, in one read transaction (`linked_range`), and refuse if the chain breaks. The header walk jumps over a stored run only as far as it is hash-linked (`linked_low`); a mismatch is fetched again | `history_after_an_offline_reorg_never_reads_the_old_fork`: 100 then 99, refused until B99 is fetched, then 98-100 are A98, B99, B100. It fails with height-only linking |
+| P1: `eth_getLogs({blockHash})` resolved the hash to a height, and the log scan then used whatever block was at that height | The requested hash goes through the scan; a different block at that height is refused (`-32002`). The WebSocket `logs` subscription pins each block the same way | none yet (needs a reorg between resolution and the scan) |
+| P2: a downward repair batch (newest first) deleted the headers it had just inserted, because each replacement truncated everything above it | Two writes: `put_tip` (gossip; a replaced height drops what's above it) and `put_run` (a fetched run; overwrites its heights, nothing else). Reads check links, so leftover rows are harmless | `a_descending_repair_batch_keeps_every_header_it_brings` |
+
+The 150-minute soak predates this history path; it doesn't validate it.
+
 ## Results
 **Full soak (150 min, binary `c020e7d`, soak v2 harness before the seventh-review changes): FAIL on two gates, with no wrong answers.**
 - **Answers:** 7,235 matches, 0 wrong, 0 refusals. 43 answers were unavailable from the reference, and 22 skim requests failed in transport (counted as unanswered).
