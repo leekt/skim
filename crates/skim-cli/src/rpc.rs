@@ -704,6 +704,7 @@ impl Rpc {
                     "snap_peers": peers.iter().filter(|(_, p)| p.snap1 || p.snap2).count(),
                     "peer_acquisition": acquisition,
                     "served": self.served_json(),
+                    "history": self.chain.as_ref().map(|c| c.history_json()),
                     "snap_fetch": {
                         "stats": sim.sched.stats(),
                         "peers": sim.sched.peer_stats().into_iter().map(|(id, p)| {

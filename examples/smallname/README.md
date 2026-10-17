@@ -29,17 +29,20 @@ Because the index holds candidates rather than answers, a stale or over-inclusiv
 2. Otherwise a live ENSv1 holding decides: the registry, the `.eth` registrar lease, or the NameWrapper. Fuses and wrapper expiry apply.
 3. A released ENSv2 registration stays ENSv2.
 
-## History: from Glamsterdam
-skim serves logs back to the Glamsterdam fork (Sepolia block 11,856,337). A new index starts there:
-- It catches up in 2,048-block ranges.
-- Then it follows the head block by block, by block hash, rolling back on reorgs.
+## History: what skim can still fetch, then everything indexed
+History comes from what skim can fetch when the index starts, and then the index keeps everything it indexed:
+- **Never before Glamsterdam** (Sepolia block 11,856,337). skim keeps headers only from the fork on and answers `-32004` before it.
+- **Never before what peers still serve.** Receipts come from peers, and each peer announces the oldest block it still serves (eth/69 `earliest_block`). skim reports the result in `skim_status.history.logs_from` and refuses older ranges.
+  - On 2026-10-18, every connected peer reported `0` (full history), so the index reached back to the fork.
+  - Once peers expire history (a couple of weeks), a new index starts later than the fork.
+- **After that, the index keeps it.** smallname catches up in 2,048-block ranges, then follows the head block by block, by block hash, rolling back on reorgs. Indexed events stay indexed however old they get.
 
 Anything earlier is marked, not guessed:
-- **History, events and lists:** `meta.completeness: "partial"`, `unsupported_reason: "pre_glamsterdam_history"`, `history_from_block: 11856337`.
-- **Name detail:** `registered_at` / `created_at` are `null` and listed in `meta.unsupported_fields` when the registration predates the fork.
+- **History, events and lists:** `meta.completeness: "partial"` and `history_from_block`, which is where this index starts. `unsupported_reason` is `pre_glamsterdam_history` when the index starts at the fork, or `history_before_index_start` when it starts later.
+- **Name detail:** `registered_at` / `created_at` are `null` and listed in `meta.unsupported_fields` when the registration predates the index.
 - **`GET /v1/namespaces/ens`:** `name_history` and `subnames` are `partial`.
 
-A name created before the fork still resolves and has a full profile; the profile is live. It shows up in lists once something about it happens after the fork.
+A name created before the index starts still resolves and has a full profile; the profile is live. It shows up in lists once something about it happens after that.
 
 **Labels:**
 - **Unknown labels:** a name whose label text was never seen in an event (`NewOwner` carries only its hash) is listed as `[labelhash].parent.eth`, as bigname does.

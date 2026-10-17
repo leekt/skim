@@ -343,6 +343,36 @@ impl ChainData {
         v
     }
 
+    /// The oldest block any connected peer serves receipts for (eth/69 `earliest_block`), and how
+    /// many peers reported one. Older receipts come only from what skim already holds.
+    pub fn peers_serve_from(&self) -> (Option<u64>, usize) {
+        let e: Vec<u64> = self
+            .net
+            .peers()
+            .into_iter()
+            .filter(|(_, p)| p.eth_version >= 70 && !p.client.starts_with("enrscout"))
+            .filter_map(|(_, p)| p.status_earliest)
+            .collect();
+        (e.iter().min().copied(), e.len())
+    }
+
+    /// Where `eth_getLogs` history starts: the fork floor (headers), and what peers still serve.
+    pub fn history_json(&self) -> Value {
+        let floor = self.history.get().and_then(|s| s.floor().ok().flatten());
+        let (peers_from, reporting) = self.peers_serve_from();
+        let logs_from = match (floor, peers_from) {
+            (Some(f), Some(p)) => Some(f.max(p)),
+            (f, p) => p.or(f),
+        };
+        json!({
+            "fork_floor": floor,
+            "peers_serve_from": peers_from,
+            "peers_reporting": reporting,
+            "logs_from": logs_from,
+            "memory_headers_from": self.inner.read().headers.first_key_value().map(|(n, _)| *n),
+        })
+    }
+
     /// Makes headers down to `number` available: in memory for recent blocks; below that, on
     /// disk (post-Amsterdam history), walking back by hash from the lowest linked header.
     async fn ensure_headers(&self, number: u64) -> Result<(), DataError> {
@@ -845,6 +875,14 @@ impl ChainData {
             return Err(DataError::RangeTooLarge(self.max_log_range));
         }
         self.ensure_headers(from).await?;
+        // Receipts older than every connected peer serves (history expiry) can't be fetched;
+        // say so instead of asking each peer for blocks it has dropped.
+        if let (Some(p), n) = self.peers_serve_from()
+            && n > 0
+            && from < p
+        {
+            return Err(DataError::Unavailable(format!("block {from} is older than connected peers serve (earliest {p}); receipts before it have expired")));
+        }
         // Below the in-memory window, headers come from the post-fork store.
         let disk: HashMap<u64, (B256, Arc<Header>)> = {
             let mem_low = self.inner.read().headers.first_key_value().map(|(n, _)| *n).unwrap_or(u64::MAX);

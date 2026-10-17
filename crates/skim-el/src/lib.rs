@@ -81,6 +81,9 @@ pub struct PeerInfo {
     pub snap2: bool,
     pub status_head: B256,
     pub status_latest: Option<u64>,
+    /// The oldest block the peer serves bodies and receipts for (eth/69+ Status): history
+    /// before it has expired on that peer.
+    pub status_earliest: Option<u64>,
     pub connected_at: Instant,
 }
 
@@ -225,6 +228,7 @@ impl ElNet {
                                 snap2,
                                 status_head: info.status.blockhash,
                                 status_latest: info.status.latest_block,
+                                status_earliest: info.status.earliest_block,
                                 connected_at: Instant::now(),
                             },
                         );

@@ -102,7 +102,14 @@ export function serve(store, { skim, port }) {
 
   const asOf = (rd) => ({ as_of: { [CHAIN_ID]: rd.head } });
   // History and lists come from events since Glamsterdam only (skim serves logs from the fork).
-  const PARTIAL = { completeness: "partial", unsupported_reason: "pre_glamsterdam_history", history_from_block: AMSTERDAM_BLOCK };
+  // History starts where this index started (the fork at the earliest; later if peers had
+  // already expired older receipts, or the index was started later).
+  const historyFrom = () => Number(store.meta("started_at_block") ?? AMSTERDAM_BLOCK);
+  const partialMeta = () => ({
+    completeness: "partial",
+    unsupported_reason: historyFrom() <= AMSTERDAM_BLOCK ? "pre_glamsterdam_history" : "history_before_index_start",
+    history_from_block: historyFrom(),
+  });
   const ref = (a) => (a ? { chain_id: CHAIN_ID, address: a.toLowerCase() } : null);
 
   /** A name row: identity plus live state (null if the name isn't registered now). */
@@ -215,7 +222,7 @@ export function serve(store, { skim, port }) {
     }
     const unknown = ["registered_at", "created_at"].filter((k) => data[k] == null);
     const meta = { ...asOf(rd), source: "verified" };
-    if (unknown.length) Object.assign(meta, { unsupported_fields: unknown, unsupported_reason: "pre_glamsterdam_history" });
+    if (unknown.length) Object.assign(meta, { unsupported_fields: unknown, unsupported_reason: partialMeta().unsupported_reason });
     // Record keys are known from writes since the fork; `addr:60` is always read.
     if (unknown.length) meta.records_completeness = "partial";
     return { data, meta };
@@ -258,7 +265,7 @@ export function serve(store, { skim, port }) {
     };
     const f = await fill(cands, check, (r) => r.label, size, after);
     const total = store.get("SELECT count(*) c FROM names WHERE parent = ?", node).c;
-    return { data: f.rows, page: page(cursor, f.more ? enc({ s: scope, k: f.last }) : null, size, total), meta: { ...asOf(rd), ...PARTIAL } };
+    return { data: f.rows, page: page(cursor, f.more ? enc({ s: scope, k: f.last }) : null, size, total), meta: { ...asOf(rd), ...partialMeta() } };
   }
 
   function historyQuery(q, where, args, scope, cursor) {
@@ -303,7 +310,7 @@ export function serve(store, { skim, port }) {
     const last = rows[size - 1];
     let total = null;
     if (inc.has("total_count")) total = store.get(`SELECT count(*) c FROM events WHERE ${conds.slice(0, cursor ? -1 : undefined).join(" AND ")}`, ...a.slice(0, cursor ? -3 : undefined)).c;
-    return { data, page: page(cursor, more ? enc({ s: sc, b: last.block, l: last.log_index }) : null, size, total), meta: { ...PARTIAL } };
+    return { data, page: page(cursor, more ? enc({ s: sc, b: last.block, l: last.log_index }) : null, size, total), meta: { ...partialMeta() } };
   }
 
   async function addressNames(rd, q, address, cursor) {
@@ -337,7 +344,7 @@ export function serve(store, { skim, port }) {
     const primary = await primaryName(rd, address);
     for (const r of out) r.is_primary = primary.status === "ok" && primary.name === r.name;
     out.sort((a, b) => (a.name < b.name ? -1 : 1));
-    return { data: out, page: page(cursor, f.more ? enc({ s: scope, k: f.last }) : null, size), meta: { ...asOf(rd), ...PARTIAL } };
+    return { data: out, page: page(cursor, f.more ? enc({ s: scope, k: f.last }) : null, size), meta: { ...asOf(rd), ...partialMeta() } };
   }
 
   async function search(rd, q, cursor) {
@@ -357,7 +364,7 @@ export function serve(store, { skim, port }) {
       return row.status === "active" || row.status === "expired" ? strip(row) : null;
     };
     const f = await fill(cands, check, (r) => r.label + r.node, size, after);
-    return { data: f.rows, page: page(cursor, f.more ? enc({ s: scope, k: f.last }) : null, size), meta: { ...asOf(rd), ...PARTIAL } };
+    return { data: f.rows, page: page(cursor, f.more ? enc({ s: scope, k: f.last }) : null, size), meta: { ...asOf(rd), ...partialMeta() } };
   }
 
   async function expiring(rd, q, cursor) {
@@ -384,7 +391,7 @@ export function serve(store, { skim, port }) {
       return row.expires_at != null && e >= after && e < before ? strip(row) : null;
     };
     const f = await fill(cands, check, (r) => ({ e: r.expires, n: r.node }), size, c0 ? { e: c0.e, n: c0.n } : null);
-    return { data: f.rows, page: page(cursor, f.more ? enc({ s: scope, ...f.last }) : null, size), meta: { ...asOf(rd), ...PARTIAL } };
+    return { data: f.rows, page: page(cursor, f.more ? enc({ s: scope, ...f.last }) : null, size), meta: { ...asOf(rd), ...partialMeta() } };
   }
 
   async function lookup(rd, body) {
@@ -438,12 +445,12 @@ export function serve(store, { skim, port }) {
   const namespaces = (ns) => {
     if (ns !== "ens") throw new ApiError(404, "not_found", `namespace ${ns} is not indexed by smallname`);
     const full = { completeness: "full" };
-    const partial = { completeness: "partial", unsupported_reason: "pre_glamsterdam_history" };
+    const partial = { completeness: "partial", unsupported_reason: partialMeta().unsupported_reason };
     return {
       data: {
         namespace: "ens",
         capabilities: { name_profile: full, name_history: partial, subnames: partial, verified_records: full, verified_primary_name: full },
-        history_from_block: AMSTERDAM_BLOCK,
+        history_from_block: historyFrom(),
         networks: [{ network: "sepolia", chain_id: CHAIN_ID, resolution: { protocol: "ens_v2", since_block: 11820291 } }],
       },
       meta: {},

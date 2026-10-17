@@ -139,8 +139,11 @@ export async function follow(store, url, { fromBlock, log = console.log, onBlock
       const target = num(head.number);
       let last = Number(store.meta("indexed_block") ?? 0);
       if (!last) {
-        // A new index starts at the fork (or FROM_BLOCK, not earlier than the fork).
-        last = Math.max(fromBlock ?? AMSTERDAM_BLOCK, AMSTERDAM_BLOCK) - 1;
+        // A new index starts as far back as skim can still serve logs: the fork at the earliest,
+        // and no earlier than what connected peers keep (history expiry). FROM_BLOCK can start
+        // it later. From then on the index keeps what it indexed.
+        const served = (await rpc(url, "skim_status", []).catch(() => null))?.history?.logs_from ?? AMSTERDAM_BLOCK;
+        last = Math.max(fromBlock ?? 0, served, AMSTERDAM_BLOCK) - 1;
         store.meta("indexed_block", last);
         store.meta("started_at_block", last + 1);
         log(`new index: from block ${last + 1}`);
