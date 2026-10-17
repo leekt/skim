@@ -220,3 +220,18 @@ Values move between modes: recent BAL → on demand → subscribed → whole sto
 | P2: whole-storage growth was counted but not held to `max_subscribed_keys`, and an install didn't count slots written during its download | Growth past the budget drops the growing contract's whole-storage tracking (never: keep claiming completeness while skipping writes). The subscription reports why. An install counts writes since its download block | `whole_storage_growth_is_held_to_the_global_budget`, `install_counts_slots_written_during_the_download_toward_the_budget` |
 
 **CI** (`.github/workflows/ci.yml`) runs the workspace tests on every push and pull request, including all of the regressions above, and replays past fuzz crashes.
+
+## Restart catch-up via consensus peers: measured, then fixed
+Every restart's consensus catch-up had timed out ("timed out at slot …") and fallen back to EL peers. Before changing anything, the walk was instrumented: each `ByRange` request records peer, slot range, latency, envelopes, bytes and error, and every attempt logs a summary. `skim probe-catchup --blocks N` runs the same walk on demand.
+
+**Measured (655-block gap, sequential as before):** 23 requests, about 30 envelopes per 32-slot request, **no errors**. Each request took 2.3 s median (5.8 s max), because a 32-slot answer is several MB of full payloads. The walk spent its 60 s budget after 640 slots. So it wasn't a stalled peer: the whole walk exceeded its budget, as the reviewer suspected (one request at a time, ≥ 21 of them).
+
+**Fix:** up to 8 windows in flight, each to a different peer, with the same 60 s budget and per-request timeout. The walk finishes only when every block of the gap has arrived; windows complete out of order, and verification rejects any gap anyway.
+
+| 655-block gap | Sequential | 8 in flight |
+|---|---|---|
+| Outcome | budget exhausted at 640 slots | complete |
+| Time | 60 s (failed) | **8.4 s, 9.0 s** (two runs) |
+| Requests / errors / empty answers | 23 / 0 / 0 | 22 / 0 / 0 |
+
+**Cost:** consensus catch-up downloads full payloads, about 175 KB per block (116 MB for 655 blocks). For very long gaps (a 3,900-block gap would be ~700 MB), the EL path is lighter: headers and BALs only. It remains the fallback, and since the earlier change, subscriptions no longer wait for either path.

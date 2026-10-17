@@ -166,45 +166,183 @@ async fn restore_inner(store: &Arc<Store>, net: &ElNet, saved: &Saved, head: &Bl
 /// Blocks `saved.number + 1 ..= head.number` from consensus peers' payload envelopes, walking
 /// back from the head's slot. Each envelope is checked like gossip (the rebuilt header must
 /// hash to the payload's block hash, which commits to the BAL); linkage is checked after.
-async fn fetch_via_cl(cl: &skim_cl::ClNode, saved: &Saved, head: &BlockRef) -> anyhow::Result<Vec<(alloy_consensus::Header, BlockWrites)>> {
+/// One `ExecutionPayloadEnvelopesByRange` request of a catch-up walk.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RangeRequest {
+    pub start_slot: u64,
+    pub end_slot: u64,
+    pub peer: Option<String>,
+    pub ms: u64,
+    pub envelopes: usize,
+    pub bytes: usize,
+    pub error: Option<String>,
+}
+
+/// Where a catch-up walk's time went (logged after every attempt, success or not).
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct CatchupTrace {
+    pub slots_walked: u64,
+    pub blocks_found: usize,
+    pub total_ms: u64,
+    pub outcome: String,
+    pub requests: Vec<RangeRequest>,
+}
+
+impl CatchupTrace {
+    /// A compact summary: request count, latency distribution, empty answers, errors by kind,
+    /// and per-peer success/stall counts.
+    pub fn summary(&self) -> serde_json::Value {
+        let mut ms: Vec<u64> = self.requests.iter().map(|r| r.ms).collect();
+        ms.sort_unstable();
+        let q = |p: f64| ms.get(((ms.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(0);
+        let mut errors: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut peers: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+        for r in &self.requests {
+            if let Some(e) = &r.error {
+                let kind = if e.contains("timed out") { "timeout" } else if e.contains("no CL peer") { "no_candidate" } else { "peer_error" };
+                *errors.entry(kind.into()).or_default() += 1;
+            }
+            let p = peers.entry(r.peer.clone().unwrap_or_else(|| "-".into())).or_default();
+            if r.error.is_none() && r.envelopes > 0 { p.0 += 1 } else { p.1 += 1 }
+        }
+        let waiting: u64 = self.requests.iter().filter(|r| r.error.is_some()).map(|r| r.ms).sum();
+        serde_json::json!({
+            "outcome": self.outcome,
+            "total_ms": self.total_ms,
+            "slots_walked": self.slots_walked,
+            "blocks_found": self.blocks_found,
+            "requests": self.requests.len(),
+            "request_ms": {"p50": q(0.5), "p90": q(0.9), "max": q(1.0)},
+            "ms_in_failed_requests": waiting,
+            "empty_answers": self.requests.iter().filter(|r| r.error.is_none() && r.envelopes == 0).count(),
+            "envelopes": self.requests.iter().map(|r| r.envelopes).sum::<usize>(),
+            "bytes": self.requests.iter().map(|r| r.bytes).sum::<usize>(),
+            "errors": errors,
+            "peers_ok_failed": peers,
+        })
+    }
+}
+
+/// Catch-up budget: the whole walk, and each request.
+const CATCHUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+const CATCHUP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Range requests in flight at once (each goes to a different peer, round robin). A 32-slot
+/// answer is several MB of payloads and takes ~2-6 s, so one at a time can't cover a gap of a
+/// few hundred blocks within the budget (measured with `skim probe-catchup`).
+const CATCHUP_PARALLEL: usize = 8;
+
+/// Walks back from `head_slot` in 32-slot `ByRange` windows, newest first, up to
+/// [`CATCHUP_PARALLEL`] at a time, until `keep` says the envelopes collected so far suffice,
+/// recording every request in `trace`. Each envelope is verified (payload hash) before `keep`
+/// sees it.
+pub async fn walk_envelopes(
+    cl: &skim_cl::ClNode,
+    head_slot: u64,
+    max_slots: u64,
+    trace: &mut CatchupTrace,
+    mut keep: impl FnMut(alloy_consensus::Header, BlockWrites) -> bool,
+) -> anyhow::Result<()> {
+    use futures::stream::{FuturesUnordered, StreamExt};
     const CHUNK: u64 = 32;
-    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    let t0 = Instant::now();
+    let deadline = t0 + CATCHUP_DEADLINE;
+    let lowest_slot = head_slot.saturating_sub(max_slots);
+    // One window, with up to 4 attempts; returns its requests and the envelopes (if any).
+    let fetch = |start: u64, end: u64| async move {
+        let mut reqs = Vec::new();
+        for _ in 0..4 {
+            let left = deadline.saturating_duration_since(Instant::now()).min(CATCHUP_REQUEST_TIMEOUT);
+            if left.is_zero() {
+                break;
+            }
+            let t = Instant::now();
+            let (peer, res) = cl.envelopes_by_range_from(start, end - start + 1, left).await;
+            let mut req = RangeRequest { start_slot: start, end_slot: end, peer: peer.map(|p| p.to_string()), ms: t.elapsed().as_millis() as u64, envelopes: 0, bytes: 0, error: None };
+            match res {
+                Ok(c) => {
+                    req.envelopes = c.len();
+                    req.bytes = c.iter().map(Vec::len).sum();
+                    tracing::debug!(?req, "catch-up request");
+                    reqs.push(req);
+                    if !c.is_empty() {
+                        return (start, reqs, Some(c));
+                    }
+                }
+                Err(e) => {
+                    req.error = Some(e.to_string());
+                    tracing::debug!(?req, "catch-up request");
+                    reqs.push(req);
+                }
+            }
+        }
+        (start, reqs, None)
+    };
+    let mut next_end = Some(head_slot);
+    let mut inflight = FuturesUnordered::new();
+    let mut lowest_started = head_slot + 1;
+    let r: anyhow::Result<()> = async {
+        loop {
+            while inflight.len() < CATCHUP_PARALLEL
+                && let Some(end) = next_end
+            {
+                let start = end.saturating_sub(CHUNK - 1).max(lowest_slot);
+                lowest_started = start;
+                inflight.push(fetch(start, end));
+                next_end = (start > lowest_slot).then(|| start - 1);
+            }
+            let Some((start, reqs, chunks)) = inflight.next().await else {
+                anyhow::bail!("walked back {} slots without finishing", head_slot - lowest_slot);
+            };
+            trace.requests.extend(reqs);
+            let chunks = chunks.ok_or_else(|| {
+                if Instant::now() >= deadline {
+                    anyhow::anyhow!("walk budget ({} s) exhausted with slots {start}.. unanswered", CATCHUP_DEADLINE.as_secs())
+                } else {
+                    anyhow::anyhow!("no peer served envelopes for slots {start}..={}", start + CHUNK - 1)
+                }
+            })?;
+            trace.slots_walked = head_slot - lowest_started + 1;
+            let mut finished = false;
+            for ssz in chunks {
+                let env = skim_cl::ssz::Envelope::parse(&ssz)?;
+                let v = skim_cl::verify::verify_payload(&env);
+                anyhow::ensure!(v.ok, "envelope for block {} does not hash to its block_hash", env.payload.block_number);
+                let bal = skim_bal::decode(env.payload.block_access_list)?;
+                trace.blocks_found += 1;
+                finished |= keep(v.header, BlockWrites::from_bal(&bal));
+            }
+            if finished {
+                return Ok(());
+            }
+        }
+    }
+    .await;
+    trace.total_ms = t0.elapsed().as_millis() as u64;
+    trace.outcome = match &r {
+        Ok(()) => "complete".into(),
+        Err(e) => e.to_string(),
+    };
+    r
+}
+
+async fn fetch_via_cl(cl: &skim_cl::ClNode, saved: &Saved, head: &BlockRef) -> anyhow::Result<Vec<(alloy_consensus::Header, BlockWrites)>> {
     let head_slot = head.timestamp.saturating_sub(skim_cl::node::SEPOLIA_GENESIS_TIME) / 12;
     let lowest_needed = saved.number + 1;
     let mut got: std::collections::BTreeMap<u64, (alloy_consensus::Header, BlockWrites)> = Default::default();
-    let mut end = head_slot;
+    let mut trace = CatchupTrace::default();
     // Slots >= blocks (some slots are empty), so walk back until the lowest needed block shows up.
-    while got.keys().next().is_none_or(|n| *n > lowest_needed) {
-        anyhow::ensure!(Instant::now() < deadline, "timed out at slot {end}");
-        anyhow::ensure!(head_slot - end <= MAX_REPLAY * 2, "walked back {} slots without reaching block {lowest_needed}", head_slot - end);
-        let start = end.saturating_sub(CHUNK - 1);
-        let mut chunks = None;
-        for _ in 0..4 {
-            match cl.envelopes_by_range(start, end - start + 1).await {
-                Ok(c) if !c.is_empty() => {
-                    chunks = Some(c);
-                    break;
-                }
-                Ok(_) => {}
-                Err(e) => tracing::debug!("envelopes {start}..={end}: {e}"),
-            }
+    let r = walk_envelopes(cl, head_slot, MAX_REPLAY * 2, &mut trace, |h, w| {
+        let n = h.number;
+        if n >= lowest_needed && n <= head.number {
+            got.insert(n, (h, w));
         }
-        let chunks = chunks.ok_or_else(|| anyhow::anyhow!("no peer served envelopes for slots {start}..={end}"))?;
-        for ssz in chunks {
-            let env = skim_cl::ssz::Envelope::parse(&ssz)?;
-            let v = skim_cl::verify::verify_payload(&env);
-            anyhow::ensure!(v.ok, "envelope for block {} does not hash to its block_hash", env.payload.block_number);
-            let n = v.header.number;
-            if n >= lowest_needed && n <= head.number {
-                let bal = skim_bal::decode(env.payload.block_access_list)?;
-                got.insert(n, (v.header, BlockWrites::from_bal(&bal)));
-            }
-        }
-        if start == 0 {
-            break;
-        }
-        end = start - 1;
-    }
+        // Windows complete out of order: done only when every block of the gap is here.
+        got.len() as u64 == head.number - lowest_needed + 1
+    })
+    .await;
+    tracing::info!(gap = head.number - saved.number, summary = %trace.summary(), "restart catch-up via consensus peers");
+    r?;
     Ok(got.into_values().collect())
 }
 

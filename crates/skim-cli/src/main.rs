@@ -12,6 +12,7 @@ mod follow;
 mod probe_cl;
 mod probe_clreq;
 mod probe_call;
+mod probe_catchup;
 mod probe_el;
 mod probe_serve;
 mod rpc;
@@ -36,6 +37,8 @@ enum Cmd {
     ProbeClReq(probe_clreq::Args),
     /// Check what a skim node serves to peers (EL and CL), verifying every answer.
     ProbeServe(probe_serve::Args),
+    /// Time the restart catch-up walk over consensus peers (where the time goes).
+    ProbeCatchup(probe_catchup::Args),
     /// M0 Spike C: cold-call SNAP rounds and latency vs Infura eth_call at the same block.
     ProbeCall(probe_call::Args),
     /// M1: follow the chain from CL gossip BALs into the MVCC store; time block -> state ready
@@ -64,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::ProbeEl(args) => probe_el::run(args).await,
         Cmd::ProbeClReq(args) => probe_clreq::run(args).await,
         Cmd::ProbeServe(args) => probe_serve::run(args).await,
+        Cmd::ProbeCatchup(args) => probe_catchup::run(args).await,
         Cmd::ProbeCall(args) => probe_call::run(args).await,
         Cmd::Follow(args) => follow::run(args).await,
         Cmd::Run(args) => run::run(args).await,

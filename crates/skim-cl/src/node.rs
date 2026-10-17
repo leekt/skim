@@ -212,7 +212,13 @@ struct Behaviour {
 
 /// Requests from the owner of a [`ClNode`] to its swarm task.
 enum Cmd {
-    Envelopes { start_slot: u64, count: u64, reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>> },
+    Envelopes {
+        start_slot: u64,
+        count: u64,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>>,
+        /// Told which peer was asked (diagnostics), before the answer arrives.
+        asked: Option<tokio::sync::oneshot::Sender<PeerId>>,
+    },
     Bootstrap { root: [u8; 32], reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>> },
     Serve { slot: u64, env: crate::serve::Served },
     EnvelopesByRoot { roots: Vec<B256>, reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>> },
@@ -240,10 +246,24 @@ impl ClNode {
     /// is at or past the range. Returns each envelope's SSZ (unverified: callers check them as
     /// they do gossip). Empty slots and pruned ranges simply yield fewer envelopes.
     pub async fn envelopes_by_range(&self, start_slot: u64, count: u64) -> anyhow::Result<Vec<Vec<u8>>> {
+        self.envelopes_by_range_from(start_slot, count, Duration::from_secs(20)).await.1
+    }
+
+    /// [`Self::envelopes_by_range`] that also reports which peer was asked (None if there was
+    /// no candidate), with a caller-chosen timeout.
+    pub async fn envelopes_by_range_from(&self, start_slot: u64, count: u64, timeout: Duration) -> (Option<PeerId>, anyhow::Result<Vec<Vec<u8>>>) {
         let (reply, rx) = tokio::sync::oneshot::channel();
+        let (asked, asked_rx) = tokio::sync::oneshot::channel();
         let count = count.min(rpc::MAX_REQUEST_PAYLOADS);
-        self.cmd.send(Cmd::Envelopes { start_slot, count, reply }).await.map_err(|_| anyhow::anyhow!("CL node stopped"))?;
-        tokio::time::timeout(Duration::from_secs(20), rx).await.map_err(|_| anyhow::anyhow!("envelopes request timed out"))??
+        if self.cmd.send(Cmd::Envelopes { start_slot, count, reply, asked: Some(asked) }).await.is_err() {
+            return (None, Err(anyhow::anyhow!("CL node stopped")));
+        }
+        let res = match tokio::time::timeout(timeout, rx).await {
+            Err(_) => Err(anyhow::anyhow!("envelopes request timed out after {} ms", timeout.as_millis())),
+            Ok(Err(_)) => Err(anyhow::anyhow!("CL node dropped the request")),
+            Ok(Ok(r)) => r,
+        };
+        (asked_rx.await.ok(), res)
     }
 
     /// `ExecutionPayloadEnvelopesByRoot(beacon block roots)` from one connected peer (SSZ,
@@ -618,7 +638,7 @@ impl Runner {
 
     fn on_cmd(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::Envelopes { start_slot, count, reply } => {
+            Cmd::Envelopes { start_slot, count, reply, asked } => {
                 // Peers whose head covers the range, rotated so retries spread out.
                 let mut cands: Vec<PeerId> = self
                     .peers
@@ -638,6 +658,9 @@ impl Runner {
                 ssz.extend_from_slice(&start_slot.to_le_bytes());
                 ssz.extend_from_slice(&count.to_le_bytes());
                 let id = self.swarm.behaviour_mut().envelopes.send_request(&peer, ssz);
+                if let Some(a) = asked {
+                    let _ = a.send(peer);
+                }
                 self.env_reqs.insert(id, reply);
             }
             Cmd::EnvelopesByRoot { roots, reply } => {

@@ -11,11 +11,24 @@ Every block, the same requests go to skim and to the reference at the same block
 Each answer is MATCH, REFUSED (skim returned an error, e.g. -32002), or WRONG (skim returned a
 value the reference contradicts). WRONG is the failure this soak exists to catch.
 
-Chaos, every 6-12 minutes: SIGKILL + restart, graceful restart, or restart with the *other*
-config (key-set change). The archive file persists across all of them.
+  - balances of the current block's senders (untracked: answered from the recent BAL index)
+  - an archived subscription created at each restart for an account whose balance, at that
+    moment, is only in recent BALs (BAL -> archive promotion), read back at older blocks
+  - config B puts the pool under `storage: all` while its keys come back from the restart
+    snapshot as provisional TTL entries, and random pool slots are read on demand right away
+    (TTL -> whole-storage promotion); those slots keep being compared long after the TTLs
+  - restarts replay a snapshot (--data-dir) while subscriptions fetch fresh (restore race)
 
-Resources: skim_status every block; subscribed keys must stay <= max_subscribed_keys, and RSS
-under RSS_LIMIT_MB if set. Exit status is nonzero on any WRONG answer or limit breach.
+Chaos, every 6-12 minutes: SIGKILL + restart, graceful restart, or restart with the *other*
+config (key-set change). The archive file and data dir persist across all of them.
+
+Gates (exit status nonzero on any):
+  - any WRONG answer
+  - subscribed keys over max_subscribed_keys, or RSS over RSS_LIMIT_MB if set
+  - availability: outside the recovery window after each restart, subscribed probes answered
+    >= 95% and cold probes >= 80% (refusing everything fails), and every probe kind matched at
+    least once
+  - recovery: subscriptions ready again within RECOVERY_LIMIT_S (default 180) of each restart
 
 `--selftest` checks the classification rules (reverts and halts are outcomes to compare).
 Reorgs are not injected here (live network); they're covered by deterministic store tests.
@@ -29,6 +42,9 @@ else:
 MINUTES = float(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[1] != "--selftest" else 120
 REF = os.environ.get("REF_URL", "")
 PORT = 8547
+RECOVERY_LIMIT_S = float(os.environ.get("RECOVERY_LIMIT_S", "180"))
+SUBSCRIBED_KINDS = ("quote_sub", "slot_sub", "archived", "promo_archived")
+SUBSCRIBED_MIN, COLD_MIN = 0.95, 0.80
 SKIM = f"http://127.0.0.1:{PORT}"
 MAX_KEYS = 60
 RSS_LIMIT_MB = float(os.environ.get("RSS_LIMIT_MB", "0"))  # 0 = no limit
@@ -41,6 +57,7 @@ WETH, USDC = "fff9976782d46cc05630d1f6ebab18b2324d6b14", "1c7d4b196cb0c7b01d743f
 QUOTE_1 = ("0xc6a5026a" + WETH.rjust(64, "0") + USDC.rjust(64, "0") + f"{10**18:x}".rjust(64, "0")
            + f"{3000:x}".rjust(64, "0") + "0" * 64)
 
+LIMITS = {"A": MAX_KEYS, "B": 8000}
 CONFIGS = {
     "A": f"""
 state:
@@ -71,9 +88,24 @@ state:
     - name: weth
       address: "0x{WETH}"
       account: true
-  limits: {{ max_subscribed_keys: {MAX_KEYS} }}
+    - name: pool-all
+      address: "{POOL}"
+      storage: all
+      max_slots: 20000
+  limits: {{ max_subscribed_keys: 8000 }}
 """,
 }
+
+
+def promo_config(cfg, promo):
+    """The config plus an archived subscription for `promo` (an account whose balance is, at
+    this moment, only in recent BALs)."""
+    extra = f"""    - name: promo
+      address: "{promo}"
+      account: true
+      retention: {{ mode: archive }}
+"""
+    return CONFIGS[cfg].replace("  limits:", extra + "  limits:", 1) if promo else CONFIGS[cfg]
 
 
 def rpc(url, method, params, timeout=60):
@@ -109,15 +141,15 @@ class Skim:
         self.cfg = "A"
         self.archive = os.path.join(OUT, "chaos.redb")
 
-    def start(self, cfg):
+    def start(self, cfg, promo=None):
         self.cfg = cfg
         path = os.path.join(OUT, f"skim-{cfg}.yaml")
         with open(path, "w") as f:
-            f.write(CONFIGS[cfg])
+            f.write(promo_config(cfg, promo))
         log = open(os.path.join(OUT, "skim.log"), "ab")
         self.proc = subprocess.Popen(
             [BIN, "run", "--rpc", f"127.0.0.1:{PORT}", "--cl-port", "9170", "--el-port", "30409", "--window", "32",
-             "--config", path, "--archive", self.archive] + os.environ.get("SKIM_EXTRA_ARGS", "").split(),
+             "--config", path, "--archive", self.archive, "--data-dir", os.path.join(OUT, "data")] + os.environ.get("SKIM_EXTRA_ARGS", "").split(),
             stdout=log, stderr=log, env=dict(os.environ, RUST_LOG="info"))
 
     def stop(self, sig):
@@ -186,11 +218,18 @@ if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
 
 counts = {"match": 0, "refused": 0, "WRONG": 0, "ref_unavailable": 0}
 by_kind = {}
+steady = {}  # kind -> [answered, refused] outside recovery windows
+recoveries = []  # per restart: seconds until subscriptions were ready again (None = never)
+restart_at = None  # time of the last restart while recovering
+promo = None  # (address, block it was subscribed at)
+senders_seen = []
+last_n = None
 wrong_log = open(os.path.join(OUT, "wrong.jsonl"), "a")
 status_log = open(os.path.join(OUT, "status.jsonl"), "a")
 events = open(os.path.join(OUT, "events.jsonl"), "a")
 skim = Skim()
 skim.start("A")
+restart_at = time.time()  # the first start is a recovery too
 t_end = time.time() + MINUTES * 60
 next_chaos = time.time() + random.uniform(6, 12) * 60
 last = None
@@ -207,7 +246,12 @@ while time.time() < t_end:
         events.write(json.dumps({"t": time.time(), "event": kind, "config": cfg}) + "\n"); events.flush()
         print(f"chaos: {kind} -> config {cfg}", flush=True)
         time.sleep(rnd.uniform(5, 40))
-        skim.start(cfg)
+        # BAL -> archive promotion: archive the balance of an account that just transacted.
+        promo = (senders_seen[-1], last_n) if senders_seen else None
+        skim.start(cfg, promo[0] if promo else None)
+        if restart_at is not None:
+            recoveries.append(None)  # the previous restart never recovered
+        restart_at = time.time()
         next_chaos = time.time() + rnd.uniform(6, 12) * 60
     head = rpc(SKIM, "eth_getBlockByNumber", ["latest", False], timeout=5).get("result")
     if not head or head["hash"] == last:
@@ -215,8 +259,20 @@ while time.time() < t_end:
         continue
     last = head["hash"]
     n = int(head["number"], 16)
+    last_n = n
     first_block = first_block or n
     tag = {"blockHash": head["hash"]}
+    sub = rpc(SKIM, "skim_subscriptionStatus", [], timeout=5).get("result")
+    ready = bool(sub) and all(x.get("ready") for x in sub)
+    recovering = restart_at is not None
+    if recovering and ready:
+        recoveries.append(time.time() - restart_at)
+        events.write(json.dumps({"t": time.time(), "event": "recovered", "seconds": recoveries[-1]}) + "\n"); events.flush()
+        restart_at, recovering = None, False
+    blk = rpc(SKIM, "eth_getBlockByNumber", [head["number"], True], timeout=10).get("result") or {}
+    senders = sorted({t["from"] for t in blk.get("transactions", [])})
+    if senders:
+        senders_seen = senders[-20:]
     reqs = [("quote", "eth_call", [random_quote(rnd), tag]) for _ in range(3)]
     reqs += [("quote_sub", "eth_call", [{"to": QUOTER, "data": QUOTE_1}, tag])]
     reqs += [("slot_sub", "eth_getStorageAt", [POOL, hex(s), tag]) for s in (0, 4)]
@@ -226,6 +282,14 @@ while time.time() < t_end:
     if n - first_block > 40:
         old = rnd.randrange(first_block, n - 35)
         reqs += [("archived", "eth_getStorageAt", [POOL, "0x0", hex(old)])]
+    # BAL-first: balances of this block's senders (written by this block, not tracked).
+    reqs += [("bal_first", "eth_getBalance", [a, tag]) for a in senders[:3]]
+    # BAL -> archive: the promoted account's balance at blocks after its promotion, from disk.
+    if promo and n - promo[1] > 40:
+        reqs += [("promo_archived", "eth_getBalance", [promo[0], hex(rnd.randrange(promo[1], n - 35))])]
+    # TTL -> whole storage (config B): random pool slots, read on demand from the first block.
+    if skim.cfg == "B":
+        reqs += [("promo_slot", "eth_getStorageAt", [POOL, hex(rnd.randrange(0, 16)), tag])]
     for kind, m, p in reqs:
         s = rpc(SKIM, m, p)
         if s.get("error", {}).get("code") == "transport":
@@ -235,14 +299,16 @@ while time.time() < t_end:
         counts[c] += 1
         by_kind.setdefault(kind, {}).setdefault(c, 0)
         by_kind[kind][c] += 1
+        if not recovering and c in ("match", "refused"):
+            st_k = steady.setdefault(kind, [0, 0])
+            st_k[0 if c == "match" else 1] += 1
         if c == "WRONG":
             wrong_log.write(json.dumps({"block": n, "kind": kind, "method": m, "params": p, "skim": s, "ref": r}) + "\n")
             wrong_log.flush()
     st = rpc(SKIM, "skim_status", [], timeout=5).get("result")
-    sub = rpc(SKIM, "skim_subscriptionStatus", [], timeout=5).get("result")
     rss = subprocess.run(["ps", "-o", "rss=", "-p", str(skim.proc.pid)], capture_output=True, text=True).stdout.strip()
     rss_max = max(rss_max, int(rss or 0) / 1024)
-    if st and st["store"]["subscribed_keys"] > MAX_KEYS:
+    if st and st["store"]["subscribed_keys"] > LIMITS[skim.cfg]:
         over_limit += 1
     status_log.write(json.dumps({"t": time.time(), "block": n, "config": skim.cfg, "rss_mb": int(rss or 0) / 1024,
                                  "status": st, "subs": sub}) + "\n")
@@ -257,7 +323,21 @@ if over_limit:
     failures.append(f"subscribed keys over the limit in {over_limit} samples")
 if RSS_LIMIT_MB and rss_max > RSS_LIMIT_MB:
     failures.append(f"RSS {rss_max:.0f} MB over the {RSS_LIMIT_MB:.0f} MB limit")
-summary = {"minutes": MINUTES, "counts": counts, "by_kind": by_kind, "subscribed_over_limit_samples": over_limit,
+if restart_at is not None:
+    recoveries.append(None)
+answer_rate = {k: round(a / (a + r), 4) for k, (a, r) in steady.items() if a + r}
+for k, rate in answer_rate.items():
+    need = SUBSCRIBED_MIN if k in SUBSCRIBED_KINDS else COLD_MIN
+    if rate < need:
+        failures.append(f"{k}: answered {rate:.1%} in steady state (< {need:.0%})")
+for k, c in by_kind.items():
+    if not c.get("match"):
+        failures.append(f"{k}: never matched")
+slow = [r for r in recoveries if r is None or r > RECOVERY_LIMIT_S]
+if slow:
+    failures.append(f"{len(slow)} restart(s) not ready within {RECOVERY_LIMIT_S:.0f} s: {slow}")
+summary = {"minutes": MINUTES, "counts": counts, "by_kind": by_kind, "steady_answer_rate": answer_rate,
+           "recoveries_s": [None if r is None else round(r, 1) for r in recoveries], "subscribed_over_limit_samples": over_limit,
            "rss_max_mb": rss_max, "verdict": "FAIL" if failures else "PASS", "failures": failures}
 json.dump(summary, open(os.path.join(OUT, "summary.json"), "w"), indent=2)
 print(json.dumps(summary, indent=2))
