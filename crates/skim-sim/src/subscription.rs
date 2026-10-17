@@ -310,7 +310,9 @@ impl Subscriptions {
                 self.status.write().entry(spec.name.clone()).or_default().error = Some(e);
                 continue;
             }
-            sim.store.watch_address(a);
+            // Not watched until installed: a pending download (failing, oversized, over budget,
+            // backing off) must not track the address, or every BAL write to it would be kept
+            // with no budget check. Installation replays the writes since the download block.
             if let Some(n) = sim.store.complete_storage_len(&a) {
                 // The limit holds for the contract's whole life: slots first written after the
                 // (verified) download count too, and those writes come from verified BALs. Past
@@ -340,6 +342,10 @@ impl Subscriptions {
                             Ok(()) => {
                                 tracing::info!(subscription = %spec.name, address = %a, slots = n, block = at.number, "storage: all downloaded and verified");
                                 None
+                            }
+                            Err(e @ skim_state::StateError::OutOfWindow(_)) => {
+                                // The download took longer than the replay window: download again.
+                                Some(e.to_string())
                             }
                             Err(e) => {
                                 // e.g. the subscribed-key budget: retry later, not every block.

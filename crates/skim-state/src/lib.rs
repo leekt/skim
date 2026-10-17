@@ -907,13 +907,18 @@ impl Store {
     }
 
     /// Installs a contract's whole storage, downloaded and verified at block `at` (keccak-keyed
-    /// slots). The address must already be watched, so writes after `at` are recorded; writes
-    /// between `at` and now that are in the BAL index are replayed here. Counts toward the
+    /// slots). The address isn't watched before this (a pending download keeps nothing): the
+    /// writes between `at` and the head are replayed from the BAL index, which must cover all
+    /// of them, or the download is too old (`OutOfWindow`: download again). Counts toward the
     /// subscribed-key limit as one key per slot.
     pub fn install_complete_storage(&self, at: &BlockRef, a: Address, slots: Vec<(B256, U256)>) -> Result<(), StateError> {
         let mut st = self.inner.write();
         if st.chain.get(&at.number).map(|b| b.hash) != Some(at.hash) {
             return Err(StateError::Reorged { number: at.number, hash: at.hash });
+        }
+        let head = st.head().map_or(at.number, |h| h.number);
+        if head > at.number && st.recent.range(at.number + 1..=head).count() as u64 != head - at.number {
+            return Err(StateError::OutOfWindow(at.number));
         }
         let later: Vec<(u64, StateKey, U256)> = st
             .recent

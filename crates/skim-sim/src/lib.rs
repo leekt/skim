@@ -228,6 +228,7 @@ impl Simulator {
         // misses, and its keys go out in the same wave as the actual misses.
         let mut predicted = None;
         let mut rounds = Vec::new();
+        let mut header_rounds = 0usize;
         let mut exec_us = 0.0;
         let (mut fetched_accounts, mut fetched_storage) = (Vec::new(), Vec::new());
         loop {
@@ -247,7 +248,9 @@ impl Simulator {
                 self.keep_warm_with(&access, retention);
                 return Ok(CallOutcome { result, access, predicted, rounds, exec_us, fetched_accounts, fetched_storage });
             }
-            if let (Mode::Resolve { .. }, Some(input), None) = (mode, &input, &predicted) {
+            if access.has_state_misses()
+                && let (Mode::Resolve { .. }, Some(input), None) = (mode, &input, &predicted)
+            {
                 let (keys, _) = self.predictor.lock().predict(input, &snap);
                 let (mut accts, mut slots) = unknown_split(&snap, &keys);
                 // One predicted wave is capped (keys come nearest-first); the rest, if the call
@@ -294,11 +297,17 @@ impl Simulator {
                 }
                 Mode::Resolve { max_rounds } => max_rounds,
             };
-            if rounds.len() >= max {
-                return Err(SimError::Incomplete(rounds.len()));
+            if rounds.len() + header_rounds >= max {
+                return Err(SimError::Incomplete(rounds.len() + header_rounds));
             }
             if let Some(&lowest) = access.miss_block_hashes.first() {
                 self.resolve_block_hashes(lowest).await;
+            }
+            if !access.has_state_misses() {
+                // Only ancestor headers were missing (eth peers serve them): run again, without
+                // waiting for a SNAP peer. Counted, so failed header lookups stay bounded.
+                header_rounds += 1;
+                continue;
             }
             let mut slots = access.miss_storage.clone();
             let extra = self.predictor.lock().expand(&snap, &slots);

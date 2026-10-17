@@ -22,6 +22,12 @@ pub struct Access {
 }
 
 impl Access {
+    /// Misses that need state (SNAP): accounts, storage, code. Block-hash misses are resolved
+    /// with headers from any eth peer.
+    pub fn has_state_misses(&self) -> bool {
+        !(self.miss_accounts.is_empty() && self.miss_storage.is_empty() && self.miss_code.is_empty())
+    }
+
     pub fn has_misses(&self) -> bool {
         !(self.miss_accounts.is_empty()
             && self.miss_storage.is_empty()

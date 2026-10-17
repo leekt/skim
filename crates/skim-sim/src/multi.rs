@@ -467,9 +467,12 @@ impl Simulator {
             if let Some(&lowest) = access.miss_block_hashes.first() {
                 self.resolve_block_hashes(lowest).await;
             }
-            self.await_state_peers().await?;
-            prefetch::resolve_retained(&self.store, &self.sched, &at, &access.miss_accounts, &access.miss_storage, &access.miss_code, Priority::High, retention)
-                .await;
+            // A SNAP peer only when state is missing; header-only misses just run again.
+            if access.has_state_misses() {
+                self.await_state_peers().await?;
+                prefetch::resolve_retained(&self.store, &self.sched, &at, &access.miss_accounts, &access.miss_storage, &access.miss_code, Priority::High, retention)
+                    .await;
+            }
         }
         Err(SimError::Incomplete(MAX_ROUNDS))
     }
@@ -616,9 +619,12 @@ impl Simulator {
             if let Some(&lowest) = access.miss_block_hashes.first() {
                 self.resolve_block_hashes(lowest).await;
             }
-            self.await_state_peers().await?;
-            prefetch::resolve_retained(&self.store, &self.sched, &at, &access.miss_accounts, &access.miss_storage, &access.miss_code, Priority::High, retention)
-                .await;
+            // A SNAP peer only when state is missing; header-only misses just run again.
+            if access.has_state_misses() {
+                self.await_state_peers().await?;
+                prefetch::resolve_retained(&self.store, &self.sched, &at, &access.miss_accounts, &access.miss_storage, &access.miss_code, Priority::High, retention)
+                    .await;
+            }
         }
         let plain = plain.ok_or(SimError::Incomplete(rounds))?;
         // 2. The traced run on the same, now fully known, state.

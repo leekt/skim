@@ -33,7 +33,9 @@ Gates (exit status nonzero on any):
     >= 95% and cold probes >= 80%, counting skim timeouts and connection failures as unanswered
     (refusing or timing out on everything fails); every required probe kind sampled at least
     its minimum number of times
-  - freshness: outside recovery windows, no more than 2% of the time with skim's head stale:
+  - freshness: in steady state (a disruption starts just before the process is stopped and
+    ends when it has recovered, so scheduled downtime never counts), no more than 2% of the
+    time with skim's head stale:
     its header timestamp more than 3 slots behind the wall clock, or more than 3 blocks behind
     the reference node's head. Sampled every 2 s by a separate thread, so slow probes can't
     delay it, and by head age rather than arrival gaps, so a stream of steadily arriving but
@@ -216,6 +218,48 @@ def is_stale(now, head_ts, skim_n, ref_n):
     return ref_n is not None and skim_n is not None and ref_n - skim_n > STALE_LAG_BLOCKS
 
 
+class Phase:
+    """Shared run phase: steady state, or a disruption (from just before the process is stopped
+    until it has recovered). Recovery time is measured from the relaunch."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.disrupted = True  # the first start is a recovery too
+        self.launched_at = time.time()
+
+    def disrupt(self):
+        with self.lock:
+            self.disrupted, self.launched_at = True, None
+
+    def launched(self):
+        with self.lock:
+            self.launched_at = time.time()
+
+    def recovered(self):
+        with self.lock:
+            took = time.time() - self.launched_at
+            self.disrupted, self.launched_at = False, None
+            return took
+
+    def steady(self):
+        with self.lock:
+            return not self.disrupted
+
+
+class Freshness:
+    """Steady-state time with a stale head, from samples (scheduled disruptions excluded)."""
+
+    def __init__(self):
+        self.stale_s = self.observed_s = 0.0
+
+    def sample(self, dt, steady, now, head_ts, skim_n, ref_n):
+        if not steady:
+            return
+        self.observed_s += dt
+        if is_stale(now, head_ts, skim_n, ref_n):
+            self.stale_s += dt
+
+
 def selftest():
     ok = {"result": "0x01"}
     rev = lambda d: {"error": {"code": 3, "message": "execution reverted", "data": d}}
@@ -249,7 +293,19 @@ def selftest():
     share = sum(is_stale(t + 12 * i, t + 12 * i - 300, 100 + i, 125 + i) for i in range(100)) / 100
     if share <= 0.02:
         bad.append(("steady old stream passes", share))
-    cases = cases + fresh_cases + [None]
+    # Scheduled downtime isn't steady-state staleness; an outage after recovery is.
+    f = Freshness()
+    for i in range(15):  # stopped on purpose (disruption): no head at all
+        f.sample(2, False, t + 2 * i, None, None, 125)
+    for i in range(15):  # recovered, fresh
+        f.sample(2, True, t + 30 + 2 * i, t + 30 + 2 * i - 4, 125, 125)
+    if f.stale_s != 0:
+        bad.append(("scheduled downtime counted as stale", f.stale_s))
+    for i in range(5):  # unexpected outage in steady state
+        f.sample(2, True, t + 60 + 2 * i, None, None, 126)
+    if f.stale_s != 10:
+        bad.append(("unexpected outage not counted", f.stale_s))
+    cases = cases + fresh_cases + [None, None]
     for b in bad:
         print("SELFTEST FAIL", b)
     print(f"selftest: {len(cases) - len(bad)}/{len(cases)} ok")
@@ -264,12 +320,10 @@ counts = {"match": 0, "refused": 0, "WRONG": 0, "ref_unavailable": 0, "skim_tran
 by_kind = {}
 steady = {}  # kind -> [answered, refused] outside recovery windows
 recoveries = []  # per restart: seconds until subscriptions were ready again (None = never)
-restart_at = None  # time of the last restart while recovering
+phase = Phase()
 promo = None  # (address, block it was subscribed at)
 senders_seen = []
 last_n = None
-stale_s = 0.0  # steady-state time with a stale head (sampled by the freshness thread)
-fresh_s = 0.0  # steady-state time the freshness thread observed
 max_head_gap_s = 0.0  # longest wall-clock gap between new heads (reported, not gated)
 steady_s = 0.0
 last_tick = time.time()
@@ -282,13 +336,16 @@ status_log = open(os.path.join(OUT, "status.jsonl"), "a")
 events = open(os.path.join(OUT, "events.jsonl"), "a")
 skim = Skim()
 skim.start("A")
-restart_at = time.time()  # the first start is a recovery too
+phase.launched()
 t_end = time.time() + MINUTES * 60
+
+
+fresh = Freshness()
 
 
 def freshness():
     """Samples head age and lag every FRESH_EVERY_S, independently of the probe loop."""
-    global stale_s, fresh_s, max_head_gap_s
+    global max_head_gap_s
     prev_t, last_hash, last_new = time.time(), None, time.time()
     ref_n, ref_t = None, 0.0
     while time.time() < t_end:
@@ -301,14 +358,11 @@ def freshness():
         now = time.time()
         if h and h["hash"] != last_hash:
             last_hash = h["hash"]
-            max_head_gap_s = max(max_head_gap_s, now - last_new) if restart_at is None else max_head_gap_s
+            steady = phase.steady()
+            max_head_gap_s = max(max_head_gap_s, now - last_new) if steady else max_head_gap_s
             last_new = now
         dt, prev_t = now - prev_t, now
-        if restart_at is not None:
-            continue
-        fresh_s += dt
-        if is_stale(now, int(h["timestamp"], 16) if h else None, int(h["number"], 16) if h else None, ref_n):
-            stale_s += dt
+        fresh.sample(dt, phase.steady(), now, int(h["timestamp"], 16) if h else None, int(h["number"], 16) if h else None, ref_n)
 
 
 threading.Thread(target=freshness, daemon=True).start()
@@ -326,6 +380,9 @@ while time.time() < t_end:
         kind = CHAOS_CYCLE[chaos_n % len(CHAOS_CYCLE)]
         chaos_n += 1
         cfg = ("B" if skim.cfg == "A" else "A") if kind == "switch-config" else skim.cfg
+        if not phase.steady():
+            recoveries.append(None)  # the previous restart never recovered
+        phase.disrupt()  # before the stop: the downtime is scheduled, not steady state
         skim.stop(signal.SIGKILL if kind == "sigkill" else signal.SIGTERM)
         events.write(json.dumps({"t": time.time(), "event": kind, "config": cfg}) + "\n"); events.flush()
         print(f"chaos: {kind} -> config {cfg}", flush=True)
@@ -334,13 +391,11 @@ while time.time() < t_end:
         promo = (senders_seen[-1], None) if senders_seen else None
         promo_from = None
         skim.start(cfg, promo[0] if promo else None)
-        if restart_at is not None:
-            recoveries.append(None)  # the previous restart never recovered
-        restart_at = time.time()
+        phase.launched()
         next_chaos = time.time() + rnd.uniform(6, 12) * 60
     head = rpc(SKIM, "eth_getBlockByNumber", ["latest", False], timeout=5).get("result")
     now = time.time()
-    if restart_at is None:
+    if phase.steady():
         steady_s += now - last_tick
     last_tick = now
     if not head or head["hash"] == last:
@@ -358,11 +413,11 @@ while time.time() < t_end:
     tag = {"blockHash": head["hash"]}
     sub = rpc(SKIM, "skim_subscriptionStatus", [], timeout=5).get("result")
     ready = bool(sub) and all(x.get("ready") for x in sub)
-    recovering = restart_at is not None
+    recovering = not phase.steady()
     if recovering and ready:
-        recoveries.append(time.time() - restart_at)
+        recoveries.append(phase.recovered())
         events.write(json.dumps({"t": time.time(), "event": "recovered", "seconds": recoveries[-1]}) + "\n"); events.flush()
-        restart_at, recovering = None, False
+        recovering = False
     blk = rpc(SKIM, "eth_getBlockByNumber", [head["number"], True], timeout=10).get("result") or {}
     senders = sorted({t["from"] for t in blk.get("transactions", [])})
     if senders:
@@ -421,9 +476,9 @@ if over_limit:
 if RSS_LIMIT_MB and rss_max > RSS_LIMIT_MB:
     failures.append(f"RSS {rss_max:.0f} MB over the {RSS_LIMIT_MB:.0f} MB limit")
 pending_recovery = None
-if restart_at is not None:
+if not phase.steady():
     # Still recovering when the run ended: unknown unless it already exceeded the limit.
-    waited = time.time() - restart_at
+    waited = time.time() - (phase.launched_at or time.time())
     if waited > RECOVERY_LIMIT_S:
         recoveries.append(None)
     else:
@@ -439,7 +494,7 @@ for k, need in REQUIRED_KINDS.items():
         failures.append(f"{k}: {got} steady-state samples (< {need})")
     if not by_kind.get(k, {}).get("match"):
         failures.append(f"{k}: never matched")
-stale_share = stale_s / fresh_s if fresh_s else 1.0
+stale_share = fresh.stale_s / fresh.observed_s if fresh.observed_s else 1.0
 if stale_share > 0.02:
     failures.append(f"head stale (> {STALE_AFTER_S} s old or > {STALE_LAG_BLOCKS} blocks behind the reference) for {stale_share:.1%} of steady-state time")
 slow = [r for r in recoveries if r is None or r > RECOVERY_LIMIT_S]

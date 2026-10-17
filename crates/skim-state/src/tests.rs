@@ -706,3 +706,42 @@ fn archiving_a_long_unchanged_key_keeps_its_value_from_a_known_block() {
     // Coverage starts no earlier than a block whose hash the store still knew.
     assert!(matches!(ar.get_at(&slot(5), 1, blk(1, 0).hash).unwrap(), archive::ArchiveRead::NotCovered { .. }));
 }
+
+// ---- Eighth review: a pending whole-storage download keeps nothing ----------------------------
+
+#[test]
+fn a_failing_whole_storage_download_does_not_accumulate_the_contracts_writes() {
+    // `storage: all` with a budget the download never fits: installation fails every time, and
+    // meanwhile blocks keep writing new slots of the contract. Nothing may be retained for it.
+    let s = Store::new(64);
+    s.set_max_subscribed(2);
+    let h = |i: u64| keccak256(U256::from(i).to_be_bytes::<32>());
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    for n in 2..=40 {
+        let r = s.install_complete_storage(&blk(n - 1, 0), A, (1..=3).map(|i| (h(i), U256::from(i))).collect());
+        assert!(matches!(r, Err(StateError::LimitReached(_))));
+        s.apply_block(blk(n, 0), writes(&[(slot(100 + n), n)])).unwrap();
+    }
+    let z = s.sizes();
+    assert_eq!((z.keys, z.versions, z.complete_slots), (0, 0, 0), "{z:?}");
+    // Once it fits, the writes since the download block are replayed from the BAL index.
+    s.set_max_subscribed(1000);
+    s.install_complete_storage(&blk(30, 0), A, vec![(h(1), U256::from(1))]).unwrap();
+    let at = s.snapshot(&blk(40, 0)).unwrap();
+    assert_eq!(known(&at, slot(135)), Some(35));
+    assert_eq!(known(&at, slot(1)), Some(1));
+    assert_eq!(known(&at, slot(129)), Some(0), "written before the download block: the download's value (absent)");
+}
+
+#[test]
+fn a_download_older_than_the_replay_window_is_refused() {
+    let s = Store::new(16);
+    let h = |i: u64| keccak256(U256::from(i).to_be_bytes::<32>());
+    for n in 1..=400 {
+        s.apply_block(blk(n, 0), writes(&[(slot(n), n)])).unwrap();
+    }
+    let oldest_indexed = *s.inner.read().recent.keys().next().unwrap();
+    let r = s.install_complete_storage(&blk(oldest_indexed - 2, 0), A, vec![(h(1), U256::from(1))]);
+    assert!(matches!(r, Err(StateError::OutOfWindow(_)) | Err(StateError::Reorged { .. })), "{r:?}");
+    assert_eq!(s.complete_storage_len(&A), None);
+}
