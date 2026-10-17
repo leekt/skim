@@ -127,6 +127,8 @@ cargo build --release                     # Rust 1.97 (pinned in rust-toolchain.
 ./target/release/skim run --config examples/uniswap-v3/skim.yaml
 ```
 
+Or with Docker (`docker build -t skim .`; the image's default command is `run --rpc 0.0.0.0:8545 --data-dir /data`). Tagged releases publish Linux and macOS binaries and an image at `ghcr.io/leekt/skim`.
+
 Wait for `state ready` in the log. Then point any Ethereum tooling at `http://127.0.0.1:8545`:
 
 ```js

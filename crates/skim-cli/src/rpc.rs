@@ -679,6 +679,14 @@ impl Rpc {
             "skim_status" => {
                 let z = sim.store.sizes();
                 let peers = sim.sched.transport().net.peers();
+                let b = sim.sched.transport().net.peer_book();
+                let acquisition = json!({
+                    "first_snap_peer_s": b.first_snap.map(|t| t.as_secs_f64()),
+                    "snap_peers_seen": b.snap_peers_seen,
+                    "snap_peers_held_60s": b.snap_peers_held,
+                    "sessions": b.sessions.iter().map(|(c, s, n)| json!({"client": c, "snap": s, "sessions": n})).collect::<Vec<_>>(),
+                    "closes": b.closes.iter().map(|(r, n)| json!({"reason": r, "count": n})).collect::<Vec<_>>(),
+                });
                 Ok(json!({
                     "head": sim.store.head().map(|h| h.number),
                     "store": {
@@ -691,6 +699,7 @@ impl Rpc {
                     "light_client": self.light.as_ref().map(|l| l.status()),
                     "el_peers": peers.len(),
                     "snap_peers": peers.iter().filter(|(_, p)| p.snap1 || p.snap2).count(),
+                    "peer_acquisition": acquisition,
                     "served": self.served_json(),
                     "snap_fetch": {
                         "stats": sim.sched.stats(),
@@ -778,6 +787,18 @@ impl Rpc {
             counter!("skim_snap_peer_answers_total", &labels).absolute(f.ok);
             counter!("skim_snap_peer_errors_total", &labels).absolute(f.errors);
         }
+        let book = sim.sched.transport().net.peer_book();
+        for (client, snap, n) in &book.sessions {
+            counter!("skim_el_sessions_total", "client" => client.clone(), "snap" => snap.to_string()).absolute(*n);
+        }
+        for (reason, n) in &book.closes {
+            counter!("skim_el_session_closes_total", "reason" => reason.clone()).absolute(*n);
+        }
+        if let Some(t) = book.first_snap {
+            gauge!("skim_el_first_snap_peer_seconds").set(t.as_secs_f64());
+        }
+        gauge!("skim_el_snap_peers_seen").set(book.snap_peers_seen as f64);
+        gauge!("skim_el_snap_peers_held").set(book.snap_peers_held as f64);
         let st = sim.sched.stats();
         for (kind, v) in [
             ("jobs", st.jobs), ("requests", st.requests), ("ok", st.ok), ("errors", st.errors), ("failed", st.failed),

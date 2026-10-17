@@ -46,6 +46,11 @@ fn describe() {
     describe_counter!("skim_snap_peer_answers_total", "SNAP answers per peer");
     describe_counter!("skim_snap_peer_errors_total", "SNAP errors per peer");
     describe_counter!("skim_snap_fetch_total", "SNAP fetch scheduler events by kind");
+    describe_counter!("skim_el_sessions_total", "EL sessions by client and whether the peer offers SNAP");
+    describe_counter!("skim_el_session_closes_total", "EL session ends by reason (TooManyPeers = the peer was full)");
+    describe_gauge!("skim_el_first_snap_peer_seconds", Unit::Seconds, "Time from start to the first SNAP-capable session");
+    describe_gauge!("skim_el_snap_peers_seen", "SNAP-capable peers seen this run");
+    describe_gauge!("skim_el_snap_peers_held", "SNAP-capable peers that held a session for at least 60 s");
     describe_gauge!("skim_store_keys", "Store keys by kind (subscribed, on_demand)");
     describe_gauge!("skim_store_bytes", "Store sizes in bytes by kind (code, recent_bals)");
     describe_counter!("skim_store_admissions_refused_total", "Keys refused by max_subscribed_keys");

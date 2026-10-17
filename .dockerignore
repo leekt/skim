@@ -1,0 +1,8 @@
+target
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
+data
+.env
+.git
+examples/node_modules

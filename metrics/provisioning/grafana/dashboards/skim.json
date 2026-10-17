@@ -1275,7 +1275,7 @@
     },
     {
       "type": "row",
-      "title": "EL networking (reth)",
+      "title": "Peer acquisition",
       "id": 26,
       "collapsed": false,
       "gridPos": {
@@ -1283,6 +1283,312 @@
         "w": 24,
         "x": 0,
         "y": 35
+      },
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "First SNAP peer",
+      "description": "Until a SNAP-capable peer connects, state skim doesn't hold can't be fetched (requests wait up to --state-wait).",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "skim_el_first_snap_peer_seconds{instance=~\"$instance\"}",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 30
+              },
+              {
+                "color": "red",
+                "value": 120
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 4,
+        "h": 4
+      },
+      "id": 27,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "SNAP peers seen",
+      "description": "",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "skim_el_snap_peers_seen{instance=~\"$instance\"}",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      },
+      "gridPos": {
+        "x": 4,
+        "y": 36,
+        "w": 4,
+        "h": 4
+      },
+      "id": 28,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "SNAP peers held 60 s",
+      "description": "Many SNAP peers drop skim within a minute because they are full; these stayed. Held peers rank first in the saved list.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "skim_el_snap_peers_held{instance=~\"$instance\"}",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 36,
+        "w": 4,
+        "h": 4
+      },
+      "id": 29,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      }
+    },
+    {
+      "type": "piechart",
+      "title": "Sessions by client (SNAP?)",
+      "description": "",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (client, snap) (skim_el_sessions_total{instance=~\"$instance\"})",
+          "legendFormat": "{{client}} snap={{snap}}",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "pieType": "donut",
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value"
+          ],
+          "showLegend": true
+        },
+        "displayLabels": []
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 36,
+        "w": 6,
+        "h": 8
+      },
+      "id": 30,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Session ends by reason",
+      "description": "TooManyPeers = the peer was full.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (reason) (rate(skim_el_session_closes_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 36,
+        "w": 6,
+        "h": 8
+      },
+      "id": 31,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      }
+    },
+    {
+      "type": "row",
+      "title": "EL networking (reth)",
+      "id": 32,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 44
       },
       "panels": []
     },
@@ -1345,11 +1651,11 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 36,
+        "y": 45,
         "w": 8,
         "h": 8
       },
-      "id": 27,
+      "id": 33,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1508,11 +1814,11 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 36,
+        "y": 45,
         "w": 8,
         "h": 8
       },
-      "id": 28,
+      "id": 34,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1671,11 +1977,11 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 36,
+        "y": 45,
         "w": 8,
         "h": 8
       },
-      "id": 29,
+      "id": 35,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1684,13 +1990,13 @@
     {
       "type": "row",
       "title": "JSON-RPC",
-      "id": 30,
+      "id": 36,
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 44
+        "y": 53
       },
       "panels": []
     },
@@ -1739,11 +2045,11 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 45,
+        "y": 54,
         "w": 8,
         "h": 8
       },
-      "id": 31,
+      "id": 37,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1794,11 +2100,11 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 45,
+        "y": 54,
         "w": 8,
         "h": 8
       },
-      "id": 32,
+      "id": 38,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1849,11 +2155,11 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 45,
+        "y": 54,
         "w": 8,
         "h": 8
       },
-      "id": 33,
+      "id": 39,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2001,11 +2307,11 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 53,
+        "y": 62,
         "w": 24,
         "h": 8
       },
-      "id": 34,
+      "id": 40,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2014,13 +2320,13 @@
     {
       "type": "row",
       "title": "State and addresses",
-      "id": 35,
+      "id": 41,
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 61
+        "y": 70
       },
       "panels": []
     },
@@ -2230,11 +2536,11 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 62,
+        "y": 71,
         "w": 24,
         "h": 10
       },
-      "id": 36,
+      "id": 42,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2285,11 +2591,11 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 72,
+        "y": 81,
         "w": 12,
         "h": 8
       },
-      "id": 37,
+      "id": 43,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2340,11 +2646,11 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 72,
+        "y": 81,
         "w": 12,
         "h": 8
       },
-      "id": 38,
+      "id": 44,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2391,11 +2697,11 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 80,
+        "y": 89,
         "w": 8,
         "h": 8
       },
-      "id": 39,
+      "id": 45,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2442,11 +2748,11 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 80,
+        "y": 89,
         "w": 8,
         "h": 8
       },
-      "id": 40,
+      "id": 46,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2556,11 +2862,11 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 80,
+        "y": 89,
         "w": 8,
         "h": 8
       },
-      "id": 41,
+      "id": 47,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2569,13 +2875,13 @@
     {
       "type": "row",
       "title": "Serving the network",
-      "id": 42,
+      "id": 48,
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 88
+        "y": 97
       },
       "panels": []
     },
@@ -2624,11 +2930,11 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 89,
+        "y": 98,
         "w": 12,
         "h": 8
       },
-      "id": 43,
+      "id": 49,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2679,11 +2985,11 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 89,
+        "y": 98,
         "w": 12,
         "h": 8
       },
-      "id": 44,
+      "id": 50,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2692,13 +2998,13 @@
     {
       "type": "row",
       "title": "Process",
-      "id": 45,
+      "id": 51,
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 97
+        "y": 106
       },
       "panels": []
     },
@@ -2743,11 +3049,11 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 98,
+        "y": 107,
         "w": 8,
         "h": 8
       },
-      "id": 46,
+      "id": 52,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2794,11 +3100,11 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 98,
+        "y": 107,
         "w": 8,
         "h": 8
       },
-      "id": 47,
+      "id": 53,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2854,11 +3160,11 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 98,
+        "y": 107,
         "w": 8,
         "h": 8
       },
-      "id": 48,
+      "id": 54,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"

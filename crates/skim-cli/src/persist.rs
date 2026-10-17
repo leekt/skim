@@ -50,12 +50,14 @@ pub fn spawn_peer_saver(p: Arc<Persist>, net: ElNet) {
             if peers.is_empty() {
                 continue;
             }
-            // This run's peers first, then the previously saved ones (peers that were full today
-            // may have room next time), up to MAX_SAVED_PEERS.
+            // This run's peers, best first (held SNAP sessions lead), then previously saved ones
+            // not judged this run, up to MAX_SAVED_PEERS. Peers this run found useless (crawlers,
+            // only ever dropped us) are left out, even if an older list had them.
+            let cooled: std::collections::HashSet<_> = net.cooled_peers().into_iter().collect();
             let mut seen = std::collections::HashSet::new();
             let text: String = peers
                 .into_iter()
-                .chain(load_peers(&p))
+                .chain(load_peers(&p).into_iter().filter(|(id, _)| !cooled.contains(id)))
                 .filter(|(id, _)| seen.insert(*id))
                 .take(MAX_SAVED_PEERS)
                 .map(|(id, a)| format!("{id}@{a}\n"))

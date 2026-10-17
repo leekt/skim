@@ -144,6 +144,18 @@ ts("SNAP fetch scheduler", [target(f'sum by (kind) (rate(skim_snap_fetch_total{{
    desc="failed = a key no peer could serve in time (the request got -32002).")
 next_row(8)
 
+# ---- Peer acquisition -------------------------------------------------------------------------
+row("Peer acquisition")
+stat("First SNAP peer", f"skim_el_first_snap_peer_seconds{{{I}}}", "s", x=0, w=4, decimals=0, thresholds=green_amber_red(30, 120),
+     desc="Until a SNAP-capable peer connects, state skim doesn't hold can't be fetched (requests wait up to --state-wait).")
+stat("SNAP peers seen", f"skim_el_snap_peers_seen{{{I}}}", x=4, w=4)
+stat("SNAP peers held 60 s", f"skim_el_snap_peers_held{{{I}}}", x=8, w=4, thresholds=red_green(1),
+     desc="Many SNAP peers drop skim within a minute because they are full; these stayed. Held peers rank first in the saved list.")
+pie("Sessions by client (SNAP?)", f'sum by (client, snap) (skim_el_sessions_total{{{I}}})', "{{client}} snap={{snap}}", x=12, w=6)
+ts("Session ends by reason", [target(f"sum by (reason) (rate(skim_el_session_closes_total{{{I}}}[$__rate_interval]))", "{{reason}}")], "ops", x=18, w=6, stack=True,
+   desc="TooManyPeers = the peer was full.")
+next_row(8)
+
 # ---- EL networking (reth's own metrics) -----------------------------------------------------
 row("EL networking (reth)")
 ts("Connections", [

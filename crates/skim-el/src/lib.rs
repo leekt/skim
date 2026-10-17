@@ -4,6 +4,7 @@
 //! callers can measure per-peer latency and availability instead of going through reth's
 //! peer-selecting fetch client.
 
+pub mod book;
 pub mod serve;
 mod snap1;
 
@@ -95,9 +96,8 @@ pub struct ElNet {
     timeout: Duration,
     serve: serve::Source,
     serve_stats: Arc<serve::ServeStats>,
-    /// Peers seen this run that we dialed (so the address is their listen address) and that
-    /// speak eth/69+: (address, offers SNAP). Saved for the next start.
-    dialable: Arc<RwLock<HashMap<PeerId, (std::net::SocketAddr, bool)>>>,
+    /// What each peer turned out to be worth (sessions, SNAP, drops); ranks the saved list.
+    book: Arc<RwLock<book::PeerBook>>,
     /// Set once the owner reports its own head ([`Self::set_head`]); the poller then stops.
     external_head: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -171,7 +171,7 @@ impl ElNet {
             serve: Default::default(),
             serve_stats: Default::default(),
             external_head: Default::default(),
-            dialable: Default::default(),
+            book: Default::default(),
         };
         tokio::spawn(serve::run(req_rx, net.serve.clone(), net.serve_stats.clone()));
         net.spawn_tracker();
@@ -181,7 +181,8 @@ impl ElNet {
 
     fn spawn_tracker(&self) {
         let peers = self.peers.clone();
-        let (handle, dialable) = (self.handle.clone(), self.dialable.clone());
+        let (handle, book) = (self.handle.clone(), self.book.clone());
+        book.write().start(Instant::now());
         let mut events = self.handle.event_listener();
         tokio::spawn(async move {
             while let Some(ev) = events.next().await {
@@ -200,16 +201,17 @@ impl ElNet {
                             .collect();
                         tracing::info!(peer = %info.peer_id, client = %info.client_version,
                             eth = %info.version, snap2, caps = caps.join(","), "session");
+                        let snap = caps.iter().any(|c| c.starts_with("snap/"));
+                        book.write().on_session(info.peer_id, &info.client_version, snap, Instant::now());
                         if info.version as u8 >= 69 && !info.client_version.starts_with("enrscout") {
                             // Only outgoing sessions show the peer's listen address.
-                            let snap = caps.iter().any(|c| c.starts_with("snap/"));
-                            let (handle, dialable, id) = (handle.clone(), dialable.clone(), info.peer_id);
+                            let (handle, book, id) = (handle.clone(), book.clone(), info.peer_id);
                             tokio::spawn(async move {
                                 use reth_network_api::Peers;
                                 if let Ok(Some(p)) = handle.get_peer_by_id(id).await
                                     && !p.direction.is_incoming()
                                 {
-                                    dialable.write().insert(id, (p.remote_addr, snap));
+                                    book.write().on_addr(id, p.remote_addr);
                                 }
                             });
                         }
@@ -231,6 +233,8 @@ impl ElNet {
                         if let Some(p) = peers.write().remove(&peer_id) {
                             tracing::info!(peer = %peer_id, client = %p.client, ?reason,
                                 up_s = p.connected_at.elapsed().as_secs(), "session closed");
+                            let why = reason.map(|r| format!("{r:?}"));
+                            book.write().on_close(peer_id, p.connected_at.elapsed(), why.as_deref());
                         }
                     }
                     _ => {}
@@ -557,11 +561,20 @@ impl ElNet {
 
     /// Connected peers worth reconnecting to after a restart (real clients on eth/69+):
     /// `(node id, address)`.
-    /// eth/69+ peers seen this run at a dialable address, SNAP-capable ones first.
+    /// Peers worth saving for the next start, best first: SNAP peers that held a session,
+    /// then other SNAP peers, then the rest; crawlers and peers that only dropped us are out.
     pub fn good_peers(&self) -> Vec<(PeerId, std::net::SocketAddr)> {
-        let mut v: Vec<_> = self.dialable.read().iter().map(|(id, (a, snap))| (!*snap, *id, *a)).collect();
-        v.sort();
-        v.into_iter().map(|(_, id, a)| (id, a)).collect()
+        self.book.read().ranked().into_iter().map(|(id, a, _)| (id, a)).collect()
+    }
+
+    /// Peers seen this run that are not worth a saved slot.
+    pub fn cooled_peers(&self) -> Vec<PeerId> {
+        self.book.read().cooled()
+    }
+
+    /// Peer acquisition so far: sessions by client, close reasons, time to the first SNAP peer.
+    pub fn peer_book(&self) -> book::BookSummary {
+        self.book.read().summary()
     }
 
     /// Dials previously good peers (their addresses may be stale; failed dials are harmless).

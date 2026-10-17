@@ -39,6 +39,7 @@
 
 | Row | Panels |
 |---|---|
+| Peer acquisition | time to the first SNAP peer, SNAP peers seen and held (≥ 60 s), sessions by client, session ends by reason |
 | Overview | head block and its age, block arrival P50, EL / SNAP / CL peers, subscribed and on-demand keys, RSS, uptime |
 | Blocks | arrival after slot start (P50/P90/P99 and a heatmap), head block |
 | Peers | EL and CL clients, peer counts, SNAP latency / answers / errors per peer, fetch-scheduler events |
@@ -47,6 +48,16 @@
 | State and addresses | the addresses your calls read (pinned / partly pinned / on demand, keys fetched), call and fetch rates per address, store size, subscription readiness |
 | Serving the network | requests skim answered for other peers, and items sent |
 | Process | CPU, RSS, file descriptors, threads |
+
+## Alerts
+`provisioning/grafana/alerting/skim-alerts.yaml` provisions four rules. They show in Grafana under **Alerting**; add a contact point there (Slack, email, …) to be notified.
+
+| Alert | Fires when |
+|---|---|
+| No SNAP state peers | 0 SNAP peers for 5 min: state skim doesn't hold can't be fetched |
+| Head behind | the head is over 3 slots old for 2 min, or the node stopped reporting |
+| Subscription not ready | a subscription isn't ready for 5 min |
+| Requests refused | over 10% of requests answered `-32002` for 10 min |
 
 For a ready-to-paste `skim.yaml` block covering the hot addresses that aren't pinned, call `skim_dashboard` (JSON-RPC) and read `.result.suggestion`.
 
@@ -59,6 +70,9 @@ For a ready-to-paste `skim.yaml` block covering the hot addresses that aren't pi
 | `skim_rpc_request_duration_seconds` | histogram | `method` |
 | `skim_rpc_requests_total` | counter | `method`, `outcome` (`ok`, `reverted`, `unavailable`, `error`) |
 | `skim_peers` | gauge | `layer` (`el`, `cl`) |
+| `skim_el_sessions_total` | counter | `client`, `snap` |
+| `skim_el_session_closes_total` | counter | `reason` (`TooManyPeers` = the peer was full) |
+| `skim_el_first_snap_peer_seconds`, `skim_el_snap_peers_seen`, `skim_el_snap_peers_held` | gauge | |
 | `skim_snap_peers` | gauge | |
 | `skim_peer_clients` | gauge | `layer`, `client` |
 | `skim_snap_peer_latency_ms`, `skim_snap_peer_inflight` | gauge | `peer`, `client` |

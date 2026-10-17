@@ -1,0 +1,100 @@
+# Alert rules for skim (Grafana unified alerting). They show in Grafana under Alerting; add a
+# contact point there (or provision one next to this file) to get notified.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: skim
+    folder: skim
+    interval: 1m
+    rules:
+      - uid: skim-no-snap-peers
+        title: No SNAP state peers
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "min by (instance) (skim_snap_peers)", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              refId: C
+              conditions: [{ evaluator: { type: lt, params: [1] } }]
+        for: 5m
+        noDataState: NoData
+        execErrState: Error
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }} has no SNAP state peer"
+          description: State skim doesn't hold can't be fetched; such requests wait (--state-wait) and then fail with -32002. Pin a peer with --trusted-peer.
+      - uid: skim-head-stale
+        title: Head behind
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "max by (instance) (skim_head_age_seconds)", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              refId: C
+              conditions: [{ evaluator: { type: gt, params: [36] } }]
+        for: 2m
+        noDataState: Alerting
+        execErrState: Error
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.instance }} head is more than 3 slots old"
+          description: skim isn't receiving or applying consensus gossip (check CL peers).
+      - uid: skim-subscription-not-ready
+        title: Subscription not ready
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "min by (instance, name) (skim_subscription_ready)", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              refId: C
+              conditions: [{ evaluator: { type: lt, params: [1] } }]
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning }
+        annotations:
+          summary: "Subscription {{ $labels.name }} on {{ $labels.instance }} is not ready"
+          description: Its state isn't complete at the head; see skim_subscriptionStatus for missing keys or the error.
+      - uid: skim-refusals
+        title: Requests refused
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: 'sum by (instance) (rate(skim_rpc_requests_total{outcome="unavailable"}[5m])) / sum by (instance) (rate(skim_rpc_requests_total[5m]))'
+              instant: true
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              refId: C
+              conditions: [{ evaluator: { type: gt, params: [0.1] } }]
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }} refuses over 10% of requests (-32002)"
+          description: State or data no peer could serve. Usually missing SNAP peers, or requests outside the window.
