@@ -22,7 +22,7 @@
 
 **skim** is an application-specific Ethereum state client. You declare the state your app cares about: accounts, storage slots, or whole simulations. skim keeps exactly that state current, straight from the Ethereum P2P network, and runs your `eth_call`s locally against it in milliseconds. Anything else is fetched on demand, with Merkle proofs verified, only when a request needs it.
 
-There is no full node, no RPC provider, and no block re-execution. The state follows the chain through Glamsterdam's [block-level access lists](https://eips.ethereum.org/EIPS/eip-7928) (BALs).
+You don't need to run a full node or use an external Ethereum RPC provider. The state follows the chain without block re-execution, through Glamsterdam's [block-level access lists](https://eips.ethereum.org/EIPS/eip-7928) (BALs).
 
 ```console
 $ skim run --config skim.yaml          # follows Sepolia, serves JSON-RPC on :8545
@@ -44,11 +44,32 @@ skim builds on that:
 | **State it has never seen** | snap/1 + snap/2 point lookups at the parent root, **verified against the state root with Merkle proofs**, then brought to the head by replaying the BAL |
 | **Execution** | revm with Amsterdam rules over a per-key MVCC store |
 
+## State age, history, and backfill limits
+
+**State written before Glamsterdam can still be fetched at today's head, even if it has never changed since.** Its current value remains in the state trie. skim fetches it through SNAP, verifies its Merkle proof against a recent state root, and applies any later BAL writes to reach the head. The key does **not** need to appear in a recent BAL.
+
+The age of a value and the age of the block you want to query are different:
+
+| What you want | Can skim do it? | Why |
+|---|---|---|
+| Read today's value of an old account or slot, including one last changed before Glamsterdam | **Yes**, when a SNAP peer can serve the required state | SNAP supplies current state regardless of when it was written. |
+| Read an old block already covered by your selective archive | **Yes**, while you keep the archive | Archived coverage does not expire with age; the values and headers are on disk. |
+| Backfill state from before you subscribed, but after Glamsterdam | **Conditionally** | Peers must supply a complete, verified chain of headers and BALs for the scan. Each key gets its own coverage range. |
+| Start today and recover months or years of post-Glamsterdam state history | **Only if peers still serve all the required BALs** | Ordinary peers can prune old BALs. Increasing `--archive-backfill` cannot recreate missing data. |
+| Read state at a block before Glamsterdam | **No**, in the current implementation | Those blocks have no BALs to reconstruct history from. A current-state proof does not prove an earlier value. |
+| Run a historical `eth_call` that needs an uncovered key | **No** | Every state dependency must be available in the archive. Missing history returns `-32002`; it is never guessed. |
+
+**Backfill cannot undo a write.** If a key has no writes throughout the scanned interval, including its known base block, its known value can extend back to the scan's start. If there are writes, coverage starts at the earliest recovered write: BALs contain new values, not the values they replaced.
+
+Peers must retain BALs for at least 3,533 epochs (about 16 days), but may prune them afterward ([EIP-7928](https://eips.ethereum.org/EIPS/eip-7928#engine-api)). This limits new backfills and healing offline gaps; it does **not** expire history already archived locally. `--archive-backfill N` targets N blocks before the archive's first block. The current implementation does not automatically clamp that target to the fork or peers' retained history, so an unavailable range can keep failing and retrying. See the [archive guide](docs/guide/archive.md) for configuration and coverage details.
+
+**External services:** state reads and backfills use Ethereum P2P peers, with no external Ethereum JSON-RPC fallback. Consensus bootstrap separately defaults to an HTTP checkpoint endpoint when neither `--checkpoint` nor a previously verified checkpoint is available; providing a trusted checkpoint avoids that HTTP request. The [trust model](#trust-model) still applies.
+
 ## The model: subscribed state, on-demand everything else
 
 | | **Subscribed** (your state watchlist) | **On demand** |
 |---|---|---|
-| What | Accounts, slots and simulations you declare | Everything else |
+| What | Accounts, slots and simulations you declare | Other state at supported blocks |
 | Freshness | Applied from every block's BAL | Fetched for the requested block; cached for a TTL |
 | Hot path | No network. Target: a few ms | One verified fetch wave, then local |
 | Guarantee | **Ready** = head BAL applied **and** every required key known. Otherwise reported as not ready. | Best effort, and never wrong: unknown state is never treated as zero |
@@ -160,7 +181,7 @@ The dashboard shows:
 <img src="assets/grafana-dashboard.png" alt="skim Grafana dashboard" width="100%">
 
 **Next steps:**
-- **[Examples](examples):** Uniswap V3, Uniswap V4, sending transactions (all with viem), and ENS resolution for the [bigname](examples/bigname) indexer.
+- **[Examples](examples):** Uniswap V3, Uniswap V4, sending transactions (all with viem), and ENS resolution for the [bigname](examples/bigname) indexer, and [smallname](examples/smallname): bigname's ENS API from skim alone.
 - **[Docs](docs):** [getting started](docs/guide/getting-started.md), [how it works](docs/guide/how-it-works.md), [configuration](docs/guide/configuration.md), [JSON-RPC](docs/guide/json-rpc.md), [archive](docs/guide/archive.md), [trust](docs/guide/trust-and-correctness.md), [troubleshooting](docs/guide/troubleshooting.md).
 
 **Supported methods:**
@@ -200,7 +221,7 @@ Consensus light-client verification is on the roadmap. Until then, skim trusts t
 - [x] M3: subscriptions (subscribed vs on-demand state)
 - [ ] Resource benchmark vs a Nethermind full node (same workload, same block hashes)
 - [x] **M4: selective state archiving.** `retention: archive` keeps every BAL-written version of subscribed state on disk. `eth_getStorageAt` and `eth_call` then work at historical blocks for what you subscribed to, from the block each key became known (90/90 and 51/51 historical reads matched a reference archive node, restart gaps healed from eth/71; see [M4](docs/experiments/m4-archive.md)). *Sync and archive only what you need.*
-- [x] **M4.2: backfill from retained BALs.** `--archive-backfill N` extends archived history up to about 2 weeks before a subscription existed. Unchanged keys are covered for the whole range; written keys are covered from their first write. Live: 102 historical reads matched a reference archive node, 3 were correctly refused, 0 were wrong.
+- [x] **M4.2: backfill from retained BALs.** `--archive-backfill N` targets N blocks before the archive's first block, subject to [BAL availability and per-key coverage](#state-age-history-and-backfill-limits). Unchanged keys can be covered for the whole scan; written keys are covered from their earliest recovered write. Live: 102 historical reads matched a reference archive node, 3 were correctly refused, 0 were wrong.
 - [x] **M5:** generalized learned patterns (exact args + amount buckets) with key/byte bounds. The V3 predictor is configurable in `skim run`: calls that needed the network fell from 51 to 19 out of 400. Added `eth_sendRawTransaction`, receipts and `eth_getLogs`, all identical to a reference node in every check ([M5](docs/experiments/m5-predictors-and-chain-data.md)).
 - [x] `storage: all`: a contract's whole storage, downloaded and verified against its storage root, then kept current from BALs (Uniswap V3 pool: 3,677 slots; 29/29 sampled slots identical to a reference node). WebSocket JSON-RPC: `newHeads`, `logs`, and `skim_subscriptions` pushes with every block's `on_block` results
 - [x] **M6: correctness and bounds.** Review fixes with regression tests. 2 h chaos soak (kills, restarts, key-set switches): 3,465 matches, 23 refusals, 0 wrong. Verified restart snapshots, warm `eth_call` 3× faster ([M6](docs/experiments/m6-correctness-and-bounds.md))

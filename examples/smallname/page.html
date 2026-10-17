@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>smallname</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --fg: #1b1b1a; --muted: #6b6b66; --line: #e2e1dc; --card: #fff; --accent: #2f5bea; --ok: #1f7a3a; --bad: #b3261e;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141413; --fg: #ecebe6; --muted: #9b9a93; --line: #2c2b28; --card: #1c1b19; --accent: #7d9bff; --ok: #6cc08b; --bad: #ff8a80; color-scheme: dark; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 16px; }
+  h1 { font-size: 20px; margin: 0; }
+  .status { color: var(--muted); font-size: 13px; }
+  .status b { color: var(--fg); font-weight: 600; }
+  form { display: flex; gap: 8px; flex-wrap: wrap; }
+  input[type=text] { flex: 1 1 280px; min-width: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); font: inherit; }
+  button { padding: 10px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); font: inherit; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; }
+  .tabs button { padding: 6px 10px; font-size: 13px; }
+  .tabs button[aria-pressed=true] { border-color: var(--accent); color: var(--accent); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; }
+  .meta { color: var(--muted); font-size: 12px; margin-bottom: 8px; display: flex; flex-wrap: wrap; gap: 4px 14px; }
+  .grid { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; }
+  .grid div:nth-child(odd) { color: var(--muted); }
+  .mono, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; word-break: break-all; }
+  pre { margin: 0; white-space: pre-wrap; max-height: 520px; overflow: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  .tablewrap { overflow-x: auto; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin-top: 8px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>smallname</h1>
+    <span class="status" id="status">loading status…</span>
+  </header>
+  <form id="f">
+    <input type="text" id="q" placeholder="name (nick.eth), address (0x…) or search term" autocomplete="off" spellcheck="false">
+    <button class="primary" type="submit">Look up</button>
+  </form>
+  <div class="tabs" id="tabs"></div>
+  <div id="out"></div>
+</div>
+<script>
+const API = location.origin.startsWith("http") ? location.origin : "";
+const TABS = {
+  name: [["profile", (q) => `/v1/names/${q}?include=counts`], ["records", (q) => `/v1/names/${q}/records?include=inventory`], ["subnames", (q) => `/v1/names/${q}/subnames`], ["history", (q) => `/v1/names/${q}/history?include=data`]],
+  address: [["names", (q) => `/v1/addresses/${q}/names`], ["primary name", (q) => `/v1/addresses/${q}/primary-name`], ["resolves to", (q) => `/v1/addresses/${q}/names?relation=resolves_to`], ["history", (q) => `/v1/addresses/${q}/history?include=data`]],
+  search: [["search", (q) => `/v1/search?q=${encodeURIComponent(q)}`], ["expiring (30 days)", () => { const t = Math.floor(Date.now() / 1000); return `/v1/names?namespace=ens&expires_after=${t}&expires_before=${t + 30 * 86400}`; }]],
+};
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const kind = (q) => (/^0x[0-9a-fA-F]{40}$/.test(q) ? "address" : q.includes(".") ? "name" : "search");
+const when = (s) => (s ? new Date(Number(s) * 1000).toISOString().slice(0, 10) : "–");
+
+async function status() {
+  try {
+    const r = await (await fetch(API + "/v1/status")).json();
+    const c = Object.values(r.data.chains)[0];
+    $("status").innerHTML = `<b class="${r.data.status === "ready" ? "ok" : "bad"}">${esc(r.data.status)}</b> · head ${c.latest_block} · indexed ${c.indexed_block} · ${c.index.events.toLocaleString()} events · ${c.index.names.toLocaleString()} names`;
+  } catch (e) {
+    $("status").textContent = "status unavailable";
+  }
+}
+
+function render(tab, j, ms) {
+  if (j.error) return `<div class="card"><b class="bad">${esc(j.error.code)}</b> ${esc(j.error.message)}</div>`;
+  const asOf = j.meta?.as_of ? Object.values(j.meta.as_of)[0] : null;
+  let body = "";
+  const d = j.data;
+  if (tab === "profile") {
+    const rows = [["owner", d.owner], ["manager", d.manager], ["status", d.status], ["authority", d.authority], ["expires", when(d.expires_at)], ["grace ends", when(d.grace_ends_at)], ["registered", when(d.registered_at)], ["resolver", d.resolver?.address], ["address (60)", d.primary_address], ["subnames", d.subname_count]];
+    for (const [k, v] of Object.entries(d.records?.texts ?? {})) rows.push([`text:${k}`, v]);
+    for (const [k, v] of Object.entries(d.records?.addresses ?? {})) if (k !== "60") rows.push([`addr:${k}`, v]);
+    if (d.records?.contenthash) rows.push(["contenthash", d.records.contenthash]);
+    body = `<div class="grid">${rows.map(([k, v]) => `<div>${esc(k)}</div><div class="mono">${esc(v ?? "–")}</div>`).join("")}</div>`;
+  } else if (Array.isArray(d)) {
+    if (!d.length) body = `<div class="meta">no results</div>`;
+    else if ("type" in d[0]) body = table(["block", "type", "name", "kind", "tx"], d.map((e) => [e.block_number, e.type, e.name, e.kind ?? "", e.transaction_hash?.slice(0, 12) + "…"]));
+    else body = table(["name", "owner", "status", "expires", "relations"], d.map((r) => [r.name, r.owner, r.status, when(r.expires_at), (r.relations ?? []).join(", ") + (r.is_primary ? " · primary" : "")]));
+  } else if (tab === "primary name") {
+    body = `<div class="grid"><div>verified</div><div class="mono">${esc(d.verification?.name ?? d.verification?.status)}</div></div>`;
+  } else if (tab === "records") {
+    body = table(["key", "status", "value"], Object.entries(d.records).map(([k, v]) => [k, v.status, v.value ?? ""]));
+  }
+  const more = j.page?.next_cursor ? ` · more results (cursor)` : "";
+  return `<div class="card"><div class="meta"><span>${ms} ms round trip</span>${j.meta?.smallname_ms != null ? `<span>${j.meta.smallname_ms} ms server</span>` : ""}${asOf ? `<span>as of block ${asOf.block_number}</span>` : ""}${more}</div>${body}
+    <details><summary>JSON</summary><pre>${esc(JSON.stringify(j, null, 2))}</pre></details></div>`;
+}
+const table = (h, rows) => `<div class="tablewrap"><table><tr>${h.map((x) => `<th>${esc(x)}</th>`).join("")}</tr>${rows.map((r) => `<tr>${r.map((x) => `<td class="mono">${esc(x)}</td>`).join("")}</tr>`).join("")}</table></div>`;
+
+let current = null;
+async function show(q, tab) {
+  const tabs = TABS[kind(q)];
+  tab = tab ?? tabs[0][0];
+  current = { q, tab };
+  $("tabs").innerHTML = tabs.map(([t]) => `<button type="button" aria-pressed="${t === tab}" data-t="${esc(t)}">${esc(t)}</button>`).join("");
+  $("out").innerHTML = `<div class="card meta">loading…</div>`;
+  const path = tabs.find(([t]) => t === tab)[1](q);
+  const t0 = performance.now();
+  let j;
+  try {
+    j = await (await fetch(API + path)).json();
+  } catch (e) {
+    j = { error: { code: "network", message: e.message } };
+  }
+  if (current.q !== q || current.tab !== tab) return;
+  $("out").innerHTML = render(tab, j, Math.round(performance.now() - t0)) + `<div class="meta mono">GET ${esc(path)}</div>`;
+  history.replaceState(null, "", `#${encodeURIComponent(q)}`);
+}
+$("tabs").addEventListener("click", (e) => { const t = e.target.dataset?.t; if (t && current) show(current.q, t); });
+$("f").addEventListener("submit", (e) => { e.preventDefault(); const q = $("q").value.trim(); if (q) show(q); });
+const initial = decodeURIComponent(location.hash.slice(1)) || "nick.eth";
+$("q").value = initial;
+show(initial);
+status();
+setInterval(status, 12000);
+</script>
+</body>
+</html>

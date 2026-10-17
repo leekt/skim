@@ -8,7 +8,8 @@
     "v4": "node uniswap-v4/quote.mjs",
     "send": "node send-transaction/send.mjs",
     "ws": "node websocket/watch.mjs",
-    "ens": "node bigname/ens.mjs"
+    "ens": "node bigname/ens.mjs",
+    "smallname": "node --experimental-sqlite --no-warnings smallname/smallname.mjs"
   },
   "dependencies": {
     "viem": "2.57.1"
