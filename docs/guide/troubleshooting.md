@@ -17,6 +17,14 @@ To get peers faster:
 - **Keep `--data-dir`** (the default; not `--ephemeral`). skim saves the peers it dialed and re-dials them on start, SNAP-capable ones first. Those peers are often full, though, so this sometimes saves minutes and sometimes doesn't.
 - **Pin a peer you run** with `--trusted-peer`.
 
+**What's happening with peers:** `skim_status.peer_acquisition` (or the Grafana "Peer acquisition" row) shows:
+- time to the first SNAP peer
+- SNAP-capable peers seen, and how many stayed at least 60 s
+- sessions by client
+- why sessions ended (`TooManyPeers` = the peer was full)
+
+On Sepolia about half of the SNAP-capable peers drop new connections within a minute because they are full. skim saves the peers that stayed, so the next start dials them first.
+
 ### No `state ready` lines
 skim isn't receiving consensus gossip. Check:
 - **Outbound UDP and TCP to the CL port range.** Some networks block discv5 (UDP).

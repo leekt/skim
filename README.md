@@ -205,6 +205,7 @@ Consensus light-client verification is on the roadmap. Until then, skim trusts t
 - [x] `storage: all`: a contract's whole storage, downloaded and verified against its storage root, then kept current from BALs (Uniswap V3 pool: 3,677 slots; 29/29 sampled slots identical to a reference node). WebSocket JSON-RPC: `newHeads`, `logs`, and `skim_subscriptions` pushes with every block's `on_block` results
 - [x] **M6: correctness and bounds.** Review fixes with regression tests. 2 h chaos soak (kills, restarts, key-set switches): 3,465 matches, 23 refusals, 0 wrong. Verified restart snapshots, warm `eth_call` 3× faster ([M6](docs/experiments/m6-correctness-and-bounds.md))
 - [x] Serving the network: recent headers, bodies, receipts and BALs (eth/69–71, snap/2), bytecode, and payload envelopes by range/root (consensus), each re-checked against its header before it is sent ([M6](docs/experiments/m6-correctness-and-bounds.md#serving-the-network))
+- [x] **M7: regression gates.** Review findings each have a deterministic test, in CI on every push. A soak gates on availability and recovery as well as wrong answers, and exercises storage-mode transitions on purpose. Also: peer-acquisition tracking with a ranked saved-peer list, parallel restart catch-up (655 blocks in ~9 s), Grafana alerts, release binaries and a container image ([M7](docs/experiments/m7-gates-and-acquisition.md))
 - [ ] Consensus light-client verification: implemented and unit-tested, waiting on consensus clients to serve Gloas light-client data
 - [ ] Mainnet once Glamsterdam ships there
 
