@@ -25,10 +25,6 @@ Items are removed from this file when they're done, and the commit that closes o
 10. **Peer-request counts** for request coalescing and completion-order fetching: metrics, and
     before/after numbers.
 
-## Streams and modules
-12. **Export separate from retention:** a module can receive changes for keys it doesn't make skim
-    keep in memory.
-
 ## smallname
 16. **Unsupported routes:** permissions by `name` / `registration_id` (needs `TokenResource`
     resource ids indexed), resolver `links` / `roles`, diagnostics, Basenames (another chain).

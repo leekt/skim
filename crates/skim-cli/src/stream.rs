@@ -210,7 +210,7 @@ mod tests {
     }
 
     fn req(cursor: Option<BlockId>, recent: Vec<BlockId>, from_block: Option<u64>) -> Request {
-        Request { cursor, recent, from_block, filters: vec![Filter::new().address(EMITTER)], max_blocks: Some(64), wait_ms: Some(0) }
+        Request { cursor, recent, from_block, filters: vec![Filter::new().address(EMITTER)], bal: None, max_blocks: Some(64), wait_ms: Some(0) }
     }
 
     fn id(number: u64, hash: B256) -> BlockId {
@@ -238,13 +238,13 @@ mod tests {
         // Fork A: 100..=110. The module applied up to A105.
         let cd = ChainData::offline(2048);
         let a = extend(&cd, 100, 110, B256::repeat_byte(0x99), 0xa);
-        let r = next(&cd, || Some(110), None, req(None, vec![], Some(100))).await.unwrap();
+        let r = next(&cd, || Some(110), tokio::sync::broadcast::channel(1).1, None, req(None, vec![], Some(100))).await.unwrap();
         assert!(applied(&r).iter().all(|(_, _, t)| t == &vec![0xa]), "before the reorg: fork A");
 
         // Reorg at 104: B104 (child of A103) .. B112 replace A104..A110.
         let b = extend(&cd, 104, 112, a[3], 0xb);
         let recent = vec![id(105, a[5]), id(104, a[4]), id(103, a[3]), id(100, a[0])];
-        let r = next(&cd, || Some(112), None, req(Some(id(105, a[5])), recent, None)).await.unwrap();
+        let r = next(&cd, || Some(112), tokio::sync::broadcast::channel(1).1, None, req(Some(id(105, a[5])), recent, None)).await.unwrap();
         let events = r["events"].as_array().unwrap();
         assert_eq!(events[0]["type"], "rewind", "{r}");
         assert_eq!(events[0]["to"]["number"], 103, "to the newest recent block still on the chain");
@@ -263,7 +263,7 @@ mod tests {
         let a = extend(&cd, 100, 110, B256::repeat_byte(0x99), 0xa);
         extend(&cd, 104, 112, a[3], 0xb);
         // Everything the module reports is on the abandoned fork.
-        let r = next(&cd, || Some(112), None, req(Some(id(106, a[6])), vec![id(105, a[5]), id(104, a[4])], None)).await;
+        let r = next(&cd, || Some(112), tokio::sync::broadcast::channel(1).1, None, req(Some(id(106, a[6])), vec![id(105, a[5]), id(104, a[4])], None)).await;
         let Err(DataError::Unavailable(m)) = r else { panic!("expected a refusal, got {r:?}") };
         assert!(m.contains("not on the chain"), "{m}");
     }
@@ -273,7 +273,7 @@ mod tests {
         // Head-only (no history store): logs cover the in-memory window, 100..=110.
         let cd = ChainData::offline(2048);
         extend(&cd, 100, 110, B256::repeat_byte(0x99), 0xa);
-        let r = next(&cd, || Some(110), None, req(None, vec![], Some(50))).await.unwrap();
+        let r = next(&cd, || Some(110), tokio::sync::broadcast::channel(1).1, None, req(None, vec![], Some(50))).await.unwrap();
         let e = &r["events"][0];
         assert_eq!((e["type"].as_str(), e["from"].as_u64(), e["to"].as_u64()), (Some("gap"), Some(50), Some(99)), "{r}");
         assert_eq!(applied(&r).first().map(|b| b.0), Some(100));
