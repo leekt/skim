@@ -126,7 +126,8 @@ impl<V: Clone> Cache<V> {
 }
 
 pub struct ChainData {
-    net: ElNet,
+    /// The EL network. `None` only in tests: no peers, so everything comes from what's held.
+    net: Option<ElNet>,
     inner: RwLock<Inner>,
     receipts: Mutex<Cache<Arc<Vec<Receipt>>>>,
     bodies: Mutex<Cache<Arc<Vec<Bytes>>>>,
@@ -228,6 +229,25 @@ fn tx_hashes(raw: &[Bytes]) -> Vec<B256> {
 
 impl ChainData {
     pub fn new(net: ElNet, max_log_range: u64) -> Arc<Self> {
+        Self::with_net(Some(net), max_log_range)
+    }
+
+    /// Without a network (tests): no peers; headers, receipts and transactions come only from
+    /// what's been noted.
+    #[cfg(test)]
+    pub fn offline(max_log_range: u64) -> Arc<Self> {
+        Self::with_net(None, max_log_range)
+    }
+
+    /// Seeds a block's receipts and transaction hashes, as if fetched and verified (tests).
+    #[cfg(test)]
+    pub fn note_receipts(&self, number: u64, hash: B256, receipts: Vec<Receipt>, txs: Vec<B256>) {
+        self.receipts.lock().put(hash, Arc::new(receipts));
+        let mut g = self.inner.write();
+        self.index_txs(&mut g, number, hash, txs);
+    }
+
+    fn with_net(net: Option<ElNet>, max_log_range: u64) -> Arc<Self> {
         let cd = Arc::new(Self {
             net,
             inner: Default::default(),
@@ -362,7 +382,7 @@ impl ChainData {
     /// Gossips `tx` and tracks it until inclusion. Returns the hash and how many peers got it.
     pub fn send(&self, tx: SignedTx, from: Address) -> (B256, usize) {
         let hash = *tx.tx_hash();
-        let peers = self.net.broadcast(vec![tx.clone()]);
+        let peers = self.net.as_ref().map_or(0, |n| n.broadcast(vec![tx.clone()]));
         let now = Instant::now();
         self.inner.write().sent.entry(hash).or_insert(Sent { tx, from, first: now, last: now });
         tracing::info!(tx = %hash, %from, peers, "transaction broadcast");
@@ -383,7 +403,7 @@ impl ChainData {
             }
         }
         if !due.is_empty() {
-            let peers = self.net.broadcast(due.clone());
+            let peers = self.net.as_ref().map_or(0, |n| n.broadcast(due.clone()));
             tracing::debug!(txs = due.len(), peers, "re-broadcast pending transactions");
         }
     }
@@ -410,10 +430,17 @@ impl ChainData {
 
     // ---- headers, bodies, receipts ---------------------------------------------------------
 
+    /// The network, for requests to a peer from [`Self::peers`] (which is empty without one).
+    fn el(&self) -> &ElNet {
+        self.net.as_ref().expect("peers come from a network")
+    }
+
     fn peers(&self) -> Vec<skim_el::Peer> {
         let mut v: Vec<_> = self
             .net
-            .peers()
+            .as_ref()
+            .map(|n| n.peers())
+            .unwrap_or_default()
             .into_iter()
             .filter(|(_, p)| p.eth_version >= 70 && !p.client.starts_with("enrscout"))
             .map(|(id, _)| id)
@@ -430,7 +457,9 @@ impl ChainData {
     pub fn peers_serve_from(&self) -> (Option<u64>, usize) {
         let e: Vec<u64> = self
             .net
-            .peers()
+            .as_ref()
+            .map(|n| n.peers())
+            .unwrap_or_default()
             .into_iter()
             .filter(|(_, p)| p.eth_version >= 70 && !p.client.starts_with("enrscout"))
             .filter_map(|(_, p)| p.status_earliest)
@@ -492,7 +521,7 @@ impl ChainData {
                     tokio::time::sleep(PASS_BACKOFF * pass).await;
                 }
                 for p in self.peers().into_iter().take(4) {
-                    let Ok(hs) = self.net.headers_falling(p, parent.into(), want).await.0 else { continue };
+                    let Ok(hs) = self.el().headers_falling(p, parent.into(), want).await.0 else { continue };
                     let mut expect = parent;
                     let mut ok = Vec::new();
                     for h in hs {
@@ -555,7 +584,7 @@ impl ChainData {
                     tokio::time::sleep(PASS_BACKOFF * pass).await;
                 }
                 for p in self.peers().into_iter().take(4) {
-                    let hs = match self.net.headers_falling(p, parent.into(), want).await {
+                    let hs = match self.el().headers_falling(p, parent.into(), want).await {
                         (Ok(hs), _) => hs,
                         (Err(e), _) => {
                             tracing::debug!(peer = %p, "headers: {e}");
@@ -605,7 +634,7 @@ impl ChainData {
                 tokio::time::sleep(PASS_BACKOFF * pass).await;
             }
             for p in self.peers().into_iter().take(5) {
-                let mut bodies = match self.net.bodies(p, vec![hash]).await {
+                let mut bodies = match self.el().bodies(p, vec![hash]).await {
                     (Ok(b), _) => b,
                     (Err(e), _) => {
                         tracing::debug!(peer = %p, number = header.number, "bodies: {e}");
@@ -647,7 +676,7 @@ impl ChainData {
                 tokio::time::sleep(PASS_BACKOFF * pass).await;
             }
             for p in self.peers().into_iter().take(6) {
-                let (r, d) = match self.net.block_receipts(p, hash).await {
+                let (r, d) = match self.el().block_receipts(p, hash).await {
                     (Ok(r), d) => (r, d),
                     (Err(e), _) => {
                         tracing::debug!(peer = %p, number = header.number, "receipts: {e}");
@@ -694,7 +723,7 @@ impl ChainData {
                 .map(|chunk| async move {
                     let hashes: Vec<B256> = chunk.iter().map(|(h, _)| *h).collect();
                     for p in self.peers().into_iter().take(3) {
-                        let Ok(rs) = self.net.blocks_receipts(p, &hashes).await.0 else { continue };
+                        let Ok(rs) = self.el().blocks_receipts(p, &hashes).await.0 else { continue };
                         let roots: Vec<(B256, B256)> = chunk.iter().map(|(hash, h)| (*hash, h.receipts_root)).collect();
                         let ok: Vec<_> = cpu(move || {
                             rs.into_iter()
@@ -732,7 +761,7 @@ impl ChainData {
                 tokio::time::sleep(PASS_BACKOFF * pass).await;
             }
             for p in self.peers().into_iter().take(4) {
-                let Ok(mut r) = self.net.bals(p, vec![hash]).await.0 else { continue };
+                let Ok(mut r) = self.el().bals(p, vec![hash]).await.0 else { continue };
                 let Some(Some(raw)) = r.0.pop() else { continue };
                 if let Ok(bal) = skim_bal::decode_verified(&raw, header.block_access_list_hash.unwrap_or_default()) {
                     let bal = Arc::new(bal);
