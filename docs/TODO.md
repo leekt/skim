@@ -39,15 +39,10 @@ Items are removed from this file when they're done, and the commit that closes o
     keep in memory.
 13. **New-block push at the head:** the stream waits by polling (200 ms); notify instead, data
     still pulled by cursor.
-14. **Finality-gated exports:** smallname ignores `finalized`; use it (e.g. prune reorg bookkeeping
-    below it) and document the pattern for irreversible exports.
 
 ## smallname
-15. **Names under pre-fork, unwrapped ancestors** can't be named from state (no preimage on chain).
-    Documented; done when there's a sourced preimage path (e.g. imported label lists) or a decision
-    to keep it as is.
-16. **Unsupported routes:** permissions, resolver and registry views, diagnostics, Basenames.
-17. **ENSv2 migration history** (`migrated_at`, `is_migrated`) isn't indexed.
+16. **Unsupported routes:** permissions by `name` / `registration_id` (needs `TokenResource`
+    resource ids indexed), resolver `links` / `roles`, diagnostics, Basenames (another chain).
 
 ## Deployment
 18. **No deployment example in the repo:** a reference setup for skim + smallname (service units,

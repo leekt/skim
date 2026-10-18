@@ -308,6 +308,53 @@ export async function records(rd, name, keys) {
   return { records: out, resolver };
 }
 
+/**
+ * Records `resolver` itself holds for `node` (direct calls, not the Universal Resolver): what a
+ * specific resolver says, whether or not it's the name's current resolver.
+ */
+export async function resolverRecords(rd, resolver, node, keys) {
+  const call = (k) => {
+    if (k === "addr:60") return { to: resolver, abi: VIEWS.resolver, functionName: "addr", args: [node] };
+    if (k.startsWith("addr:")) return { to: resolver, abi: VIEWS.resolver, functionName: "addr", args: [node, BigInt(k.slice(5))] };
+    if (k.startsWith("text:")) return { to: resolver, abi: VIEWS.resolver, functionName: "text", args: [node, k.slice(5)] };
+    if (k === "contenthash") return { to: resolver, abi: VIEWS.resolver, functionName: "contenthash", args: [node] };
+    if (k === "name") return { to: resolver, abi: VIEWS.resolver, functionName: "name", args: [node] };
+    return null;
+  };
+  const calls = keys.map(call);
+  const results = await rd.many(calls.filter(Boolean));
+  let i = 0;
+  const out = {};
+  for (const [j, k] of keys.entries()) {
+    if (!calls[j]) {
+      out[k] = { status: "unsupported", unsupported_reason: "record_key_not_supported" };
+      continue;
+    }
+    const r = results[i++];
+    if (!r.ok) {
+      out[k] = r.code === 3 ? { status: "not_found", reason: "reverted" } : { status: "failed", failure_reason: "state_unavailable" };
+      continue;
+    }
+    let v = r.value;
+    if (v === "0x" || v === "" || v === ZERO) v = null;
+    out[k] = v == null ? { status: "not_found" } : { status: "ok", value: String(v) };
+  }
+  return out;
+}
+
+/** An ENSv2 registry's entry for a label (getState by labelhash), at the reader's block. */
+export async function registryEntry(rd, registry, labelHash) {
+  const r = await rd.one({ to: registry, abi: VIEWS.v2Registry, functionName: "getState", args: [hexToBigInt(labelHash)] });
+  if (!r.ok) return { unavailable: r.error };
+  const st = r.value;
+  let owner = null;
+  if (st.status === 2) {
+    const o = await rd.one({ to: registry, abi: VIEWS.v2Registry, functionName: "ownerOf", args: [st.tokenId] });
+    owner = o.ok && o.value !== ZERO ? o.value : null;
+  }
+  return { status: V2_STATUS[st.status] ?? String(st.status), expiry: st.expiry === MAX_U64 ? null : st.expiry, owner };
+}
+
 /** Primary name through the Universal Resolver (forward-verified, ENSIP-19). */
 export async function primaryName(rd, address, coinType = 60n) {
   const r = await rd.one({ to: UNIVERSAL_RESOLVER, abi: VIEWS.universalResolver, functionName: "reverse", args: [address, BigInt(coinType)] });

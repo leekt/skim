@@ -148,7 +148,8 @@ export async function follow(store, url, { fromBlock, log = console.log, signal 
       });
       if (applied || r.events.length) log(`${r.cursor?.number ?? r.nextFrom - 1}: ${applied} ENS events (head ${r.head}${r.finalized ? `, finalized ${r.finalized.number}` : ""})`);
       if (r.finalized) store.meta("finalized_block", r.finalized.number);
-      store.pruneBlocks(Number(store.meta("indexed_block") ?? 0));
+      const fin = store.meta("finalized_block");
+      store.pruneBlocks(Number(store.meta("indexed_block") ?? 0), fin ? Math.min(Number(fin), Number(store.meta("indexed_block") ?? 0)) : null);
     } catch (e) {
       log(`stream: ${e.message}`);
       await sleep(5000);

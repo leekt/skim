@@ -104,6 +104,45 @@ export class Ingest {
   }
 
   /**
+   * One candidate label from a user-provided list (e.g. a published ENS label list). Hash-checked
+   * by construction: it's only used where its labelhash already occurs.
+   * - It names index rows shown as `[labelhash]`.
+   * - As `label.eth`, it names a `.eth` name the index only knows by node (a parent created
+   *   before the index started, seen through its subnames or events).
+   * Returns how many rows it named.
+   */
+  importLabel(label) {
+    if (!label || label.includes(".")) return 0;
+    const h = lh(label);
+    let named = 0;
+    if (this.s.get("SELECT 1 FROM names WHERE labelhash = ? AND label LIKE '[%'", h)) {
+      this.s.run("INSERT OR IGNORE INTO labels (labelhash, label) VALUES (?, ?)", h, label);
+      named += this.s.run("UPDATE names SET label = ? WHERE labelhash = ? AND label LIKE '[%'", label, h).changes;
+    }
+    const n = child(ETH_NODE, h);
+    const unnamed = !this.s.get("SELECT 1 FROM names WHERE node = ?", n);
+    if (unnamed && (this.s.get("SELECT 1 FROM names WHERE parent = ? LIMIT 1", n) || this.s.get("SELECT 1 FROM events WHERE node = ? LIMIT 1", n))) {
+      this.s.run("INSERT OR IGNORE INTO labels (labelhash, label) VALUES (?, ?)", h, label);
+      // Block 0: learned from state-independent data (a hash match), never rolled back.
+      this.preimage("eth");
+      this.edge(ETH_NODE, ROOT, lh("eth"), 0, null);
+      this.edge(n, ETH_NODE, h, 0, null);
+      this.s.run("UPDATE names SET label = ? WHERE node = ?", label, n);
+      named += 1;
+    }
+    return named;
+  }
+
+  /** Records a completed migration if `tx` holds both its Graveyard transfer and its ENSv2 registration. */
+  noteMigration(node, tx, block, ts) {
+    const both = this.s.get(
+      `SELECT (SELECT 1 FROM events WHERE tx = ? AND node = ? AND type = 'migration' LIMIT 1) AS g,
+              (SELECT 1 FROM events WHERE tx = ? AND node = ? AND kind = 'LabelRegistered' AND address = ? LIMIT 1) AS r`,
+      tx, node, tx, node, lower(V2.ethRegistry));
+    if (both?.g && both?.r) this.s.run("INSERT OR IGNORE INTO migrations (node, block, ts, tx) VALUES (?, ?, ?, ?)", node, block, ts, tx);
+  }
+
+  /**
    * A registry's place in the tree (the node its labels are under), then its tokens are named.
    * A settled place (`fixed`: seeded, or a parent claim the parent confirmed) never moves; an
    * unsettled one keeps its first mount, unless `fix` settles it. A mount under the registry's
@@ -395,6 +434,9 @@ export class Ingest {
     this.s.run(
       "INSERT OR IGNORE INTO events (block, log_index, tx_index, tx, block_hash, ts, address, kind, type, node, actor, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       l.block, l.logIndex, raw.transactionIndex, raw.transactionHash, raw.blockHash, ts, addr, name, type, node, actor, json(args ?? {}));
+    // A migration completes when both halves are in the same transaction (either order).
+    const v2Registration = name === "LabelRegistered" && addr === lower(V2.ethRegistry);
+    if (node && raw.transactionHash && (type === "migration" || v2Registration)) this.noteMigration(node, raw.transactionHash, l.block, ts);
     return true;
   }
 }

@@ -54,7 +54,11 @@ A name created before the index starts still resolves and has a full profile; th
 **Labels:**
 - **Unknown labels:** a name whose label text was never seen in an event (`NewOwner` carries only its hash) is listed as `[labelhash].parent.eth`, as bigname does.
 - **Wrapped ancestors:** when an ancestor predates the fork, smallname reads its full name from the NameWrapper (`names(node)`, live, checked against the node) and records it.
-- **Unwrapped ancestors:** a pre-fork ancestor that isn't wrapped can't be named from state. Such rows are left out, under the same `partial` marker.
+- **Unwrapped ancestors:** a pre-fork ancestor that isn't wrapped can't be named from state. Such rows are left out, under the same `partial` marker, unless a label list names them (below).
+- **Label lists (optional):** `smallname import-labels <file>` reads a newline-separated list of labels, such as a published ENS label list (smallname downloads nothing). Each label is used only where its hash already occurs:
+  - it fills in `[labelhash]` rows;
+  - as `label.eth`, it names a `.eth` parent the index only knows by node.
+  A list can't put a wrong name in the index, only fill gaps.
 
 **Measured** (Sepolia, all post-fork history: 78k blocks, from 11,856,337 to 11,934,300):
 
@@ -76,11 +80,27 @@ A name created before the index starts still resolves and has a full profile; th
 | `GET /v1/search` (`q`, `match=prefix\|contains`) | index → live check |
 | `GET /v1/names?namespace=ens&expires_after=&expires_before=` | index → live check |
 | `POST /v1/lookup` (`inputs`, `profile=feed\|detail`) | live |
-| `GET /v1/status`, `GET /v1/namespaces/ens` | index position, skim head |
+| `GET /v1/resolvers/{chain_id}/{address}` | what the resolver is (declared ENSv1/ENSv2 kinds), and the names currently using it: index → live check |
+| `GET /v1/resolvers/{chain_id}/{address}/records?name=` (`keys`) | live, direct calls to that resolver (not the Universal Resolver); known keys from the index |
+| `GET /v1/registries/{chain_id}/{address}` | an ENSv2 registry's place in the tree (`confirmed`, `mounted` or `unmounted`) and label count: index |
+| `GET /v1/registries/{chain_id}/{address}/labels` (`owner`, `exclude_owner`) | index → live (`getState`, `ownerOf`) |
+| `GET /v1/permissions` (`address`, `registry=chain:addr`, `contract_address`) | index: the latest `EACRolesChanged` bitmap per (contract, resource, account); revoked grants (zero) left out |
+| `GET /v1/status`, `GET /v1/namespaces/ens` | index position, finalized block, skim head |
 
 - **Response shapes:** these follow bigname's: `{data, page, meta}`, opaque cursors, Unix-second strings, `{error: {code, message, details}}`.
-- **Not implemented** (`422 unsupported`): permissions, resolver and registry views, diagnostics, and Basenames (`*.base.eth`, another chain).
+- **Not implemented** (`422 unsupported`):
+  - permissions anchored by `name` or `registration_id` (ENSv2 resource ids come from `TokenResource`, which isn't indexed)
+  - resolver `links` and `roles` views
+  - diagnostics
+  - Basenames (`*.base.eth`, another chain)
+- **Simplified shapes:** permission rows are `{contract, resource, account, roles, updated_block, updated_at}`, without bigname's lineage and effective-grant expansion.
+- **Migration history:** `is_migrated` and `migrated_at` are set on ENSv2 names, from a completed ENSv1 → ENSv2 migration: the ENSv1 token sent to the Graveyard and the ENSv2 registration in the same transaction, as bigname defines it. `registered_at` skips the migration's registration, so it keeps meaning the original registration (null when that predates the index).
 - **Primary names:** answered `verified` only. The `indexed` answer is `unsupported`, because smallname doesn't keep a stored claim.
+
+## Finality
+Each stream response carries the block skim's light client verified as finalized. smallname records it (`finalized_block` in `/v1/status` and `meta.index`). It keeps reorg bookkeeping (the block hashes it sends as `recent`) only above it, plus one anchor at or below it.
+
+**Irreversible exports:** an app that exports from the index (to another database, a queue, an email) should export only rows at or below `finalized_block`. Rows above it can still be rolled back by a `rewind`. Rows at or below it can't: a finalized block isn't reorged out, which is what the light client verifies. Without a light client (`finalized_block: null`), nothing is final, and such exports should wait.
 
 ## Files
 | File | |

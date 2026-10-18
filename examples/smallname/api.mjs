@@ -5,9 +5,9 @@
 import http from "node:http";
 import { readFileSync } from "node:fs";
 import { namehash, labelhash, isAddress, getAddress } from "viem";
-import { CHAIN_ID, AMSTERDAM_BLOCK, V1, VIEWS } from "./contracts.mjs";
+import { CHAIN_ID, AMSTERDAM_BLOCK, V1, V1_RESOLVERS, V2, VIEWS } from "./contracts.mjs";
 import { Ingest, dnsLabels } from "./ingest.mjs";
-import { Reader, nameState, records, primaryName, normalizeName } from "./live.mjs";
+import { Reader, nameState, records, primaryName, normalizeName, resolverRecords, registryEntry } from "./live.mjs";
 
 const PAGE_DEFAULT = 50;
 const PAGE_MAX = 200;
@@ -82,7 +82,11 @@ export function serve(store, { skim, port, host }) {
     return nameOf(node);
   }
   const firstSeen = (node, types) =>
-    store.get(`SELECT ts FROM events INDEXED BY events_node WHERE node = ? AND type IN (${types.map(() => "?").join(",")}) ORDER BY block DESC, log_index DESC LIMIT 1`, node, ...types)?.ts ?? null;
+    // A migration's ENSv2 registration isn't a new registration (it keeps the ENSv1 lease's date).
+    store.get(
+      `SELECT ts FROM events INDEXED BY events_node WHERE node = ? AND type IN (${types.map(() => "?").join(",")})
+       AND tx NOT IN (SELECT tx FROM migrations WHERE node = ? AND tx IS NOT NULL) ORDER BY block DESC, log_index DESC LIMIT 1`,
+      node, ...types, node)?.ts ?? null;
   const releasedInV2 = (node) => {
     const r = store.get("SELECT kind FROM events INDEXED BY events_node WHERE node = ? AND kind IN ('LabelRegistered','LabelUnregistered') ORDER BY block DESC, log_index DESC LIMIT 1", node);
     return r?.kind === "LabelUnregistered";
@@ -107,7 +111,14 @@ export function serve(store, { skim, port, host }) {
   const indexMeta = (head) => {
     const indexed = Number(store.meta("indexed_block") ?? 0);
     const gaps = JSON.parse(store.meta("gaps") || "[]");
-    return { indexed_block: indexed, history_from_block: historyFrom(), lag_blocks: head ? Math.max(0, head - indexed) : null, ...(gaps.length && { gaps }) };
+    const fin = store.meta("finalized_block");
+    return {
+      indexed_block: indexed, history_from_block: historyFrom(), lag_blocks: head ? Math.max(0, head - indexed) : null,
+      // Verified by skim's light client: index rows at or below it can't be rewound, so exports
+      // that can't be undone should wait for it.
+      finalized_block: fin ? Number(fin) : null,
+      ...(gaps.length && { gaps }),
+    };
   };
   const asOf = (rd) => ({ as_of: { [CHAIN_ID]: rd.head }, index: indexMeta(rd.head.block_number) });
   // History and lists come from events since Glamsterdam only (skim serves logs from the fork).
@@ -134,6 +145,12 @@ export function serve(store, { skim, port, host }) {
       created_at: s(store.get("SELECT ts FROM names WHERE node = ?", node)?.ts ?? null),
     };
     if (st.ens_v1) row.ens_v1 = st.ens_v1;
+    if (st.authority === "ens_v2") {
+      // History, not authority: when the name moved from ENSv1 (a completed migration).
+      const m = store.get("SELECT ts FROM migrations WHERE node = ? ORDER BY block DESC LIMIT 1", node);
+      row.is_migrated = !!m;
+      if (m?.ts) row.migrated_at = String(m.ts);
+    }
     if (st.unsupported_reason) Object.assign(row, { read_status: "unsupported", unsupported_reason: st.unsupported_reason });
     row._resolver = st.resolver ?? null;
     return row;
@@ -438,7 +455,7 @@ export function serve(store, { skim, port, host }) {
         pending_invalidation_count: 0, pending_invalidation_count_capped: false, dead_letter_count: 0,
         chains: {
           [CHAIN_ID]: {
-            latest_block: rd.head.block_number, indexed_block: indexed, safe_block: null, finalized_block: null, started_at_block: Number(store.meta("started_at_block") ?? 0) || null,
+            latest_block: rd.head.block_number, indexed_block: indexed, safe_block: null, finalized_block: store.meta("finalized_block") ? Number(store.meta("finalized_block")) : null, started_at_block: Number(store.meta("started_at_block") ?? 0) || null,
             lag_blocks: lag, lag_seconds: ts ? Math.max(0, Number(rd.head.timestamp) - ts) : null,
             network_block: rd.head.block_number, network_head_observed_at: rd.head.timestamp,
             network_head_age_seconds: Math.max(0, Math.round(Date.now() / 1000) - Number(rd.head.timestamp)),
@@ -465,6 +482,147 @@ export function serve(store, { skim, port, host }) {
       meta: {},
     };
   };
+
+  // ---- contract views: resolvers, registries, permissions ----
+
+  function parseContract(chainRaw, addrRaw) {
+    if (String(chainRaw) !== String(CHAIN_ID)) throw new ApiError(404, "not_found", `chain ${chainRaw} is not indexed by smallname`);
+    return parseAddress(addrRaw).toLowerCase();
+  }
+  /** What a resolver is, as far as the index knows. */
+  function resolverKind(a) {
+    if (V1_RESOLVERS.map((x) => x.toLowerCase()).includes(a)) return { kind: "ens_v1_public_resolver", declared: true };
+    if (a === V2.publicResolverV2.toLowerCase()) return { kind: "ens_v2_public_resolver", declared: true };
+    if (a === V2.ensv1Resolver.toLowerCase()) return { kind: "ens_v1_mirror_resolver", declared: true };
+    if (store.get("SELECT 1 FROM v2_resolvers WHERE address = ?", a)) return { kind: "ens_v2_permissioned_resolver", declared: true };
+    return { kind: "unknown", declared: false };
+  }
+
+  /** GET /v1/resolvers/{chain}/{address}: the resolver, and the names currently using it. */
+  async function resolverOverview(rd, q, a, cursor) {
+    const size = pageSize(q);
+    const scope = `res:${a}`;
+    const after = cursor ? dec(cursor, scope).k : "";
+    // Candidates: names whose resolver was ever set to it; each is checked live.
+    const cands = (k, n) => store.all(
+      "SELECT DISTINCT node FROM events WHERE type = 'resolver' AND actor = ? AND node IS NOT NULL AND node > ? ORDER BY node LIMIT ?", a, k, n);
+    const check = async (r) => {
+      const name = await nameOfLive(rd, r.node);
+      if (!name) return null;
+      const row = await nameRow(rd, name, r.node);
+      return row._resolver?.toLowerCase() === a ? strip(row) : null;
+    };
+    const f = await fill(cands, check, (r) => r.node, size, after);
+    const k = resolverKind(a);
+    return {
+      data: {
+        chain_id: CHAIN_ID, address: a, ...k,
+        record_key_count: store.get("SELECT count(*) c FROM record_keys WHERE resolver = ?", a).c,
+        bound_names: f.rows,
+      },
+      page: page(cursor, f.more ? enc({ s: scope, k: f.last }) : null, size),
+      meta: { ...asOf(rd), ...partialMeta() },
+    };
+  }
+
+  /** GET /v1/resolvers/{chain}/{address}/records?name=: what this resolver holds for a name. */
+  async function resolverNameRecords(rd, q, a) {
+    if (!q.get("name")) throw bad("name is required");
+    const name = parseName(q.get("name"));
+    const node = namehash(name);
+    const inv = inventory(node, a);
+    const keys = q.get("keys") ? q.get("keys").split(",").filter(Boolean) : inv.length ? inv : ["addr:60"];
+    if (keys.length > 200) throw unsupported("at most 200 keys", "too_many_keys");
+    const recs = await resolverRecords(rd, a, node, keys);
+    return { data: { chain_id: CHAIN_ID, address: a, name, namehash: node, ...resolverKind(a), records: recs, known_keys: inv }, meta: { ...asOf(rd), source: "verified" } };
+  }
+
+  function registryRow(a) {
+    const r = store.get("SELECT parent_node, fixed, block FROM registries WHERE address = ?", a);
+    if (!r) throw new ApiError(404, "not_found", `${a} is not a known ENSv2 registry`);
+    return r;
+  }
+
+  /** GET /v1/registries/{chain}/{address}: an ENSv2 registry's place in the tree and size. */
+  async function registryOverview(rd, a) {
+    const r = registryRow(a);
+    const parentName = r.parent_node ? (r.parent_node === "0x" + "00".repeat(32) ? "" : await nameOfLive(rd, r.parent_node)) : null;
+    return {
+      data: {
+        chain_id: CHAIN_ID, address: a,
+        parent: r.parent_node ? { namehash: r.parent_node, name: parentName } : null,
+        placement: r.fixed ? "confirmed" : r.parent_node ? "mounted" : "unmounted",
+        label_count: store.get("SELECT count(*) c FROM v2_tokens WHERE registry = ?", a).c,
+        announced_block: r.block || null,
+      },
+      meta: { ...asOf(rd), ...partialMeta() },
+    };
+  }
+
+  /** GET /v1/registries/{chain}/{address}/labels: its labels, each read live (getState). */
+  async function registryLabels(rd, q, a, cursor) {
+    const r = registryRow(a);
+    const size = pageSize(q);
+    const owner = q.get("owner") ? parseAddress(q.get("owner")).toLowerCase() : null;
+    const exclude = q.get("exclude_owner") ? parseAddress(q.get("exclude_owner")).toLowerCase() : null;
+    const scope = `reg:${a}:${owner ?? ""}:${exclude ?? ""}`;
+    const after = cursor ? dec(cursor, scope).k : "";
+    const parentName = r.parent_node ? await nameOfLive(rd, r.parent_node) : null;
+    const cands = (k, n) => store.all(
+      `SELECT t.labelhash, t.node, coalesce(l.label, '[' || substr(t.labelhash, 3) || ']') AS label FROM v2_tokens t LEFT JOIN labels l ON l.labelhash = t.labelhash
+       WHERE t.registry = ? AND t.labelhash > ? ORDER BY t.labelhash LIMIT ?`, a, k, n);
+    const check = async (t) => {
+      const e = await registryEntry(rd, a, t.labelhash);
+      if (e.unavailable) return { label: t.label, labelhash: t.labelhash, read_status: "failed", failure_reason: "state_unavailable" };
+      const o = e.owner?.toLowerCase() ?? null;
+      if ((owner && o !== owner) || (exclude && o === exclude)) return null;
+      const name = parentName != null ? (parentName ? `${t.label}.${parentName}` : t.label) : null;
+      return { label: t.label, labelhash: t.labelhash, name, namehash: t.node, status: e.status, owner: e.owner, expires_at: e.expiry == null ? null : String(e.expiry) };
+    };
+    const f = await fill(cands, check, (t) => t.labelhash, size, after);
+    return { data: f.rows, page: page(cursor, f.more ? enc({ s: scope, k: f.last }) : null, size), meta: { ...asOf(rd), ...partialMeta() } };
+  }
+
+  /**
+   * GET /v1/permissions: current EAC role grants (ENSv2 registries and resolvers), from the
+   * indexed EACRolesChanged events: the latest bitmap per (contract, resource, account); a zero
+   * bitmap is a revoked grant and isn't listed. Name and registration anchors need resource ids
+   * (TokenResource), which aren't indexed: those return 422.
+   */
+  function permissions(q, cursor) {
+    if (q.get("name") || q.get("registration_id")) throw unsupported("name and registration_id anchors are not supported by smallname", "resource_ids_not_indexed");
+    const conds = ["kind = 'EACRolesChanged'"];
+    const args = [];
+    if (q.get("address")) conds.push("actor = ?") && args.push(parseAddress(q.get("address")).toLowerCase());
+    if (q.get("registry")) {
+      const [c, ad] = q.get("registry").split(":");
+      conds.push("address = ?") && args.push(parseContract(c, ad));
+    }
+    if (q.get("contract_address")) conds.push("address = ?") && args.push(parseAddress(q.get("contract_address")).toLowerCase());
+    if (args.length === 0) throw bad("at least one of address, registry or contract_address is required");
+    const size = pageSize(q);
+    const scope = `perm:${args.join(",")}`;
+    const after = cursor ? dec(cursor, scope).o : 0;
+    const rows = store.all(
+      `WITH g AS (
+         SELECT address, json_extract(data, '$.resource') AS resource, lower(json_extract(data, '$.account')) AS account,
+                json_extract(data, '$.newRoleBitmap') AS roles, block, ts,
+                row_number() OVER (PARTITION BY address, json_extract(data, '$.resource'), lower(json_extract(data, '$.account')) ORDER BY block DESC, log_index DESC) AS rn
+         FROM events WHERE ${conds.join(" AND ")})
+       SELECT * FROM g WHERE rn = 1 AND roles != '0' ORDER BY address, resource, account LIMIT ? OFFSET ?`,
+      ...args, size + 1, after);
+    const more = rows.length > size;
+    const data = rows.slice(0, size).map((r) => {
+      const isRegistry = !!store.get("SELECT 1 FROM registries WHERE address = ?", r.address);
+      return {
+        contract: { chain_id: CHAIN_ID, address: r.address, kind: isRegistry ? "registry" : "resolver" },
+        resource: String(r.resource), account: getAddress(r.account),
+        roles: "0x" + BigInt(r.roles).toString(16),
+        updated_block: r.block, updated_at: r.ts == null ? null : String(r.ts),
+      };
+    });
+    return { data, page: page(cursor, more ? enc({ s: scope, o: after + size }) : null, size), meta: { index: indexMeta(null), ...partialMeta() } };
+  }
 
   async function route(req, url) {
     const q = url.searchParams;
@@ -511,7 +669,12 @@ export function serve(store, { skim, port, host }) {
       return historyQuery(q, conds.join(" AND "), args, `ev:${args.join(",")}`, cursor);
     }
     if (p === "/v1/search") return search(await Reader.atHead(skim), q, cursor);
-    if (/^\/v1\/(permissions|resolvers|registries|diagnostics)/.test(p)) throw unsupported("not implemented by smallname", "not_supported_by_smallname");
+    if ((m = p.match(/^\/v1\/resolvers\/([^/]+)\/([^/]+)$/))) return resolverOverview(await Reader.atHead(skim), q, parseContract(m[1], m[2]), cursor);
+    if ((m = p.match(/^\/v1\/resolvers\/([^/]+)\/([^/]+)\/records$/))) return resolverNameRecords(await Reader.atHead(skim), q, parseContract(m[1], m[2]));
+    if ((m = p.match(/^\/v1\/registries\/([^/]+)\/([^/]+)$/))) return registryOverview(await Reader.atHead(skim), parseContract(m[1], m[2]));
+    if ((m = p.match(/^\/v1\/registries\/([^/]+)\/([^/]+)\/labels$/))) return registryLabels(await Reader.atHead(skim), q, parseContract(m[1], m[2]), cursor);
+    if (p === "/v1/permissions") return permissions(q, cursor);
+    if (/^\/v1\/(resolvers\/[^/]+\/[^/]+\/(links|roles)|diagnostics)/.test(p)) throw unsupported("not implemented by smallname", "not_supported_by_smallname");
     throw new ApiError(404, "not_found", `no route ${p}`);
   }
 

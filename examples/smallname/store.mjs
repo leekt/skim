@@ -39,11 +39,15 @@ CREATE TABLE IF NOT EXISTS registries (address TEXT PRIMARY KEY, parent_node TEX
 CREATE TABLE IF NOT EXISTS v2_tokens (registry TEXT NOT NULL, label_id TEXT NOT NULL, labelhash TEXT NOT NULL, node TEXT, block INTEGER NOT NULL,
   PRIMARY KEY (registry, label_id));
 CREATE TABLE IF NOT EXISTS v2_resolvers (address TEXT PRIMARY KEY, block INTEGER NOT NULL);
+-- Completed ENSv1 -> ENSv2 migrations: the ENSv1 token sent to the Graveyard and the ENSv2
+-- registration in the same transaction (bigname's rule). History only; authority is read live.
+CREATE TABLE IF NOT EXISTS migrations (node TEXT NOT NULL, block INTEGER NOT NULL, ts INTEGER, tx TEXT,
+  PRIMARY KEY (node, block));
 CREATE TABLE IF NOT EXISTS v2_links (resolver TEXT NOT NULL, record_id TEXT NOT NULL, node TEXT NOT NULL, block INTEGER NOT NULL, log_index INTEGER NOT NULL,
   PRIMARY KEY (resolver, node, block, log_index));
 `;
 
-const REORG_TABLES = ["blocks", "events", "names", "rel", "expiry", "record_keys", "versions", "registries", "v2_tokens", "v2_resolvers", "v2_links"];
+const REORG_TABLES = ["blocks", "events", "names", "rel", "expiry", "record_keys", "versions", "registries", "v2_tokens", "v2_resolvers", "v2_links", "migrations"];
 
 export class Store {
   constructor(path) {
@@ -63,6 +67,13 @@ export class Store {
     // confirmed by the parent's mount); later mounts elsewhere don't move it.
     if (!this.db.prepare("SELECT 1 FROM pragma_table_info('registries') WHERE name = 'fixed'").get()) {
       this.db.exec("ALTER TABLE registries ADD COLUMN fixed INTEGER NOT NULL DEFAULT 0");
+    }
+    // Index files from before the migrations table: derive it once from the stored events.
+    if (!this.db.prepare("SELECT 1 FROM migrations LIMIT 1").get() && !this.db.prepare("SELECT 1 FROM meta WHERE k = 'migrations_built'").get()) {
+      this.db.exec(`INSERT OR IGNORE INTO migrations (node, block, ts, tx)
+        SELECT g.node, g.block, g.ts, g.tx FROM events g JOIN events r ON r.tx = g.tx AND r.node = g.node
+        WHERE g.type = 'migration' AND r.kind = 'LabelRegistered' AND r.address = '0xd4ebcbbdf463c9c45784603db0ddd499bc44a8b4'`);
+      this.db.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('migrations_built', '1')");
     }
     this.stmts = new Map();
   }
@@ -111,8 +122,17 @@ export class Store {
     });
   }
 
-  /** Keeps followed-block hashes for the last `keep` blocks only (events carry their own timestamps). */
-  pruneBlocks(head, keep = 512) {
+  /**
+   * Reorg bookkeeping (followed-block hashes, sent as `recent` for rewinds) is only needed above
+   * finality: a verified finalized block can't be rewound past. Below it, one anchor is kept (the
+   * newest row at or below finality). Without a finalized block, the last `keep` blocks are kept.
+   */
+  pruneBlocks(head, finalized = null, keep = 512) {
+    if (finalized != null) {
+      const anchor = this.get("SELECT max(number) n FROM blocks WHERE number <= ?", finalized)?.n;
+      if (anchor != null) this.run("DELETE FROM blocks WHERE number < ?", anchor);
+      return;
+    }
     this.run("DELETE FROM blocks WHERE number < ?", head - keep);
   }
 }
