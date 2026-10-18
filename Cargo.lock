@@ -7721,6 +7721,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "skim-bal",
+ "skim-el",
  "skim-snap",
  "skim-state",
  "thiserror 2.0.21",

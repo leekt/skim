@@ -4,17 +4,10 @@ What's known to be missing or unproven, as of 2026-10-18. Each item says what "d
 Items are removed from this file when they're done, and the commit that closes one says so.
 
 ## Correctness and tests
-1. **Stream reorg test.** `skim_streamNext`'s `rewind` was checked by hand only (a fake cursor hash
-   with one canonical `recent` entry). Done: an automated test drives a stream across a reorg
-   (cursor on the abandoned fork, `recent` with stale and canonical entries) and asserts the
-   rewind target and that no abandoned-fork logs are delivered after it.
-2. **`eth_getLogs({blockHash})` under a reorg.** The scan refuses a different block at the
-   requested height; done when a test forces a reorg between resolving the hash and scanning.
-3. **Pending whole-storage downloads.** The store side is tested; the subscription code no longer
-   watches the address before installation, untested. Done: a network-free test of subscription
-   maintenance where downloads keep failing and BAL writes to the contract keep coming.
-4. **Header-only misses don't wait for SNAP peers.** Done: a test with all state local, a
-   `BLOCKHASH` miss, and no SNAP peer, asserting the call completes.
+4. **Header-only misses don't wait for SNAP peers.** Covered for `eth_call` with no peers at all
+   (`crates/skim-sim/tests/header_only_miss.rs`: bounded `Incomplete`, never `NoStatePeers`).
+   Still untested: an eth-only peer supplying the header so the call completes, and the
+   `eth_simulateV1` / trace paths (`multi.rs`), which have the same shortcut.
 5. **Soak on the current build.** The last full soak (`c020e7d`) predates history, streams and the
    eighth/ninth review fixes, and failed freshness (old metric) and config-switch recovery (407 s,
    215 s). Done: a 150-minute soak on the current build, results in the experiment log, with any
