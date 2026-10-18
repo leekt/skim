@@ -213,3 +213,11 @@ Four more runs (two of each mode) lost every SNAP peer partway through ("no SNAP
 - **Restarts:** 16; 14 recovered in 34-160 s.
   - **428 s (sigkill, config B):** after 133 s of following, one gossip payload was missed. The gap could only be filled from eth/71 EL peers, and only crawlers were connected on the EL side for 5 minutes. Fixed after this build: a live gap now falls back to payload envelopes from consensus peers (commit `0ce59c6`).
   - **245 s (graceful, config A):** the chain was followed from 33 s on, but no SNAP-serving peer was connected to fill the subscriptions until ~245 s. This is peer acquisition (section 3), not the store; the soak ran next to two other skim nodes on the same machine and IP.
+
+**Third full soak (150 min, binary `be3f0fa`, head-only, the same harness): FAIL on one recovery, with no wrong answers.**
+- **Answers:** 8,873 matches, 0 wrong, 0 refusals. 17 answers were unavailable from the reference; 10 skim requests failed in transport (counted).
+- **Steady-state answer rate:** 99.7% or higher for every kind, and every required kind was sampled.
+- **Freshness:** the head was stale 0.0% of steady-state time; the longest gap between new heads was 24.9 s.
+- **Restarts:** 17; 16 recovered in 19-151 s.
+  - **235.5 s (sigkill, config A):** the chain was followed again 15 s after the relaunch, and the restart snapshot was verified and replayed 3 s later. But it held 44 of 50 keys, and the rest needed SNAP. The only SNAP-capable peer, a Besu node, answered "root unavailable". The other EL peers were reth (no SNAP) and crawlers. The first Nethermind peer connected 226 s in, and the subscriptions were ready 10 s after that. This is the same peer-acquisition gap as the second soak's 245 s restart.
+- **Memory: a regression.** RSS median 181 MB, quartiles 157/210 MB, max 263 MB, against at most 134 MB for `5237bc1`. 26 BAL promotions; subscribed keys never over the limit. The builds in between added mimalloc, stream/history code (unused with `--history off`) and the CPU pool. Tracked in [TODO](../TODO.md) item 6.
