@@ -165,6 +165,34 @@ The 150-minute soak predates this history path; it doesn't validate it.
 
 Also from the review: stored matches are encoded and compressed before the write transaction opens; the transaction only stores finished bytes.
 
+## Peer requests: coalescing and fetch order
+Measured on the aarch64 Linux deployment host (2 cores), each run on a fresh instance with its own ports and data directory, counted with `skim_status.peer_requests`.
+
+**Coalescing (`--history local`, the deployed build, `466f36e` or later).** After a warm-up stream walked the headers, N identical `skim_streamNext` requests ran concurrently over the same 512 blocks (the ENS registry and WETH as filters, ~45 matching logs). Without coalescing, each stream would fetch the candidate blocks' receipts itself, so N streams would cost about N times one stream's requests. The receipts requests (`GetReceipts`, 32 blocks each) for the whole set of streams were:
+
+| Concurrent streams | Runs | `GetReceipts` requests | Wall time |
+|---|---|---|---|
+| 1 | 2 | 5, 6 | 6.0 s, 46.1 s |
+| 2 | 2 | 5, 6 | 4.4 s, 3.7 s |
+| 3 | 4 | 6, 6, 6, 7 | 3.5 s, 3.2 s, 3.6 s, 43.9 s |
+
+Every concurrent stream got the same events. So a second or third reader of the same range adds no receipts requests: the coalescing works. 7 of 15 runs failed in the warm-up instead and are left out. A fresh instance's walk back to 2,600 blocks below the head stopped at about 600 with `-32002 headers below N not served by peers` (the four peers it asked didn't return a linked run), and 30 s of retries weren't enough. See [TODO](../TODO.md).
+
+**Fetch order (binary `64aa3ee`, `SKIM_FETCH_PIPELINE=1` against `=0`).** The workload was 40 cold `eth_call`s through the Universal Resolver, `resolve(name, addr(node))` for 40 `.eth` names from the smallname index, sent as one batch 30 s after the instance was ready. Alternate runs used each mode:
+- `1`: each account's bytecode is requested as soon as that account arrives.
+- `0`: the earlier order, where bytecode is requested in one batch after the whole wave.
+
+| Mode | Runs with 40/40 answered | Cold batch time | SNAP account / storage / code requests |
+|---|---|---|---|
+| completion order (`1`) | 4 | 51.6, 52.6, 20.8, 48.7 s | 401\*, 66, 64, 70 / 459, 384, 384, 396 / 74, 49, 50, 53 |
+| wave order (`0`) | 3 | 14.9, 6.1, 50.0 s | 76, 42, 49 / 390, 362, 367 / 43, 41, 46 |
+
+\* The first run, unexplained; the other runs agree with each other.
+
+Four more runs (two of each mode) lost every SNAP peer partway through ("no SNAP state peers connected after waiting 60 s"). They answered 32 of 40 calls in 75–105 s and are left out. The same batch was warm in 34–58 ms in every run.
+
+**Conclusion:** completion order shows no latency gain on this workload. Time is dominated by which SNAP peers a fresh instance has (6–53 s with all calls answered). It does cost about 15% more code requests, because codes go one per request instead of batched. The switch was for this measurement only and has been removed; completion order stays. Batching codes that arrive close together is the obvious refinement, if code requests start to matter.
+
 ## Results
 **Full soak (150 min, binary `c020e7d`, soak v2 harness before the seventh-review changes): FAIL on two gates, with no wrong answers.**
 - **Answers:** 7,235 matches, 0 wrong, 0 refusals. 43 answers were unavailable from the reference, and 22 skim requests failed in transport (counted as unanswered).

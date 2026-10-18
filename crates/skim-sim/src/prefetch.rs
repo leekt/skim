@@ -108,51 +108,33 @@ pub(crate) async fn resolve_inner<T: skim_snap::Transport>(
     for (k, f) in keys.iter().copied().zip(sched.submit(&keys, prio)) {
         pending.push(async move { (k, f.await) }.boxed());
     }
-    // SKIM_FETCH_PIPELINE=0 (measurement only): the earlier behaviour, bytecode requested only
-    // after the whole wave is in.
-    static PIPELINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let pipeline = *PIPELINE.get_or_init(|| std::env::var("SKIM_FETCH_PIPELINE").map_or(true, |v| v != "0"));
-    let mut deferred: Vec<Key> = Vec::new();
-    loop {
-        while let Some((k, (res, meta))) = pending.next().await {
-            absorb(&mut r, &meta);
-            match (k, res) {
-                (Key::Account { address, .. }, Ok(Value::Account(a))) => {
-                    let (bal, nonce, ch) = match a {
-                        Some(a) => (a.balance, U256::from(a.nonce), a.code_hash),
-                        None => (U256::ZERO, U256::ZERO, KECCAK_EMPTY),
-                    };
-                    let _ = store.insert_bases_with(
-                        at,
-                        &[(StateKey::Balance(address), bal), (StateKey::Nonce(address), nonce), (StateKey::CodeHash(address), U256::from_be_bytes(ch.0))],
-                        retention,
-                    );
-                    if ch != KECCAK_EMPTY && store.code(&ch).is_none() && codes.insert(ch) {
-                        r.code_round = true;
-                        let k = Key::Code(ch);
-                        if pipeline {
-                            let f = sched.submit(&[k], prio).pop().expect("one key");
-                            pending.push(async move { (k, f.await) }.boxed());
-                        } else {
-                            deferred.push(k);
-                        }
-                    }
+    while let Some((k, (res, meta))) = pending.next().await {
+        absorb(&mut r, &meta);
+        match (k, res) {
+            (Key::Account { address, .. }, Ok(Value::Account(a))) => {
+                let (bal, nonce, ch) = match a {
+                    Some(a) => (a.balance, U256::from(a.nonce), a.code_hash),
+                    None => (U256::ZERO, U256::ZERO, KECCAK_EMPTY),
+                };
+                let _ = store.insert_bases_with(
+                    at,
+                    &[(StateKey::Balance(address), bal), (StateKey::Nonce(address), nonce), (StateKey::CodeHash(address), U256::from_be_bytes(ch.0))],
+                    retention,
+                );
+                if ch != KECCAK_EMPTY && store.code(&ch).is_none() && codes.insert(ch) {
+                    r.code_round = true;
+                    let k = Key::Code(ch);
+                    let f = sched.submit(&[k], prio).pop().expect("one key");
+                    pending.push(async move { (k, f.await) }.boxed());
                 }
-                (Key::Storage { address, slot, .. }, Ok(Value::Storage(v))) => {
-                    let _ = store.insert_base_with(at, StateKey::Storage(address, slot), v, retention);
-                }
-                (Key::Code(_), Ok(Value::Code(c))) => {
-                    store.insert_code(c);
-                }
-                _ => r.failed += 1,
             }
-        }
-        if deferred.is_empty() {
-            break;
-        }
-        let ks = std::mem::take(&mut deferred);
-        for (k, f) in ks.iter().copied().zip(sched.submit(&ks, prio)) {
-            pending.push(async move { (k, f.await) }.boxed());
+            (Key::Storage { address, slot, .. }, Ok(Value::Storage(v))) => {
+                let _ = store.insert_base_with(at, StateKey::Storage(address, slot), v, retention);
+            }
+            (Key::Code(_), Ok(Value::Code(c))) => {
+                store.insert_code(c);
+            }
+            _ => r.failed += 1,
         }
     }
     r.wall_ms = t.elapsed().as_secs_f64() * 1e3;
