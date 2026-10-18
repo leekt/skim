@@ -58,11 +58,71 @@ pub struct SnapDb<'a> {
     pub access: Mutex<Access>,
     /// Analyzed bytecode by code hash, shared across calls (jump-table analysis is per contract,
     /// not per call). Code is content-addressed, so entries never go stale.
-    pub code_cache: &'a parking_lot::RwLock<std::collections::HashMap<B256, Bytecode>>,
+    pub code_cache: &'a CodeCache,
 }
 
-/// Analyzed contracts kept in [`SnapDb::code_cache`] before it is reset.
+/// Analyzed contracts kept in a [`CodeCache`].
 pub const CODE_CACHE_MAX: usize = 4096;
+
+/// Analyzed bytecode by code hash, bounded with clock (second-chance) eviction: a hit only
+/// sets the entry's bit under the read lock; when full, the clock hand clears bits until it
+/// finds an entry not used since its last pass and evicts that one. Hot contracts stay;
+/// previously the whole cache was dropped at the limit.
+pub struct CodeCache {
+    cap: usize,
+    inner: parking_lot::RwLock<ClockInner>,
+}
+
+#[derive(Default)]
+struct ClockInner {
+    map: std::collections::HashMap<B256, (Bytecode, std::sync::atomic::AtomicBool)>,
+    ring: std::collections::VecDeque<B256>,
+}
+
+impl Default for CodeCache {
+    fn default() -> Self {
+        Self::new(CODE_CACHE_MAX)
+    }
+}
+
+impl CodeCache {
+    pub fn new(cap: usize) -> Self {
+        Self { cap: cap.max(1), inner: Default::default() }
+    }
+
+    pub fn get(&self, h: &B256) -> Option<Bytecode> {
+        let g = self.inner.read();
+        let (b, used) = g.map.get(h)?;
+        used.store(true, std::sync::atomic::Ordering::Relaxed);
+        Some(b.clone())
+    }
+
+    pub fn insert(&self, h: B256, b: Bytecode) {
+        let mut g = self.inner.write();
+        if g.map.contains_key(&h) {
+            return;
+        }
+        while g.map.len() >= self.cap {
+            let Some(k) = g.ring.pop_front() else { break };
+            let second_chance = g.map.get(&k).is_some_and(|(_, used)| used.swap(false, std::sync::atomic::Ordering::Relaxed));
+            if second_chance {
+                g.ring.push_back(k);
+            } else {
+                g.map.remove(&k);
+            }
+        }
+        g.map.insert(h, (b, std::sync::atomic::AtomicBool::new(false)));
+        g.ring.push_back(h);
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.read().map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 impl SnapDb<'_> {
     fn get(&self, k: StateKey) -> StateValue {
@@ -95,17 +155,13 @@ impl DatabaseRef for SnapDb<'_> {
         if h == KECCAK_EMPTY {
             return Ok(Bytecode::default());
         }
-        if let Some(b) = self.code_cache.read().get(&h) {
-            return Ok(b.clone());
+        if let Some(b) = self.code_cache.get(&h) {
+            return Ok(b);
         }
         match self.snap.code(&h) {
             Some(c) => {
                 let b = Bytecode::new_raw(c);
-                let mut cache = self.code_cache.write();
-                if cache.len() >= CODE_CACHE_MAX {
-                    cache.clear();
-                }
-                cache.insert(h, b.clone());
+                self.code_cache.insert(h, b.clone());
                 Ok(b)
             }
             None => {
@@ -138,5 +194,45 @@ impl DatabaseRef for SnapDb<'_> {
                 Ok(B256::ZERO)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod code_cache_tests {
+    use super::*;
+
+    fn code(i: u8) -> (B256, Bytecode) {
+        (B256::repeat_byte(i), Bytecode::new_raw(vec![0x60, i, 0x00].into()))
+    }
+
+    #[test]
+    fn a_full_cache_evicts_one_cold_entry_and_keeps_hot_ones() {
+        let c = CodeCache::new(3);
+        for i in 1..=3 {
+            let (h, b) = code(i);
+            c.insert(h, b);
+        }
+        // 1 and 3 are used; 2 isn't.
+        assert!(c.get(&B256::repeat_byte(1)).is_some());
+        assert!(c.get(&B256::repeat_byte(3)).is_some());
+        let (h4, b4) = code(4);
+        c.insert(h4, b4);
+        assert_eq!(c.len(), 3, "bounded, and not cleared");
+        assert!(c.get(&B256::repeat_byte(2)).is_none(), "the cold entry went");
+        for i in [1, 3, 4] {
+            assert!(c.get(&B256::repeat_byte(i)).is_some(), "entry {i} stays");
+        }
+    }
+
+    #[test]
+    fn stays_bounded_under_churn() {
+        let c = CodeCache::new(16);
+        for i in 0..=255u8 {
+            let (h, b) = code(i);
+            c.insert(h, b);
+            let _ = c.get(&B256::repeat_byte(7)); // one hot contract
+        }
+        assert_eq!(c.len(), 16);
+        assert!(c.get(&B256::repeat_byte(7)).is_some());
     }
 }

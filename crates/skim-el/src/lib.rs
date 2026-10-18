@@ -5,6 +5,39 @@
 //! peer-selecting fetch client.
 
 pub mod book;
+
+/// Requests skim sent to peers, by kind (process-wide): what request coalescing and fetch
+/// pipelining save is measured with these. Continuations of a partial response count again.
+pub mod requests {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub static HEADERS: AtomicU64 = AtomicU64::new(0);
+    pub static BODIES: AtomicU64 = AtomicU64::new(0);
+    pub static RECEIPTS: AtomicU64 = AtomicU64::new(0);
+    pub static BALS: AtomicU64 = AtomicU64::new(0);
+    pub static SNAP_ACCOUNT: AtomicU64 = AtomicU64::new(0);
+    pub static SNAP_STORAGE: AtomicU64 = AtomicU64::new(0);
+    pub static SNAP_CODE: AtomicU64 = AtomicU64::new(0);
+    pub static SNAP_OTHER: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn add(c: &AtomicU64) {
+        c.fetch_add(1, Relaxed);
+    }
+
+    /// `(kind, count)` for every kind.
+    pub fn counts() -> [(&'static str, u64); 8] {
+        [
+            ("headers", HEADERS.load(Relaxed)),
+            ("bodies", BODIES.load(Relaxed)),
+            ("receipts", RECEIPTS.load(Relaxed)),
+            ("block_access_lists", BALS.load(Relaxed)),
+            ("snap_account", SNAP_ACCOUNT.load(Relaxed)),
+            ("snap_storage", SNAP_STORAGE.load(Relaxed)),
+            ("snap_code", SNAP_CODE.load(Relaxed)),
+            ("snap_other", SNAP_OTHER.load(Relaxed)),
+        ]
+    }
+}
 pub mod serve;
 mod snap1;
 
@@ -358,6 +391,12 @@ impl ElNet {
 
     /// Sends a SNAP request over whichever version the peer negotiated.
     async fn snap_any(&self, peer: PeerId, request: SnapProtocolMessage) -> Timed<SnapResponse> {
+        requests::add(match &request {
+            SnapProtocolMessage::GetAccountRange(_) => &requests::SNAP_ACCOUNT,
+            SnapProtocolMessage::GetStorageRanges(_) => &requests::SNAP_STORAGE,
+            SnapProtocolMessage::GetByteCodes(_) => &requests::SNAP_CODE,
+            _ => &requests::SNAP_OTHER,
+        });
         let snap2 = self.peers.read().get(&peer).is_some_and(|p| p.snap2);
         if snap2 {
             return self.snap(peer, request).await;
@@ -388,6 +427,17 @@ impl ElNet {
         self.handle.num_connected_peers()
     }
 
+    /// [`Self::send`], counted under `kind` in [`requests`].
+    async fn send_counted<T>(
+        &self,
+        kind: &std::sync::atomic::AtomicU64,
+        peer: PeerId,
+        make: impl FnOnce(oneshot::Sender<reth_network::p2p::error::RequestResult<T>>) -> PeerRequest,
+    ) -> Timed<T> {
+        requests::add(kind);
+        self.send(peer, make).await
+    }
+
     async fn send<T>(
         &self,
         peer: PeerId,
@@ -412,14 +462,14 @@ impl ElNet {
         limit: u64,
     ) -> Timed<Vec<Header>> {
         let request = GetBlockHeaders { start_block: start, limit, skip: 0, direction: HeadersDirection::Rising };
-        let (r, d) = self.send(peer, |response| PeerRequest::GetBlockHeaders { request, response }).await;
+        let (r, d) = self.send_counted(&requests::HEADERS, peer, |response| PeerRequest::GetBlockHeaders { request, response }).await;
         (r.map(|h| h.0), d)
     }
 
     /// eth/71 `GetBlockAccessLists`. `None` entries are "unavailable" (`0x80`).
     pub async fn bals(&self, peer: PeerId, hashes: Vec<B256>) -> Timed<BlockAccessLists> {
         let request = GetBlockAccessLists(hashes);
-        self.send(peer, |response| PeerRequest::GetBlockAccessLists { request, response }).await
+        self.send_counted(&requests::BALS, peer, |response| PeerRequest::GetBlockAccessLists { request, response }).await
     }
 
     async fn snap(&self, peer: PeerId, request: SnapProtocolMessage) -> Timed<SnapResponse> {
@@ -519,14 +569,14 @@ impl ElNet {
     /// Headers walking towards genesis from `start` (inclusive).
     pub async fn headers_falling(&self, peer: PeerId, start: BlockHashOrNumber, limit: u64) -> Timed<Vec<Header>> {
         let request = GetBlockHeaders { start_block: start, limit, skip: 0, direction: HeadersDirection::Falling };
-        let (r, d) = self.send(peer, |response| PeerRequest::GetBlockHeaders { request, response }).await;
+        let (r, d) = self.send_counted(&requests::HEADERS, peer, |response| PeerRequest::GetBlockHeaders { request, response }).await;
         (r.map(|h| h.0), d)
     }
 
     /// `GetBlockBodies`. Callers verify each body against its header's `transactions_root`.
     pub async fn bodies(&self, peer: PeerId, hashes: Vec<B256>) -> Timed<Vec<BlockBody>> {
         let request = GetBlockBodies(hashes);
-        let (r, d) = self.send(peer, |response| PeerRequest::GetBlockBodies { request, response }).await;
+        let (r, d) = self.send_counted(&requests::BODIES, peer, |response| PeerRequest::GetBlockBodies { request, response }).await;
         (r.map(|b| b.0), d)
     }
 
@@ -537,7 +587,7 @@ impl ElNet {
         let mut out = Vec::new();
         for _ in 0..64 {
             let request = GetReceipts70 { first_block_receipt_index: out.len() as u64, block_hashes: vec![hash] };
-            let (r, _) = self.send(peer, |response| PeerRequest::GetReceipts70 { request, response }).await;
+            let (r, _) = self.send_counted(&requests::RECEIPTS, peer, |response| PeerRequest::GetReceipts70 { request, response }).await;
             match r {
                 Ok(mut m) => {
                     let got = m.receipts.pop().unwrap_or_default();
@@ -565,7 +615,7 @@ impl ElNet {
                 break;
             }
             let request = GetReceipts70 { first_block_receipt_index: cur.len() as u64, block_hashes: hashes[out.len()..].to_vec() };
-            let (r, _) = self.send(peer, |response| PeerRequest::GetReceipts70 { request, response }).await;
+            let (r, _) = self.send_counted(&requests::RECEIPTS, peer, |response| PeerRequest::GetReceipts70 { request, response }).await;
             let m = match r {
                 Ok(m) => m,
                 Err(e) if out.is_empty() => return (Err(e), start.elapsed()),

@@ -19,11 +19,10 @@ Items are removed from this file when they're done, and the commit that closes o
    the head-following figure.
 
 ## Performance
-8. **EVM execution on a bounded CPU pool,** without slowing short warm calls (measured).
-9. **Reused per-run EVM setup; partial eviction for the bytecode-analysis cache** (it clears all
-   4,096 entries when full).
-10. **Peer-request counts** for request coalescing and completion-order fetching: metrics, and
-    before/after numbers.
+10. **Peer-request counts: before/after numbers.** Counters exist (`skim_peer_requests_total{kind}`
+    and `skim_status.peer_requests`: headers, bodies, receipts, block access lists, SNAP account /
+    storage / code). Done when request coalescing and completion-order fetching each have a
+    measured before/after on a fixed workload.
 
 ## smallname
 16. **Unsupported routes:** permissions by `name` / `registration_id` (needs `TokenResource`

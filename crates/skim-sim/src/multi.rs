@@ -456,7 +456,7 @@ impl Simulator {
         let at = if self.miss_at_parent { self.store.block(b.number.saturating_sub(1)).unwrap_or(*b) } else { *b };
         let retention = *self.on_demand.read();
         for _ in 0..MAX_ROUNDS {
-            let (out, access) = self.simulate_once(&snap, &header, blocks, place, opts)?;
+            let (out, access) = self.cpu(|| self.simulate_once(&snap, &header, blocks, place, opts)).await?;
             if !access.has_misses() {
                 self.keep_warm(&access);
                 return Ok(out);
@@ -488,29 +488,34 @@ impl Simulator {
         let (snap, header) = self.snapshot_ctx(b)?;
         let mut list = tx.access_list.clone();
         for _ in 0..10 {
-            let (store, at) = (self.store.clone(), *snap.block());
-            let block_hash = move |n: u64| store.block_hash_at(&at, n);
-            let sdb = db::SnapDb { snap: &snap, block_hash: &block_hash, access: Default::default(), code_cache: &self.code_cache };
-            let mut cache = CacheDB::new(&sdb);
-            if let Some(o) = &overrides {
-                apply_state_overrides(&mut cache, o)?;
-            }
-            let mut t = tx.clone();
-            t.access_list = list.clone();
-            if t.tx_type == 0 && !list.0.is_empty() {
-                // An access list makes it (at least) an EIP-2930 transaction; legacy ones don't
-                // pay for, or benefit from, a list.
-                t.tx_type = 1;
-            }
-            let mut evm = Context::mainnet()
-                .with_db(&mut cache)
-                .with_block(env::block_env(&header))
-                .with_cfg(env::call_cfg())
-                .build_mainnet_with_inspector(AccessListInspector::new(list.clone()));
-            let res = evm.inspect_tx(t).map_err(|e| SimError::Evm(format!("{e:?}")))?;
-            let next = evm.inspector.access_list();
-            drop(evm);
-            refuse_misses(&sdb)?;
+            let (res, next) = self
+                .cpu(|| {
+                    let (store, at) = (self.store.clone(), *snap.block());
+                    let block_hash = move |n: u64| store.block_hash_at(&at, n);
+                    let sdb = db::SnapDb { snap: &snap, block_hash: &block_hash, access: Default::default(), code_cache: &self.code_cache };
+                    let mut cache = CacheDB::new(&sdb);
+                    if let Some(o) = &overrides {
+                        apply_state_overrides(&mut cache, o)?;
+                    }
+                    let mut t = tx.clone();
+                    t.access_list = list.clone();
+                    if t.tx_type == 0 && !list.0.is_empty() {
+                        // An access list makes it (at least) an EIP-2930 transaction; legacy ones
+                        // don't pay for, or benefit from, a list.
+                        t.tx_type = 1;
+                    }
+                    let mut evm = Context::mainnet()
+                        .with_db(&mut cache)
+                        .with_block(env::block_env(&header))
+                        .with_cfg(env::call_cfg())
+                        .build_mainnet_with_inspector(AccessListInspector::new(list.clone()));
+                    let res = evm.inspect_tx(t).map_err(|e| SimError::Evm(format!("{e:?}")))?;
+                    let next = evm.inspector.access_list();
+                    drop(evm);
+                    refuse_misses(&sdb)?;
+                    Ok::<_, SimError>((res, next))
+                })
+                .await?;
             if next == list {
                 return Ok(AccessListOutcome { access_list: list, gas_used: res.result.tx_gas_used(), result: res.result });
             }
@@ -593,19 +598,23 @@ impl Simulator {
         let mut plain = None;
         let rounds = if base.prestate.is_some() { MAX_REPLAY_ROUNDS } else { MAX_ROUNDS };
         for _ in 0..rounds {
-            let sdb = db::SnapDb { snap: &snap, block_hash: &block_hash, access: Default::default(), code_cache: &self.code_cache };
-            let mut cache = CacheDB::new(&sdb);
-            prepare(&mut cache, base)?;
-            if wants_prestate {
-                use revm::Database;
-                let _ = cache.basic(benv.beneficiary);
-            }
-            let r = {
-                let mut evm = Context::mainnet().with_db(&mut cache).with_block(benv.clone()).with_cfg(cfg.clone()).build_mainnet();
-                evm.transact(tx.clone())
-            };
-            drop(cache);
-            let access = sdb.access.into_inner().unwrap();
+            let (r, access) = self
+                .cpu(|| {
+                    let sdb = db::SnapDb { snap: &snap, block_hash: &block_hash, access: Default::default(), code_cache: &self.code_cache };
+                    let mut cache = CacheDB::new(&sdb);
+                    prepare(&mut cache, base)?;
+                    if wants_prestate {
+                        use revm::Database;
+                        let _ = cache.basic(benv.beneficiary);
+                    }
+                    let r = {
+                        let mut evm = Context::mainnet().with_db(&mut cache).with_block(benv.clone()).with_cfg(cfg.clone()).build_mainnet();
+                        evm.transact(tx.clone())
+                    };
+                    drop(cache);
+                    Ok::<_, SimError>((r, sdb.access.into_inner().unwrap()))
+                })
+                .await?;
             if !access.has_misses() {
                 self.keep_warm(&access);
                 // Only now is a rejection meaningful: with unknown state (e.g. the sender not yet
@@ -628,10 +637,14 @@ impl Simulator {
         }
         let plain = plain.ok_or(SimError::Incomplete(rounds))?;
         // 2. The traced run on the same, now fully known, state.
-        let sdb = db::SnapDb { snap: &snap, block_hash: &block_hash, access: Default::default(), code_cache: &self.code_cache };
-        let mut cache = CacheDB::new(&sdb);
-        prepare(&mut cache, base)?;
-        let trace = run_tracer(&mut cache, &sdb, benv, cfg, tx, opts)?;
+        let trace = self
+            .cpu(|| {
+                let sdb = db::SnapDb { snap: &snap, block_hash: &block_hash, access: Default::default(), code_cache: &self.code_cache };
+                let mut cache = CacheDB::new(&sdb);
+                prepare(&mut cache, base)?;
+                run_tracer(&mut cache, &sdb, benv, cfg, tx, opts)
+            })
+            .await?;
         Ok((trace, plain))
     }
 }

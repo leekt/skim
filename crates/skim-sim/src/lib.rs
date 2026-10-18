@@ -98,7 +98,7 @@ pub struct Simulator {
     pub predictor: Mutex<predictor::Predictor>,
     /// Headers by number, with their hash computed once on insert.
     headers: RwLock<BTreeMap<u64, (B256, Arc<Header>)>>,
-    code_cache: RwLock<std::collections::HashMap<B256, revm::bytecode::Bytecode>>,
+    code_cache: db::CodeCache,
     /// Resolve misses at the parent root (peers may not have executed the head yet).
     pub miss_at_parent: bool,
     /// Retention for state fetched on demand (unsubscribed): `Ttl(n)` keeps it current for n
@@ -107,6 +107,8 @@ pub struct Simulator {
     /// How long an interactive request waits for a SNAP peer when none is connected, before
     /// giving up (`--state-wait`).
     pub state_wait: RwLock<std::time::Duration>,
+    /// EVM runs in progress, at most one per CPU (see [`Self::cpu`]).
+    cpu: tokio::sync::Semaphore,
     /// Miss rounds an interactive call may take (`on_demand.max_fetch_rounds`): each round
     /// fetches the state the previous run stopped at, so deep call chains need more.
     pub max_rounds: std::sync::atomic::AtomicUsize,
@@ -119,11 +121,12 @@ impl Simulator {
             sched,
             predictor: Mutex::new(predictor),
             headers: RwLock::default(),
-            code_cache: RwLock::default(),
+            code_cache: db::CodeCache::default(),
             miss_at_parent: true,
             on_demand: RwLock::new(Retention::Ttl(4)),
             max_rounds: std::sync::atomic::AtomicUsize::new(8),
             state_wait: RwLock::new(std::time::Duration::from_secs(60)),
+            cpu: tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(2, |n| n.get())),
         })
     }
 
@@ -141,6 +144,18 @@ impl Simulator {
             keys.extend(account_keys(*a));
         }
         self.store.touch_ttl(&keys, n);
+    }
+
+    /// CPU-bound EVM work: at most one run per CPU at a time, and off the async workers
+    /// (`block_in_place` hands this worker's other tasks to another thread for the duration), so
+    /// a burst of heavy calls can't stall request handling, block following or peer I/O. On a
+    /// current-thread runtime (tests) it runs inline.
+    pub async fn cpu<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _permit = self.cpu.acquire().await.expect("never closed");
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+            _ => f(),
+        }
     }
 
     /// Before an interactive fetch wave: if no SNAP peer is connected (e.g. right after a cold
@@ -233,7 +248,7 @@ impl Simulator {
         let (mut fetched_accounts, mut fetched_storage) = (Vec::new(), Vec::new());
         loop {
             let t = Instant::now();
-            let (result, access) = self.execute(&snap, &header, tx.clone())?;
+            let (result, access) = self.cpu(|| self.execute(&snap, &header, tx.clone())).await?;
             exec_us += t.elapsed().as_secs_f64() * 1e6;
             fetched_accounts.extend_from_slice(&access.miss_accounts);
             fetched_storage.extend_from_slice(&access.miss_storage);

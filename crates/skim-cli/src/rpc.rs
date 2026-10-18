@@ -710,6 +710,9 @@ impl Rpc {
                     "snap_peers": peers.iter().filter(|(_, p)| p.snap1 || p.snap2).count(),
                     "peer_acquisition": acquisition,
                     "served": self.served_json(),
+                    // Requests sent to peers since start, by kind (continuations of partial
+                    // responses count again).
+                    "peer_requests": skim_el::requests::counts().into_iter().map(|(k, n)| (k.to_string(), json!(n))).collect::<serde_json::Map<_, _>>(),
                     "history": self.chain.as_ref().map(|c| c.history_json()),
                     "snap_fetch": {
                         "stats": sim.sched.stats(),
@@ -808,6 +811,9 @@ impl Rpc {
         }
         let peers = sim.sched.transport().net.peers();
         gauge!("skim_peers", "layer" => "el").set(peers.len() as f64);
+        for (kind, n) in skim_el::requests::counts() {
+            counter!("skim_peer_requests_total", "kind" => kind).absolute(n);
+        }
         gauge!("skim_snap_peers").set(peers.iter().filter(|(_, p)| p.snap1 || p.snap2).count() as f64);
         for c in crate::dashboard::by_kind(peers.iter().map(|(_, p)| p.client.as_str())) {
             gauge!("skim_peer_clients", "layer" => "el", "client" => c["client"].as_str().unwrap_or("").to_string()).set(c["count"].as_f64().unwrap_or(0.0));
