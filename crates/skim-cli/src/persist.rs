@@ -234,12 +234,37 @@ const CATCHUP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// few hundred blocks within the budget (measured with `skim probe-catchup`).
 const CATCHUP_PARALLEL: usize = 8;
 
+/// Payload envelopes by slot range from consensus peers: `ClNode` in production, a stand-in in
+/// tests. Returns the peer that was asked (if any) and the raw SSZ envelopes.
+pub trait EnvelopeSource: Send + Sync {
+    fn envelopes_by_range_from(
+        &self,
+        start_slot: u64,
+        count: u64,
+        timeout: std::time::Duration,
+    ) -> futures::future::BoxFuture<'_, (Option<String>, anyhow::Result<Vec<Vec<u8>>>)>;
+}
+
+impl EnvelopeSource for skim_cl::ClNode {
+    fn envelopes_by_range_from(
+        &self,
+        start_slot: u64,
+        count: u64,
+        timeout: std::time::Duration,
+    ) -> futures::future::BoxFuture<'_, (Option<String>, anyhow::Result<Vec<Vec<u8>>>)> {
+        Box::pin(async move {
+            let (peer, res) = skim_cl::ClNode::envelopes_by_range_from(self, start_slot, count, timeout).await;
+            (peer.map(|p| p.to_string()), res)
+        })
+    }
+}
+
 /// Walks back from `head_slot` in 32-slot `ByRange` windows, newest first, up to
 /// [`CATCHUP_PARALLEL`] at a time, until `keep` says the envelopes collected so far suffice,
 /// recording every request in `trace`. Each envelope is verified (payload hash) before `keep`
 /// sees it.
 pub async fn walk_envelopes(
-    cl: &skim_cl::ClNode,
+    cl: &(impl EnvelopeSource + ?Sized),
     head_slot: u64,
     max_slots: u64,
     expected_blocks: u64,
@@ -261,7 +286,7 @@ pub async fn walk_envelopes(
             }
             let t = Instant::now();
             let (peer, res) = cl.envelopes_by_range_from(start, end - start + 1, left).await;
-            let mut req = RangeRequest { start_slot: start, end_slot: end, peer: peer.map(|p| p.to_string()), ms: t.elapsed().as_millis() as u64, envelopes: 0, bytes: 0, error: None };
+            let mut req = RangeRequest { start_slot: start, end_slot: end, peer, ms: t.elapsed().as_millis() as u64, envelopes: 0, bytes: 0, error: None };
             match res {
                 Ok(c) => {
                     req.envelopes = c.len();

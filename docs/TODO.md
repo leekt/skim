@@ -4,10 +4,6 @@ What's known to be missing or unproven, as of 2026-10-18. Each item says what "d
 Items are removed from this file when they're done, and the commit that closes one says so.
 
 ## Correctness and tests
-4. **Header-only misses don't wait for SNAP peers.** Covered for `eth_call` with no peers at all
-   (`crates/skim-sim/tests/header_only_miss.rs`: bounded `Incomplete`, never `NoStatePeers`).
-   Still untested: an eth-only peer supplying the header so the call completes, and the
-   `eth_simulateV1` / trace paths (`multi.rs`), which have the same shortcut.
 5. **Soak on the current build.** The last full soak (`c020e7d`) predates history, streams and the
    eighth/ninth review fixes, and failed freshness (old metric) and config-switch recovery (407 s,
    215 s). Done: a 150-minute soak on the current build, results in the experiment log, with any
@@ -23,9 +19,6 @@ Items are removed from this file when they're done, and the commit that closes o
     and `skim_status.peer_requests`: headers, bodies, receipts, block access lists, SNAP account /
     storage / code). Done when request coalescing and completion-order fetching each have a
     measured before/after on a fixed workload.
-
-## Streams and modules
-20. **The CL gap-fill fallback has no test** (`ClNode` has no network-free seam).
 
 ## smallname
 16. **Unsupported routes:** permissions by `registration_id`, resolver `links` / `roles`,

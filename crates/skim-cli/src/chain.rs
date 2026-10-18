@@ -40,7 +40,7 @@ pub struct Chain {
     /// Consensus peers: the missing blocks' payload envelopes (with their BALs) when no EL peer
     /// serves them. A missed gossip payload must not stall the follower until an eth/71 peer
     /// shows up (measured: 5 minutes with only crawlers connected on the EL side).
-    pub cl: Option<skim_cl::ClNode>,
+    pub cl: Option<Arc<dyn crate::persist::EnvelopeSource>>,
 }
 
 impl Chain {
@@ -145,7 +145,7 @@ impl Chain {
         // No EL peer could: the same blocks from consensus peers (payload envelopes carry the
         // header fields and the BAL, each envelope checked against its block hash).
         if let Some(cl) = &self.cl {
-            match self.reconcile_via_cl(cl, b, head.number).await {
+            match self.reconcile_via_cl(cl.as_ref(), b, head.number).await {
                 Ok(r) => return Ok(r),
                 Err(e) => tracing::debug!(number = b.number, "gap fill via consensus peers: {e}"),
             }
@@ -156,7 +156,7 @@ impl Chain {
     /// Fills `b`'s missing ancestors from consensus peers: walks payload envelopes back from
     /// `b`'s slot until the collected blocks link (by hash) from a block the store holds to `b`'s
     /// parent, then rolls back to that block and applies them in order.
-    async fn reconcile_via_cl(&self, cl: &skim_cl::ClNode, b: &BlockRef, head: u64) -> anyhow::Result<(u64, u64)> {
+    async fn reconcile_via_cl(&self, cl: &dyn crate::persist::EnvelopeSource, b: &BlockRef, head: u64) -> anyhow::Result<(u64, u64)> {
         let slot = b.timestamp.saturating_sub(skim_cl::node::SEPOLIA_GENESIS_TIME) / 12;
         let mut got: std::collections::BTreeMap<u64, (Header, BlockWrites)> = Default::default();
         let mut found: Option<u64> = None;
@@ -197,4 +197,136 @@ impl Chain {
 enum Reconcile {
     NoAncestor,
     Defer(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::U256;
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    const GENESIS: u64 = skim_cl::node::SEPOLIA_GENESIS_TIME;
+    /// Block `n` sits in slot `SLOT0 + n`.
+    const SLOT0: u64 = 1_000_000;
+
+    /// A `SignedExecutionPayloadEnvelope` (SSZ, Gloas layout) for block `number` on top of
+    /// `parent`, with an empty BAL; its `block_hash` is what `verify_payload` rebuilds. Returns
+    /// the rebuilt header and the bytes.
+    fn envelope(parent: B256, number: u64, salt: u8) -> (Header, Vec<u8>) {
+        let slot = SLOT0 + number;
+        let timestamp = GENESIS + slot * 12;
+        let bal: &[u8] = &[0xc0]; // RLP of an empty list: an empty, valid BAL
+        let mut payload = vec![0u8; 540];
+        payload[0..32].copy_from_slice(parent.as_slice());
+        payload[32..52].copy_from_slice(&[salt; 20]); // fee recipient: tells forks apart
+        payload[404..412].copy_from_slice(&number.to_le_bytes());
+        payload[412..420].copy_from_slice(&30_000_000u64.to_le_bytes());
+        payload[428..436].copy_from_slice(&timestamp.to_le_bytes());
+        payload[440..472].copy_from_slice(&U256::from(7u64).to_le_bytes::<32>());
+        payload[532..540].copy_from_slice(&slot.to_le_bytes());
+        // Variable fields: extra_data, transactions, withdrawals (all empty), then the BAL.
+        for off in [436, 504, 508, 528] {
+            payload[off..off + 4].copy_from_slice(&540u32.to_le_bytes());
+        }
+        payload.extend_from_slice(bal);
+        let requests = [12u32.to_le_bytes(), 12u32.to_le_bytes(), 12u32.to_le_bytes()].concat(); // three empty lists
+        let mut msg = vec![0u8; 80];
+        msg[0..4].copy_from_slice(&80u32.to_le_bytes());
+        msg[4..8].copy_from_slice(&((80 + payload.len()) as u32).to_le_bytes());
+        msg.extend_from_slice(&payload);
+        msg.extend_from_slice(&requests);
+        let mut signed = 100u32.to_le_bytes().to_vec();
+        signed.extend_from_slice(&[0u8; 96]);
+        signed.extend_from_slice(&msg);
+        // block_hash = the hash of the header rebuilt from these fields.
+        let header = {
+            let env = skim_cl::ssz::Envelope::parse(&signed).expect("valid layout");
+            skim_cl::verify::rebuild_header(&env)
+        };
+        let at = 100 + 80 + 472;
+        signed[at..at + 32].copy_from_slice(header.hash_slow().as_slice());
+        let env = skim_cl::ssz::Envelope::parse(&signed).unwrap();
+        assert!(skim_cl::verify::verify_payload(&env).ok);
+        (header, signed)
+    }
+
+    /// `count` linked blocks from `from`, on top of `parent`.
+    fn fork(parent: B256, from: u64, count: u64, salt: u8) -> Vec<(Header, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut p = parent;
+        for n in from..from + count {
+            let (h, b) = envelope(p, n, salt);
+            p = h.hash_slow();
+            out.push((h, b));
+        }
+        out
+    }
+
+    /// Consensus peers that serve these envelopes by slot (nothing else, no network).
+    struct Envelopes(BTreeMap<u64, Vec<u8>>);
+
+    impl crate::persist::EnvelopeSource for Envelopes {
+        fn envelopes_by_range_from(
+            &self,
+            start_slot: u64,
+            count: u64,
+            _timeout: Duration,
+        ) -> futures::future::BoxFuture<'_, (Option<String>, anyhow::Result<Vec<Vec<u8>>>)> {
+            let out = self.0.range(start_slot..start_slot + count).map(|(_, b)| b.clone()).collect();
+            Box::pin(async move { (Some("test".into()), Ok(out)) })
+        }
+    }
+
+    async fn chain_at(head: &Header, envelopes: &[(Header, Vec<u8>)], with_cl: bool) -> Chain {
+        let store = Store::new(64);
+        store.apply_block(block_ref(head), Default::default()).unwrap();
+        // A real node restricted to trusted peers with none trusted: never any EL peer.
+        let net = ElNet::start_sepolia(0, vec![], true).await.expect("local node");
+        let source = Envelopes(envelopes.iter().map(|(h, b)| (h.slot_number.unwrap(), b.clone())).collect());
+        Chain {
+            store,
+            net,
+            on_header: Box::new(|_| {}),
+            lookback: 4,
+            cl: with_cl.then(|| Arc::new(source) as Arc<dyn crate::persist::EnvelopeSource>),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gap_with_no_el_peers_is_filled_from_consensus_peers() {
+        // A100 stored; A104 arrives (gossip missed A101..A103); no EL peer; consensus peers
+        // serve A101..A103.
+        let a = fork(B256::repeat_byte(0x99), 100, 5, 0xa);
+        let chain = chain_at(&a[0].0, &a[1..4], true).await;
+        match chain.place(a[4].0.clone(), Default::default()).await {
+            Placed::Applied { filled, reorged_to, .. } => assert_eq!((filled, reorged_to), (3, None)),
+            other => panic!("expected the gap filled, got {other:?}"),
+        }
+        assert_eq!(chain.store.head().map(|h| h.hash), Some(a[4].0.hash_slow()));
+        for (h, _) in &a[1..4] {
+            assert_eq!(chain.store.block(h.number).map(|b| b.hash), Some(h.hash_slow()), "block {}", h.number);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn envelopes_from_another_fork_are_not_applied() {
+        // A100 stored; A104 arrives; consensus peers only have B101..B103, a fork that doesn't
+        // lead to A104. Nothing is applied: the block waits.
+        let a = fork(B256::repeat_byte(0x99), 100, 5, 0xa);
+        let b = fork(a[0].0.hash_slow(), 101, 3, 0xb);
+        let chain = chain_at(&a[0].0, &b, true).await;
+        let r = chain.place(a[4].0.clone(), Default::default()).await;
+        assert!(matches!(r, Placed::Deferred(_)), "{r:?}");
+        assert_eq!(chain.store.head().map(|h| h.number), Some(100));
+        assert!(chain.store.block(101).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_consensus_peers_the_gap_waits() {
+        // The same gap with no envelope source: deferred (what the fallback replaces).
+        let a = fork(B256::repeat_byte(0x99), 100, 5, 0xa);
+        let chain = chain_at(&a[0].0, &a[1..4], false).await;
+        assert!(matches!(chain.place(a[4].0.clone(), Default::default()).await, Placed::Deferred(_)));
+    }
 }
