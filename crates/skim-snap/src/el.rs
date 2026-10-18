@@ -59,6 +59,10 @@ pub struct ElTransport {
     /// Verified accounts by (state root, address, peer), shared by concurrent slot lookups to
     /// the same peer. Per peer, so one slow peer never blocks lookups routed to others.
     accounts: Arc<Mutex<HashMap<(B256, Address, PeerId), AccountCell>>>,
+    /// Verified account values by (state root, address), whichever peer proved them: a value
+    /// proven against the root is the same for every peer, so a slot request placed on another
+    /// peer reuses it instead of fetching (and proving) the account again.
+    verified: Arc<Mutex<HashMap<(B256, Address), Option<AccountState>>>>,
 }
 
 /// A contract's whole storage at a root.
@@ -208,7 +212,7 @@ impl ElTransport {
     }
 
     pub fn new(net: ElNet) -> Self {
-        Self { net, excluded: Default::default(), rejections: Default::default(), accounts: Default::default() }
+        Self { net, excluded: Default::default(), rejections: Default::default(), accounts: Default::default(), verified: Default::default() }
     }
 
     pub fn exclude(&self, peer: PeerId) {
@@ -258,9 +262,12 @@ impl ElTransport {
         }
     }
 
-    /// The verified account at `root`, fetched once per (root, address, peer) across concurrent
-    /// callers. Failures aren't cached.
+    /// The verified account at `root`: reused if any peer already proved it; otherwise fetched
+    /// once per (root, address, peer) across concurrent callers. Failures aren't cached.
     async fn account_shared(&self, peer: PeerId, root: B256, address: Address) -> Result<Option<Option<AccountState>>, TransportError> {
+        if let Some(a) = self.verified.lock().get(&(root, address)) {
+            return Ok(Some(*a));
+        }
         let cell = {
             let mut map = self.accounts.lock();
             if map.len() > 8192 {
@@ -280,7 +287,14 @@ impl ElTransport {
             })
             .await;
         match res {
-            Ok(a) => Ok(Some(*a)),
+            Ok(a) => {
+                let mut v = self.verified.lock();
+                if v.len() > 8192 {
+                    v.clear();
+                }
+                v.insert((root, address), *a);
+                Ok(Some(*a))
+            }
             Err(TransportError::Other(_)) => Ok(None),
             Err(e) => Err(e),
         }

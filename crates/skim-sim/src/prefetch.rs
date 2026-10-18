@@ -17,6 +17,8 @@ use revm::primitives::KECCAK_EMPTY;
 use skim_bal::StateKey;
 use skim_snap::{FetchMeta, Key, Priority, Scheduler, Value, el::ElTransport};
 use skim_state::{BlockRef, Retention, Snapshot, StateValue, Store};
+#[cfg(test)]
+use std::sync::Arc;
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Resolve {
@@ -79,10 +81,13 @@ pub async fn resolve_with(
     resolve_inner(store, sched, at, accounts, storage, code, prio, Retention::Subscribed).await
 }
 
+/// Fetches the keys and installs each verified value as soon as it arrives (completion order),
+/// so an account's bytecode request starts when that account is in, not after the whole wave.
+/// Returns once every key, and every bytecode it led to, has an answer.
 #[allow(clippy::too_many_arguments)]
-async fn resolve_inner(
+pub(crate) async fn resolve_inner<T: skim_snap::Transport>(
     store: &Store,
-    sched: &Scheduler<ElTransport>,
+    sched: &Scheduler<T>,
     at: &BlockRef,
     accounts: &[Address],
     storage: &[(Address, U256)],
@@ -90,14 +95,20 @@ async fn resolve_inner(
     prio: Priority,
     retention: Retention,
 ) -> Resolve {
+    use futures::{FutureExt, StreamExt};
     let t = std::time::Instant::now();
     let root = at.state_root;
     let mut keys: Vec<Key> = accounts.iter().map(|&address| Key::Account { root, address }).collect();
     keys.extend(storage.iter().map(|&(address, slot)| Key::Storage { root, address, slot }));
     keys.extend(code.iter().map(|&h| Key::Code(h)));
     let mut r = Resolve { keys: keys.len(), ..Default::default() };
-    let mut chained = Vec::new();
-    for (k, (res, meta)) in keys.iter().zip(sched.fetch_detailed_with(&keys, prio).await) {
+    // Code hashes requested in this resolve (given, or chained from an account): once each.
+    let mut codes: std::collections::HashSet<B256> = code.iter().copied().collect();
+    let mut pending = futures::stream::FuturesUnordered::new();
+    for (k, f) in keys.iter().copied().zip(sched.submit(&keys, prio)) {
+        pending.push(async move { (k, f.await) }.boxed());
+    }
+    while let Some((k, (res, meta))) = pending.next().await {
         absorb(&mut r, &meta);
         match (k, res) {
             (Key::Account { address, .. }, Ok(Value::Account(a))) => {
@@ -105,32 +116,23 @@ async fn resolve_inner(
                     Some(a) => (a.balance, U256::from(a.nonce), a.code_hash),
                     None => (U256::ZERO, U256::ZERO, KECCAK_EMPTY),
                 };
-                let _ = store.insert_base_with(at, StateKey::Balance(*address), bal, retention);
-                let _ = store.insert_base_with(at, StateKey::Nonce(*address), nonce, retention);
-                let _ = store.insert_base_with(at, StateKey::CodeHash(*address), U256::from_be_bytes(ch.0), retention);
-                if ch != KECCAK_EMPTY && store.code(&ch).is_none() {
-                    chained.push(Key::Code(ch));
+                let _ = store.insert_base_with(at, StateKey::Balance(address), bal, retention);
+                let _ = store.insert_base_with(at, StateKey::Nonce(address), nonce, retention);
+                let _ = store.insert_base_with(at, StateKey::CodeHash(address), U256::from_be_bytes(ch.0), retention);
+                if ch != KECCAK_EMPTY && store.code(&ch).is_none() && codes.insert(ch) {
+                    r.code_round = true;
+                    let k = Key::Code(ch);
+                    let f = sched.submit(&[k], prio).pop().expect("one key");
+                    pending.push(async move { (k, f.await) }.boxed());
                 }
             }
             (Key::Storage { address, slot, .. }, Ok(Value::Storage(v))) => {
-                let _ = store.insert_base_with(at, StateKey::Storage(*address, *slot), v, retention);
+                let _ = store.insert_base_with(at, StateKey::Storage(address, slot), v, retention);
             }
             (Key::Code(_), Ok(Value::Code(c))) => {
                 store.insert_code(c);
             }
             _ => r.failed += 1,
-        }
-    }
-    if !chained.is_empty() {
-        r.code_round = true;
-        for (res, meta) in sched.fetch_detailed_with(&chained, prio).await {
-            absorb(&mut r, &meta);
-            match res {
-                Ok(Value::Code(c)) => {
-                    store.insert_code(c);
-                }
-                _ => r.failed += 1,
-            }
         }
     }
     r.wall_ms = t.elapsed().as_secs_f64() * 1e3;
@@ -318,5 +320,66 @@ mod tests {
         let mut buf = [0xffu8; 64];
         buf[32..].copy_from_slice(&U256::from(6u64).to_be_bytes::<32>());
         assert_eq!(bitmap_slot(-1), U256::from_be_bytes(keccak256(buf).0));
+    }
+
+    // ---- completion-order resolution (no network: a mock transport) ----
+
+    use skim_snap::{AccountAnswer, AccountState, Config, PeerId, SlotAnswer, Transport, TransportError};
+    use std::time::Duration;
+
+    const CODE: &[u8] = b"pipelined-code";
+    const SLOW_SLOT_MS: u64 = 400;
+    const CODE_MS: u64 = 250;
+
+    /// One peer: accounts answer at once (with bytecode to fetch), storage takes `SLOW_SLOT_MS`,
+    /// bytecode `CODE_MS`. Counts account requests.
+    #[derive(Clone, Default)]
+    struct Mock {
+        account_requests: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Transport for Mock {
+        fn snap_peers(&self) -> Vec<PeerId> {
+            vec![PeerId::repeat_byte(1)]
+        }
+        async fn account(&self, _: PeerId, _: B256, _: Address) -> Result<AccountAnswer, TransportError> {
+            self.account_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok(AccountAnswer::Found(Some(AccountState { nonce: 1, balance: U256::from(9), storage_root: B256::ZERO, code_hash: keccak256(CODE) })))
+        }
+        async fn storage(&self, _: PeerId, _: B256, _: Address, slot: U256) -> Result<SlotAnswer, TransportError> {
+            tokio::time::sleep(Duration::from_millis(SLOW_SLOT_MS)).await;
+            Ok(SlotAnswer::Found(slot + U256::from(1)))
+        }
+        async fn codes(&self, _: PeerId, hashes: Vec<B256>) -> Result<Vec<Bytes>, TransportError> {
+            tokio::time::sleep(Duration::from_millis(CODE_MS)).await;
+            Ok(hashes.iter().filter(|h| **h == keccak256(CODE)).map(|_| Bytes::from_static(CODE)).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn bytecode_is_fetched_as_soon_as_its_account_arrives() {
+        // Account (fast) -> its bytecode (250 ms), alongside an unrelated slow slot (400 ms).
+        // Waiting for the whole wave before chaining the bytecode takes 400 + 250 ms; in
+        // completion order the bytecode overlaps the slot, so ~400 ms.
+        let store = Store::new(64);
+        let at = BlockRef { number: 1, hash: B256::repeat_byte(1), parent_hash: B256::ZERO, state_root: B256::repeat_byte(7), timestamp: 12 };
+        store.apply_block(at, Default::default()).unwrap();
+        let mock = Mock::default();
+        let sched = Scheduler::new(mock.clone(), Config { hedge_after: Duration::from_secs(10), deadline: Duration::from_secs(5), ..Default::default() });
+        let (a, s) = (Address::repeat_byte(0xaa), Address::repeat_byte(0xbb));
+        let r = resolve_inner(&store, &sched, &at, &[a], &[(s, U256::from(3))], &[], Priority::High, Retention::Subscribed).await;
+        assert_eq!(r.failed, 0);
+        assert!(r.code_round);
+        assert!(store.code(&keccak256(CODE)).is_some(), "the chained bytecode is installed before returning");
+        let snap = store.snapshot(&at).unwrap();
+        assert_eq!(snap.get(&StateKey::Storage(s, U256::from(3))).unwrap(), StateValue::Known(U256::from(4)));
+        assert_eq!(snap.get(&StateKey::Balance(a)).unwrap(), StateValue::Known(U256::from(9)));
+        assert!(
+            r.wall_ms < (SLOW_SLOT_MS + CODE_MS) as f64 - 100.0,
+            "bytecode waited for the unrelated slot: {:.0} ms",
+            r.wall_ms
+        );
+        assert_eq!(mock.account_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

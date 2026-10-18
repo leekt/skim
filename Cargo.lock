@@ -7713,6 +7713,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-types-eth",
  "alloy-rpc-types-trace",
+ "futures",
  "parking_lot",
  "revm",
  "revm-inspectors",

@@ -339,15 +339,20 @@ impl<T: Transport> Scheduler<T> {
     }
 
     pub async fn fetch_detailed_with(&self, keys: &[Key], prio: Priority) -> Vec<(Result<Value, FetchError>, FetchMeta)> {
+        futures::future::join_all(self.submit(keys, prio)).await
+    }
+
+    /// Enqueues `keys` now and returns one future per key (in input order) that resolves when
+    /// that key's result is in. Unlike [`Self::fetch_detailed_with`], callers can act on each
+    /// result as it completes (e.g. with `FuturesUnordered`) and submit follow-up keys (an
+    /// account's bytecode) without waiting for the rest of the wave.
+    pub fn submit(&self, keys: &[Key], prio: Priority) -> Vec<impl std::future::Future<Output = (Result<Value, FetchError>, FetchMeta)> + Send + 'static> {
         let rxs: Vec<_> = {
             let mut st = self.inner.state.lock();
             keys.iter().map(|k| self.inner.enqueue(&mut st, *k, prio)).collect()
         };
         self.inner.wake.notify_one();
-        futures::future::join_all(rxs.into_iter().map(|rx| async move {
-            rx.await.unwrap_or((Err(FetchError::Deadline), FetchMeta::default()))
-        }))
-        .await
+        rxs.into_iter().map(|rx| async move { rx.await.unwrap_or((Err(FetchError::Deadline), FetchMeta::default())) }).collect()
     }
 
     /// (queued High jobs, queued Low jobs).
