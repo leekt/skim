@@ -219,5 +219,35 @@ Four more runs (two of each mode) lost every SNAP peer partway through ("no SNAP
 - **Steady-state answer rate:** 99.7% or higher for every kind, and every required kind was sampled.
 - **Freshness:** the head was stale 0.0% of steady-state time; the longest gap between new heads was 24.9 s.
 - **Restarts:** 17; 16 recovered in 19-151 s.
-  - **235.5 s (sigkill, config A):** the chain was followed again 15 s after the relaunch, and the restart snapshot was verified and replayed 3 s later. But it held 44 of 50 keys, and the rest needed SNAP. The only SNAP-capable peer, a Besu node, answered "root unavailable". The other EL peers were reth (no SNAP) and crawlers. The first Nethermind peer connected 226 s in, and the subscriptions were ready 10 s after that. This is the same peer-acquisition gap as the second soak's 245 s restart.
-- **Memory: a regression.** RSS median 181 MB, quartiles 157/210 MB, max 263 MB, against at most 134 MB for `5237bc1`. 26 BAL promotions; subscribed keys never over the limit. The builds in between added mimalloc, stream/history code (unused with `--history off`) and the CPU pool. Tracked in [TODO](../TODO.md) item 6.
+  - **235.5 s (sigkill, config A):** the chain was followed again 15 s after the relaunch, and the restart snapshot was verified and replayed 3 s later. The key that wasn't ready was the one the harness subscribes at each restart: the balance of an account that just transacted, which no snapshot can hold. Its value was in a BAL from just before the restart, but after a start the recent-BAL index only covered new blocks, so it waited for SNAP. The only SNAP-capable peer, a Besu node, answered "root unavailable", and the first Nethermind peer connected 226 s in. The same cause explains the second soak's 245 s restart. Fixed in `0e2acfc`: after a start, the 32 blocks before the first applied block are fetched from consensus peers into the index, and keys still waiting are promoted from it (measured live: 31 blocks in 1.7 s).
+- **Memory:** RSS median 181 MB, quartiles 157/210 MB, max 263 MB, against at most 134 MB for `5237bc1`. 26 BAL promotions; subscribed keys never over the limit. The reasons are measured below.
+
+## Memory: why head-only RSS went from ~134 MB to ~230 MB
+Builds side by side on one machine (macOS), each with soak config A and the same per-block requests (seeded by block number), with no restarts. RSS in MB at equal uptime:
+
+| Build | 10 min | 20 min | 30 min | 38 min | 60 min max |
+|---|---|---|---|---|---|
+| `5237bc1` (system allocator) | 110 | 135 | 149 | 161 | 173 |
+| `be3f0fa` without mimalloc | 104 | 130 | 145 | 155 | 172 |
+| `be3f0fa` (mimalloc) | 186 | 217 | 243 | 266 | 287 |
+| current (mimalloc) | 192-211 | 238-251 | 261 | 273 | 301 |
+| current without mimalloc | 129 | 149 | | | |
+| current, mimalloc with eager arena commit off and purge delay 0 | 210 | 241 | | | |
+
+All builds held the same state (1,351 keys, 256 recent BALs, ~19.5 MB of BAL writes).
+- **mimalloc (`106e3dc`), about 80-110 MB.** The same code with the system allocator stays at the old figures. With the system allocator the live heap was 103 MB at 57 min (malloc zone); with mimalloc the physical footprint was 236-255 MB against 86-94 MB, with the same allocation counts. So it is memory mimalloc holds after freeing it, not more live data. Changing its settings didn't help. It was adopted for catch-up on Linux, where glibc's per-thread arenas left RSS at 394-610 MB.
+- **The window filling, the first ~50 minutes.** Every build grows until the 256-block window is full (256 x 12 s = 51 min) and the recent-BAL index and versions reach their size. Soak segments are 7-13 minutes, so soak peaks depend on uptime.
+- **Changes since `be3f0fa`, about 20 MB.** The current build without mimalloc is ~20 MB above `be3f0fa` without it at equal uptime (129 vs 104 at 10 min). It also runs more threads (26 vs 15 to 16), which mimalloc gives per-thread pages.
+- **Leaks:** none seen within 60 minutes. Growth follows the window filling, and keys and BAL sizes stayed equal across builds. A run longer than the window would be needed to rule one out.
+
+## Header walks right after start
+Header and body requests went only to eth/70+ peers (the filter receipts need), at most 4 per pass over ~1.5 s. On a fresh instance there were often none, so a stream below the memory window failed at once with `-32002 headers below N not served by peers`. Locally, 3 of 5 fresh starts failed and no peer was even asked. Fixed in `0e2acfc`: headers and bodies go to any non-crawler peer, up to 8 per pass, waiting up to 30 s for a first one.
+
+Before/after on the deployment host: a `--history local` instance, a stream 2,600 blocks below the head 30 s after it was ready, retried every 10 s for 3 minutes, alternating builds. Seconds from launch:
+
+| | Fresh starts | Restarts (saved peers) |
+|---|---|---|
+| deployed (`466f36e`+) | 93, 61, **failed**, 161 | 171, **failed**, 176 (up to 11 tries) |
+| `0e2acfc` | 125, 169, 98, 64 | 60, 77, 271 (1-3 tries) |
+
+All 7 succeeded with the fix. When no EL peer serves headers at all, which can last minutes for a fresh node (locally every reth peer refused with `TooManyPeers` for 6 minutes), nothing can serve the walk; it now waits instead of failing at once.
