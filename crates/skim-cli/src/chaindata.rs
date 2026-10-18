@@ -650,6 +650,19 @@ impl ChainData {
 
     /// Raw transactions of a block, verified against `transactions_root`.
     pub async fn block_txs(&self, hash: B256, header: &Header) -> Result<Arc<Vec<Bytes>>, DataError> {
+        self.fetch_block_txs(hash, header, true).await
+    }
+
+    /// A block's transaction hashes for a log scan: the body is fetched (and verified) but not
+    /// kept, so a long scan over history doesn't fill the body cache and tx index with old blocks.
+    async fn scan_tx_hashes(&self, n: u64, hash: B256, header: &Header) -> Result<Arc<Vec<B256>>, DataError> {
+        if let Some(hs) = self.block_tx_hashes(n, hash) {
+            return Ok(hs);
+        }
+        Ok(Arc::new(tx_hashes(&self.fetch_block_txs(hash, header, false).await?)))
+    }
+
+    async fn fetch_block_txs(&self, hash: B256, header: &Header, keep: bool) -> Result<Arc<Vec<Bytes>>, DataError> {
         if let Some(b) = self.bodies.lock().get(&hash) {
             return Ok(b);
         }
@@ -673,6 +686,9 @@ impl ChainData {
                     continue;
                 }
                 let raw = Arc::new(raw);
+                if !keep {
+                    return Ok(raw);
+                }
                 self.bodies.lock().put(hash, raw.clone());
                 if let Some(w) = body.withdrawals
                     && Some(alloy_consensus::proofs::calculate_withdrawals_root(&w)) == header.withdrawals_root
@@ -1264,14 +1280,7 @@ impl ChainData {
                         }
                     }
                     drop(r);
-                    let txs = if found.is_empty() {
-                        None
-                    } else {
-                        Some(match self.block_tx_hashes(n, bh) {
-                            Some(hs) => hs,
-                            None => Arc::new(tx_hashes(&self.block_txs(bh, &h).await?)),
-                        })
-                    };
+                    let txs = if found.is_empty() { None } else { Some(self.scan_tx_hashes(n, bh, &h).await?) };
                     let logs = found
                         .into_iter()
                         .map(|(ti, li, log)| crate::history::MatchedLog { tx_index: ti, log_index: li, tx_hash: txs.as_ref().map_or(B256::ZERO, |t| t[ti as usize]), log })
