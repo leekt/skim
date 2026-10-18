@@ -215,6 +215,8 @@ Consensus light-client verification is on the roadmap. Until then, skim trusts t
 
 ## Status and roadmap
 
+Open work, with what "done" means for each item: [`docs/TODO.md`](docs/TODO.md).
+
 - [x] M0: P2P feasibility (CL payload gossip, eth/71, snap/1+2, adaptive scheduler)
 - [x] M1: BAL state follower with MVCC store
 - [x] M2: simulator, JSON-RPC adapter, verified state, state access predictor
