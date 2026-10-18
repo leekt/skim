@@ -116,9 +116,11 @@ pub(crate) async fn resolve_inner<T: skim_snap::Transport>(
                     Some(a) => (a.balance, U256::from(a.nonce), a.code_hash),
                     None => (U256::ZERO, U256::ZERO, KECCAK_EMPTY),
                 };
-                let _ = store.insert_base_with(at, StateKey::Balance(address), bal, retention);
-                let _ = store.insert_base_with(at, StateKey::Nonce(address), nonce, retention);
-                let _ = store.insert_base_with(at, StateKey::CodeHash(address), U256::from_be_bytes(ch.0), retention);
+                let _ = store.insert_bases_with(
+                    at,
+                    &[(StateKey::Balance(address), bal), (StateKey::Nonce(address), nonce), (StateKey::CodeHash(address), U256::from_be_bytes(ch.0))],
+                    retention,
+                );
                 if ch != KECCAK_EMPTY && store.code(&ch).is_none() && codes.insert(ch) {
                     r.code_round = true;
                     let k = Key::Code(ch);

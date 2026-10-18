@@ -698,12 +698,27 @@ impl Store {
     /// [`Self::insert_base`] with an explicit retention. A TTL never downgrades a key that is
     /// already subscribed.
     pub fn insert_base_with(&self, at: &BlockRef, key: StateKey, value: U256, retention: Retention) -> Result<(), StateError> {
+        self.insert_bases_with(at, &[(key, value)], retention)
+    }
+
+    /// Several verified values at `at` (e.g. an account's balance, nonce and code hash), under one
+    /// write lock: the chain check, the replay of later BAL writes and the archive writes happen
+    /// together for all of them, as one step (a rollback can't land in between).
+    pub fn insert_bases_with(&self, at: &BlockRef, values: &[(StateKey, U256)], retention: Retention) -> Result<(), StateError> {
         let mut st = self.inner.write();
         if st.chain.get(&at.number).map(|b| b.hash) != Some(at.hash) {
             return Err(StateError::Reorged { number: at.number, hash: at.hash });
         }
+        for &(key, value) in values {
+            self.insert_base_locked(&mut st, at, key, value, retention);
+        }
+        drop(st);
+        Ok(())
+    }
+
+    fn insert_base_locked(&self, st: &mut Inner, at: &BlockRef, key: StateKey, value: U256, retention: Retention) {
         let retention = match retention {
-            Retention::Subscribed if !self.admit(&st, &key) => Retention::Ttl(REFUSED_TTL),
+            Retention::Subscribed if !self.admit(st, &key) => Retention::Ttl(REFUSED_TTL),
             r => r,
         };
         match retention {
@@ -715,7 +730,7 @@ impl Store {
                 let subscribed = st.watched_keys.contains(&key) || st.tracked_by_address(&key);
                 if !subscribed {
                     let head = st.head().map_or(at.number, |h| h.number);
-                    self.admit_temp(&mut st, key, head + n);
+                    self.admit_temp(st, key, head + n);
                 }
             }
         }
@@ -724,11 +739,8 @@ impl Store {
         if !has_at {
             st.put(key, at.number, value);
         }
-        let later: Vec<(u64, U256)> = st
-            .recent
-            .range(at.number + 1..)
-            .filter_map(|(n, w)| w.get(&key).map(|v| (*n, v)))
-            .collect();
+        // The recent index keeps each block's writes sorted: binary search.
+        let later: Vec<(u64, U256)> = st.recent.range(at.number + 1..).filter_map(|(n, w)| w.lookup(&key).map(|v| (*n, v))).collect();
         for (n, v) in &later {
             st.put(key, *n, *v);
         }
@@ -747,8 +759,6 @@ impl Store {
                 self.archive_try(r);
             }
         }
-        drop(st);
-        Ok(())
     }
 
     /// Sizes of the store's structures (for growth monitoring).
