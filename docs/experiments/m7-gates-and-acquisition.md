@@ -274,3 +274,9 @@ All 7 succeeded with the fix. When no EL peer serves headers at all, which can l
 - **Restarts:** 18, all recovered in 16-116 s (gate passes). With `skim_subscriptionStatus.missing` and the readiness log, any slow restart now names what it waited for.
 - **Freshness:** stale 0.0%; longest gap between heads 24.6 s. **RSS max:** 194 MB.
 - **Key limit, 75 samples over (up to 66 > 60):** each restart in config A archives a new `promo` account, and the previous ones were reloaded from the archive as subscribed keys without going through the limit, so the count grew restart by restart (35, 52, 56, 59, 60, 66). The release after 64 unneeded blocks never fired: restarts came every 30-60 blocks, and the wait is counted in memory. Fixed after this run: reloaded archive keys stay archived (writes recorded) but hold no subscribed slot until a subscription asks for them again (`archived_keys_reloaded_after_a_restart_hold_no_slots_until_asked_for`).
+
+**Sixth full soak (150 min, binary `6a6de69`, head-only, macOS system allocator): PASS.**
+- **Restarts:** 15, all recovered in 22-145 s.
+- **Key limit:** never exceeded; subscribed keys peaked at 55 of 60. The archive keys reloaded at each start no longer take slots. The 64-block release still never elapsed between restarts, and doesn't need to.
+- **Freshness:** stale 0.0%; longest gap between heads 24.7 s. **RSS max:** 168 MB.
+- **Answers: mostly unchecked.** The reference node was rate-limiting this account (HTTP 429), so only 1,977 answers could be compared: 0 wrong, 2 refused. 7,433 were unavailable from the reference. The fifth soak, the same day, compared 7,294 with 0 wrong.
