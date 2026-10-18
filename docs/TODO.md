@@ -10,9 +10,13 @@ Items are removed from this file when they're done, and the commit that closes o
    failure explained.
 
 ## Memory and disk
-6. **Memory during a long catch-up.** skim reached 514 MB RSS catching up the post-fork history
-   (113-124 MB following the head afterwards). Done: the cause identified and catch-up held near
-   the head-following figure.
+6. **Memory during a long catch-up.** Measured on aarch64 Linux (the A1), catching up ~40k blocks:
+   glibc 394-610 MB RSS while heaptrack showed a 228 MB peak live heap (freed receipt buffers
+   kept in per-thread arenas); with mimalloc 225-375 MB; with mimalloc and scans no longer
+   keeping the bodies they fetch, 230-296 MB. Following the head with mimalloc: 181 MB after
+   10 minutes. Done when catch-up stays near the head figure: the remaining gap is receipts in
+   flight (a 256-block chunk; 64 measured 220-235 MB but slower) and live-heap attribution,
+   which needs a symbolized heap profile (heaptrack couldn't unwind the release binary).
 
 ## Performance
 10. **Peer-request counts: before/after numbers.** Counters exist (`skim_peer_requests_total{kind}`
