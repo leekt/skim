@@ -52,6 +52,8 @@ const SENT_TTL: Duration = Duration::from_secs(30 * 60);
 /// (peers come and go, and a busy one may answer a moment later).
 const PASSES: u32 = 3;
 const PASS_BACKOFF: Duration = Duration::from_millis(500);
+/// How long a header or body fetch waits for a first eligible peer (just after start).
+const PEER_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum DataError {
@@ -495,14 +497,33 @@ impl ChainData {
         self.net.as_ref().expect("peers come from a network")
     }
 
+    /// Peers for receipts and access lists (eth/70+ requests), rotated so load spreads.
     fn peers(&self) -> Vec<skim_el::Peer> {
+        self.peers_min(70)
+    }
+
+    /// Peers for headers and bodies, which every eth version serves. Right after start few peers
+    /// speak eth/70+, so these don't share that filter; with none connected yet, waits up to
+    /// `PEER_WAIT` for one instead of failing at once.
+    async fn header_peers(&self) -> Vec<skim_el::Peer> {
+        let deadline = tokio::time::Instant::now() + PEER_WAIT;
+        loop {
+            let v = self.peers_min(66);
+            if !v.is_empty() || tokio::time::Instant::now() >= deadline || self.net.is_none() {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    fn peers_min(&self, eth: u8) -> Vec<skim_el::Peer> {
         let mut v: Vec<_> = self
             .net
             .as_ref()
             .map(|n| n.peers())
             .unwrap_or_default()
             .into_iter()
-            .filter(|(_, p)| p.eth_version >= 70 && !p.client.starts_with("enrscout"))
+            .filter(|(_, p)| p.eth_version >= eth && !p.client.starts_with("enrscout"))
             .map(|(id, _)| id)
             .collect();
         if !v.is_empty() {
@@ -584,8 +605,15 @@ impl ChainData {
                 if pass > 0 {
                     tokio::time::sleep(PASS_BACKOFF * pass).await;
                 }
-                for p in self.peers().into_iter().take(4) {
-                    let Ok(hs) = self.el().headers_falling(p, parent.into(), want).await.0 else { continue };
+                for p in self.header_peers().await.into_iter().take(8) {
+                    let hs = match self.el().headers_falling(p, parent.into(), want).await {
+                        (Ok(hs), _) => hs,
+                        (Err(e), d) => {
+                            tracing::debug!(peer = %p, low, ms = d.as_millis() as u64, "history headers: {e}");
+                            continue;
+                        }
+                    };
+                    let n = hs.len();
                     let mut expect = parent;
                     let mut ok = Vec::new();
                     for h in hs {
@@ -596,7 +624,9 @@ impl ChainData {
                         expect = h.parent_hash;
                         ok.push((hh, h));
                     }
-                    if !ok.is_empty() {
+                    if ok.is_empty() {
+                        tracing::debug!(peer = %p, low, returned = n, "history headers: response does not link to our lowest header");
+                    } else {
                         got = Some(ok);
                         break;
                     }
@@ -647,7 +677,7 @@ impl ChainData {
                 if pass > 0 {
                     tokio::time::sleep(PASS_BACKOFF * pass).await;
                 }
-                for p in self.peers().into_iter().take(4) {
+                for p in self.header_peers().await.into_iter().take(8) {
                     let hs = match self.el().headers_falling(p, parent.into(), want).await {
                         (Ok(hs), _) => hs,
                         (Err(e), _) => {
@@ -710,7 +740,7 @@ impl ChainData {
             if pass > 0 {
                 tokio::time::sleep(PASS_BACKOFF * pass).await;
             }
-            for p in self.peers().into_iter().take(5) {
+            for p in self.header_peers().await.into_iter().take(5) {
                 let mut bodies = match self.el().bodies(p, vec![hash]).await {
                     (Ok(b), _) => b,
                     (Err(e), _) => {

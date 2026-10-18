@@ -260,6 +260,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         tracing::info!(block = s.number, keys = s.values.len(), "restart snapshot found; will verify and replay it to the head");
     }
     let mut saved = saved;
+    // The recent-BAL index before the first applied block is filled once, after it applies.
+    let mut bals_seeded = false;
     let transport = ElTransport::new(net.clone());
     for p in &args.exclude_snap_peer {
         transport.exclude(*p);
@@ -480,6 +482,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 metrics::gauge!("skim_block_changed_keys").set(ready.changed_keys.len() as f64);
                 light.on_block(&store);
                 let _ = ws_events.send(crate::rpc::WsEvent::NewHead(ready.block));
+                if !bals_seeded {
+                    bals_seeded = true;
+                    let (store, cl, b, w) = (store.clone(), cl.clone(), ready.block, args.window);
+                    tokio::spawn(async move { crate::persist::seed_recent_bals(store, &cl, b, w).await });
+                }
                 if let Some(s) = saved.take() {
                     // Runs alongside subscription maintenance (see the maintenance task).
                     let (store, net, cl, b) = (store.clone(), net.clone(), cl.clone(), ready.block);

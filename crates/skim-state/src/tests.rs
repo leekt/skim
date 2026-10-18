@@ -745,3 +745,31 @@ fn a_download_older_than_the_replay_window_is_refused() {
     assert!(matches!(r, Err(StateError::OutOfWindow(_)) | Err(StateError::Reorged { .. })), "{r:?}");
     assert_eq!(s.complete_storage_len(&A), None);
 }
+
+#[test]
+fn blocks_from_before_the_start_seed_the_bal_index_and_promote_waiting_keys() {
+    // Started at block 20: a key subscribed now, last written at 17, is unknown (no BAL for it).
+    let s = Store::new(8);
+    s.apply_block(blk(20, 0), writes(&[])).unwrap();
+    s.apply_block(blk(21, 0), writes(&[])).unwrap();
+    assert!(s.watch_key(slot(1)));
+    assert_eq!(known(&s.snapshot(&blk(21, 0)).unwrap(), slot(1)), None);
+    // A run that doesn't end at a block the store knows is refused (another fork).
+    let other: Vec<_> = (17..=19).map(|n| (blk(n, 7), writes(&[]))).collect();
+    assert!(s.seed_recent(&other).is_err());
+    // A gap in the run is refused too.
+    let gappy = vec![(blk(17, 0), writes(&[(slot(1), 5)])), (blk(19, 0), writes(&[]))];
+    assert!(s.seed_recent(&gappy).is_err());
+    assert_eq!(known(&s.snapshot(&blk(21, 0)).unwrap(), slot(1)), None);
+    // Blocks 13..=19, linked to the first applied block: 13 is outside the 8-block window.
+    let run: Vec<_> = (13..=19).map(|n| (blk(n, 0), if n == 17 { writes(&[(slot(1), 5)]) } else { writes(&[]) })).collect();
+    assert_eq!(s.seed_recent(&run).unwrap(), 6);
+    // The waiting key is promoted from block 17's write, and stays current with later writes.
+    assert_eq!(known(&s.snapshot(&blk(21, 0)).unwrap(), slot(1)), Some(5));
+    assert_eq!(s.sizes().bal_promotions, 1);
+    s.apply_block(blk(22, 0), writes(&[(slot(1), 6)])).unwrap();
+    assert_eq!(known(&s.snapshot(&blk(22, 0)).unwrap(), slot(1)), Some(6));
+    // A key never written in the seeded range stays unknown, never zero.
+    assert!(s.watch_key(slot(2)));
+    assert_eq!(known(&s.snapshot(&blk(22, 0)).unwrap(), slot(2)), None);
+}

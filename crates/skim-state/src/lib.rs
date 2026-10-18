@@ -689,6 +689,45 @@ impl Store {
         }
     }
 
+    /// Fills the recent-BAL index with blocks from before the first applied one (just after a
+    /// start, the index would otherwise cover only blocks seen since). `blocks` must be
+    /// ascending and hash-linked, and the last must be a block whose hash the store already
+    /// holds (the parent of the first applied block, or later); BALs are expected verified
+    /// against their headers. Tracked keys that hold no value yet are then promoted from the
+    /// index, as they would have been had these blocks been applied. Returns the blocks added.
+    pub fn seed_recent(&self, blocks: &[(BlockRef, Arc<BlockWrites>)]) -> Result<usize, StateError> {
+        for w in blocks.windows(2) {
+            if w[1].0.number != w[0].0.number + 1 || w[1].0.parent_hash != w[0].0.hash {
+                return Err(StateError::NotChild(w[1].0.hash, w[0].0.hash));
+            }
+        }
+        let Some((last, _)) = blocks.last() else { return Ok(0) };
+        let mut st = self.inner.write();
+        if st.hashes.get(&last.number) != Some(&last.hash) {
+            return Err(StateError::Reorged { number: last.number, hash: last.hash });
+        }
+        let cut = st.head().map(|h| h.number.saturating_sub(self.window)).unwrap_or(0);
+        let mut added = 0;
+        for (b, w) in blocks {
+            if b.number <= cut || st.recent.contains_key(&b.number) {
+                continue;
+            }
+            let mut w = BlockWrites { writes: w.writes.clone(), ..Default::default() };
+            w.normalize();
+            st.recent.insert(b.number, Arc::new(w));
+            st.hashes.entry(b.number).or_insert(b.hash);
+            st.hashes.entry(b.number.saturating_sub(1)).or_insert(b.parent_hash);
+            added += 1;
+        }
+        let waiting: Vec<StateKey> = st.watched_keys.iter().chain(st.temp.keys()).copied().collect();
+        for k in waiting {
+            if st.seed_from_bal(&k) {
+                self.bal_promotions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(added)
+    }
+
     /// Commits a value fetched at `at` (e.g. via SNAP at `at.state_root`), then replays later
     /// indexed writes to `key`, so a stale fetch never hides a newer BAL write. Tracks the key.
     pub fn insert_base(&self, at: &BlockRef, key: StateKey, value: U256) -> Result<(), StateError> {

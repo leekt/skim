@@ -378,7 +378,46 @@ async fn fetch_via_cl(cl: &skim_cl::ClNode, saved: &Saved, head: &BlockRef) -> a
     Ok(got.into_values().collect())
 }
 
-type Replayed = (Vec<(skim_bal::StateKey, alloy_primitives::U256)>, Vec<(B256, alloy_primitives::Bytes)>);
+/// After a start, fills the recent-BAL index with up to [`SEED_BALS`] blocks before `first` (the
+/// first applied block), from consensus peers and verified like gossip. A key that changed in those
+/// blocks, like the balance of an account that just transacted, then resolves from its BAL
+/// instead of waiting for a SNAP peer that serves the head. Best effort: on failure the index
+/// just fills from new blocks, as before.
+pub async fn seed_recent_bals(store: Arc<Store>, cl: &(impl EnvelopeSource + ?Sized), first: BlockRef, window: u64) {
+    let window = window.min(SEED_BALS);
+    let low = first.number.saturating_sub(window).max(1);
+    if low >= first.number {
+        return;
+    }
+    let head_slot = first.timestamp.saturating_sub(skim_cl::node::SEPOLIA_GENESIS_TIME) / 12;
+    let mut got: std::collections::BTreeMap<u64, (alloy_consensus::Header, BlockWrites)> = Default::default();
+    let mut trace = CatchupTrace::default();
+    let want = first.number - low;
+    let r = walk_envelopes(cl, head_slot.saturating_sub(1), window * 2, want, &mut trace, |h, w| {
+        if (low..first.number).contains(&h.number) {
+            got.insert(h.number, (h, w));
+        }
+        got.len() as u64 == want
+    })
+    .await;
+    if let Err(e) = r {
+        tracing::info!(summary = %trace.summary(), "recent BALs from before the start unavailable ({e})");
+        return;
+    }
+    let blocks: Vec<(BlockRef, Arc<BlockWrites>)> = got.into_values().map(|(h, w)| (crate::chain::block_ref(&h), Arc::new(w))).collect();
+    let promoted = store.sizes().bal_promotions;
+    match store.seed_recent(&blocks) {
+        Ok(n) => tracing::info!(blocks = n, from = low, promoted = store.sizes().bal_promotions - promoted, ms = trace.total_ms,
+            "recent BALs from before the start indexed"),
+        Err(e) => tracing::warn!("recent BALs from before the start discarded ({e})"),
+    }
+}
+
+/// Blocks of BALs fetched from before the start: enough for keys that just changed (a whole
+/// 256-block window is ~30 MB of payloads to fetch and parse at once, for keys a fetch covers).
+const SEED_BALS: u64 = 32;
+
+type Replayed =(Vec<(skim_bal::StateKey, alloy_primitives::U256)>, Vec<(B256, alloy_primitives::Bytes)>);
 
 /// The whole check, independent of where the blocks came from: the headers start right after
 /// the snapshot block, each links to the previous by hash (the first to the snapshot's hash, so
