@@ -47,7 +47,8 @@ impl Persist {
         if let Some(dir) = path.as_ref().parent() {
             std::fs::create_dir_all(dir).map_err(|e| PersistError::Db(e.to_string()))?;
         }
-        let db = Database::create(path)?;
+        // Small, bounded page cache: written once per run, read once at startup.
+        let db = Database::builder().set_cache_size(8 << 20).create(path)?;
         let tx = db.begin_write()?;
         tx.open_table(STATE)?;
         tx.open_table(CODE)?;

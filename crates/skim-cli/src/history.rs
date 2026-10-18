@@ -20,6 +20,9 @@ const HEADERS: TableDefinition<u64, (&[u8; 32], &[u8])> = TableDefinition::new("
 /// "floor": the first post-fork block (once a walk reached a pre-fork header).
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
+/// redb page cache for the header store.
+const CACHE_BYTES: usize = 16 << 20;
+
 pub struct HeaderStore {
     db: Database,
 }
@@ -48,7 +51,9 @@ pub fn post_fork(h: &Header) -> bool {
 
 impl HeaderStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let db = Database::create(path)?;
+        // Bounded page cache: reads walk many headers, and redb's default cache (1 GiB) would
+        // keep most of the file in memory.
+        let db = Database::builder().set_cache_size(CACHE_BYTES).create(path)?;
         let tx = db.begin_write()?;
         tx.open_table(HEADERS)?;
         tx.open_table(META)?;

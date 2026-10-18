@@ -138,7 +138,8 @@ pub struct Archive {
 
 impl Archive {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ArchiveError> {
-        let db = Database::create(path)?;
+        // Bounded page cache (redb's default is 1 GiB): history reads are point lookups.
+        let db = Database::builder().set_cache_size(64 << 20).create(path)?;
         let tx = db.begin_write()?;
         tx.open_table(VERSIONS)?;
         tx.open_table(COVERAGE)?;
