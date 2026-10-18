@@ -1,0 +1,16 @@
+[Unit]
+Description=smallname (ENS read API over skim)
+After=skim.service
+Wants=skim.service
+
+[Service]
+User=skim
+WorkingDirectory=/opt/smallname
+Environment=SKIM_RPC=http://127.0.0.1:8545 DB=/var/lib/smallname/smallname.db PORT=8787 HOST=127.0.0.1
+# Node 22.13+ (node:sqlite).
+ExecStart=/usr/bin/node --experimental-sqlite --no-warnings smallname/smallname.mjs run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

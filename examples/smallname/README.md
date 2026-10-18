@@ -102,6 +102,9 @@ Each stream response carries the block skim's light client verified as finalized
 
 **Irreversible exports:** an app that exports from the index (to another database, a queue, an email) should export only rows at or below `finalized_block`. Rows above it can still be rolled back by a `rewind`. Rows at or below it can't: a finalized block isn't reorged out, which is what the light client verifies. Without a light client (`finalized_block: null`), nothing is final, and such exports should wait.
 
+## Deploying
+Service units, a tunnel config and sizes: [`deploy/`](deploy).
+
 ## Files
 | File | |
 |---|---|

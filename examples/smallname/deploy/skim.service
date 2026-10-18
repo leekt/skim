@@ -1,0 +1,15 @@
+[Unit]
+Description=skim (Sepolia; ENS kept warm; post-fork history for smallname)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=skim
+# Built by the release workflow (x86_64 or aarch64 Linux), or `cargo build --release`.
+ExecStart=/opt/skim/skim run --config /opt/skim/skim.yaml --rpc 127.0.0.1:8545 --data-dir /var/lib/skim --history local
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

@@ -28,7 +28,3 @@ Items are removed from this file when they're done, and the commit that closes o
 ## smallname
 16. **Unsupported routes:** permissions by `name` / `registration_id` (needs `TokenResource`
     resource ids indexed), resolver `links` / `roles`, diagnostics, Basenames (another chain).
-
-## Deployment
-18. **No deployment example in the repo:** a reference setup for skim + smallname (service units,
-    a reverse proxy or tunnel in front of smallname only, skim's RPC kept private).
