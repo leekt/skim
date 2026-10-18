@@ -14,10 +14,15 @@
 //!   (the newest block of the module's `recent` list that still is).
 //! - `gap {from, to}`: blocks skim can't serve logs for any more (before the fork, or expired
 //!   on every connected peer); the module decides how to mark them.
-//! - `apply {block, logs}`: a block with logs matching the module's filters (blocks without
-//!   matches are skipped; the response's `cursor` says how far the scan went).
+//! - `apply {block, logs, stateChanges?}`: a block with logs matching the module's filters, or
+//!   (with `bal`) changes to its accounts from the block's access list, each with its
+//!   `block_access_index` (blocks with neither are skipped; `cursor` says how far the scan
+//!   went).
 //! Each response also reports `finalized` (verified by the light client), so a module can hold
 //! irreversible exports until then.
+//!
+//! At the head, a request with `waitMs` returns as soon as skim applies the next block (it's
+//! woken by the same new-head notification WebSocket subscribers get); data is still pulled.
 
 use std::time::{Duration, Instant};
 
@@ -35,6 +40,11 @@ pub struct BlockId {
 }
 
 #[derive(Deserialize)]
+pub struct BalFilter {
+    pub addresses: Vec<alloy_primitives::Address>,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
     /// The last block the module applied (`None`: a new module, starting at `from_block`).
@@ -45,16 +55,27 @@ pub struct Request {
     /// For a new module: the first block it wants (default: the head).
     pub from_block: Option<u64>,
     /// Logs matching any of these (address and topics; block fields are ignored).
+    #[serde(default)]
     pub filters: Vec<Filter>,
+    /// State changes to these accounts, from each block's access list, change by change with its
+    /// `block_access_index` (a separate hook from logs; either or both may be given).
+    pub bal: Option<BalFilter>,
     /// Blocks per response (at most `--max-logs-range`).
     pub max_blocks: Option<u64>,
     /// At the head: how long to wait for a new block before answering with no events.
     pub wait_ms: Option<u64>,
 }
 
-pub async fn next(chain: &ChainData, head: impl Fn() -> Option<u64>, finalized: Option<Value>, req: Request) -> Result<Value, DataError> {
-    if req.filters.is_empty() {
-        return Err(DataError::Invalid("filters must not be empty".into()));
+pub async fn next(
+    chain: &ChainData,
+    head: impl Fn() -> Option<u64>,
+    mut new_heads: tokio::sync::broadcast::Receiver<crate::rpc::WsEvent>,
+    finalized: Option<Value>,
+    req: Request,
+) -> Result<Value, DataError> {
+    let bal_addresses = req.bal.as_ref().map(|b| b.addresses.clone()).unwrap_or_default();
+    if req.filters.is_empty() && bal_addresses.is_empty() {
+        return Err(DataError::Invalid("give log filters, bal addresses, or both".into()));
     }
     let mut events = Vec::new();
     let Some(mut tip) = head() else { return Err(DataError::Unavailable("not following the chain yet".into())) };
@@ -86,27 +107,50 @@ pub async fn next(chain: &ChainData, head: impl Fn() -> Option<u64>, finalized: 
         pos = logs_from - 1;
     }
 
-    // At the head: wait (briefly) for the next block.
+    // At the head: wait for the next block (woken by the new-head notification, not polling).
     if pos >= tip {
         let until = Instant::now() + Duration::from_millis(req.wait_ms.unwrap_or(0).min(30_000));
         while pos >= tip && Instant::now() < until {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            let left = until.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(left, new_heads.recv()).await {
+                Ok(Ok(crate::rpc::WsEvent::NewHead(_))) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) | Err(_) => break,
+            }
             tip = head().unwrap_or(tip);
         }
     }
     // The new position: the last block scanned, else where the rewind/gap left the module.
     let cursor = if pos < tip {
         let to = tip.min(pos + req.max_blocks.unwrap_or(chain.max_log_range).clamp(1, chain.max_log_range));
-        let scan = chain.scan(&req.filters, pos + 1, to, None, true).await?;
-        for b in scan.blocks {
-            events.push(json!({
-                "type": "apply",
-                "block": {"number": b.number, "hash": b.hash, "parentHash": b.parent_hash, "timestamp": b.timestamp},
-                "logs": b.logs,
-            }));
+        let scan = if req.filters.is_empty() { None } else { Some(chain.scan(&req.filters, pos + 1, to, None, true).await?) };
+        let bal = if bal_addresses.is_empty() { Vec::new() } else { chain.bal_changes(&bal_addresses, pos + 1, to).await? };
+        // One `apply` per block with logs, state changes, or both, in block order.
+        let mut by_block: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
+        if let Some(scan) = &scan {
+            for b in &scan.blocks {
+                by_block.insert(b.number, json!({
+                    "type": "apply",
+                    "block": {"number": b.number, "hash": b.hash, "parentHash": b.parent_hash, "timestamp": b.timestamp},
+                    "logs": b.logs,
+                }));
+            }
         }
-        pos = scan.last.0;
-        Some(json!({"number": scan.last.0, "hash": scan.last.1}))
+        for (n, bh, h, changes) in bal {
+            let e = by_block.entry(n).or_insert_with(|| json!({
+                "type": "apply",
+                "block": {"number": n, "hash": bh, "parentHash": h.parent_hash, "timestamp": h.timestamp},
+                "logs": [],
+            }));
+            e["stateChanges"] = Value::Array(changes);
+        }
+        events.extend(by_block.into_values());
+        let last = match &scan {
+            Some(s) => s.last,
+            None => (to, chain.canonical_hash(to).ok_or_else(|| DataError::Unavailable(format!("no header for block {to}")))?),
+        };
+        pos = last.0;
+        Some(json!({"number": last.0, "hash": last.1}))
     } else {
         chain.canonical_hash(pos).map(|h| json!({"number": pos, "hash": h}))
     };

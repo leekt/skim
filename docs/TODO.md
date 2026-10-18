@@ -33,12 +33,8 @@ Items are removed from this file when they're done, and the commit that closes o
     before/after numbers.
 
 ## Streams and modules
-11. **BAL stream:** per-transaction state changes (keeping `block_access_index`), a separate hook
-    from logs.
 12. **Export separate from retention:** a module can receive changes for keys it doesn't make skim
     keep in memory.
-13. **New-block push at the head:** the stream waits by polling (200 ms); notify instead, data
-    still pulled by cursor.
 
 ## smallname
 16. **Unsupported routes:** permissions by `name` / `registration_id` (needs `TokenResource`

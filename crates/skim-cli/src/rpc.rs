@@ -726,7 +726,7 @@ impl Rpc {
                 let req: crate::stream::Request = need(params, 0)?;
                 let finalized = self.light.as_ref().and_then(|l| l.status().finalized_block).map(|b| json!({"number": b.number, "hash": b.hash}));
                 let store = sim.store.clone();
-                Ok(crate::stream::next(chain, move || store.head().map(|h| h.number), finalized, req).await?)
+                Ok(crate::stream::next(chain, move || store.head().map(|h| h.number), self.events.subscribe(), finalized, req).await?)
             }
             "skim_archiveCoverage" => {
                 let a: Address = need(params, 0)?;

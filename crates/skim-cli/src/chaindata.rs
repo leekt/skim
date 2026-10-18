@@ -970,6 +970,83 @@ impl ChainData {
         Ok(Value::Array(scan.blocks.into_iter().flat_map(|b| b.logs).collect()))
     }
 
+    /// Changes to `addresses` in each block of `[from, to]`, from the block's verified access list,
+    /// change by change with its `block_access_index` (0: system calls before the transactions,
+    /// `i + 1`: transaction `i`, the last: after them), not merged into final values. Blocks without
+    /// changes to these addresses are left out. BALs come from the gossip cache or eth/71 peers.
+    pub async fn bal_changes(&self, addresses: &[Address], from: u64, to: u64) -> Result<Vec<(u64, B256, Arc<Header>, Vec<Value>)>, DataError> {
+        let want: HashSet<Address> = addresses.iter().copied().collect();
+        let want = &want;
+        let headers = self.linked_headers(from, to).await?;
+        let fetched: Vec<_> = futures::stream::iter(headers)
+            .map(|(n, bh, h)| async move {
+                let bal = self.block_bal(bh, &h).await?;
+                let mut changes = Vec::new();
+                for acc in bal.iter().filter(|a| want.contains(&a.address)) {
+                    let a = acc.address;
+                    for c in acc.balance_changes() {
+                        changes.push(json!({"index": c.block_access_index.0, "address": a, "kind": "balance", "value": c.post_balance}));
+                    }
+                    for c in acc.nonce_changes() {
+                        changes.push(json!({"index": c.block_access_index.0, "address": a, "kind": "nonce", "value": c.new_nonce}));
+                    }
+                    for c in acc.code_changes() {
+                        changes.push(json!({"index": c.block_access_index.0, "address": a, "kind": "code", "codeHash": keccak256(&c.new_code), "value": c.new_code}));
+                    }
+                    for sc in acc.storage_changes() {
+                        for c in &sc.changes {
+                            changes.push(json!({"index": c.block_access_index.0, "address": a, "kind": "storage", "slot": sc.slot, "value": c.new_value}));
+                        }
+                    }
+                }
+                changes.sort_by_key(|c| c["index"].as_u64().unwrap_or(0));
+                Ok::<_, DataError>((n, bh, h, changes))
+            })
+            .buffered(8)
+            .collect::<Vec<_>>()
+            .await;
+        let mut out = Vec::new();
+        for r in fetched {
+            let (n, bh, h, changes) = r?;
+            if !changes.is_empty() {
+                out.push((n, bh, h, changes));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The headers of `[from, to]` on one hash-linked chain (memory, else the post-fork store).
+    async fn linked_headers(&self, from: u64, to: u64) -> Result<Vec<(u64, B256, Arc<Header>)>, DataError> {
+        self.ensure_headers(from).await?;
+        let disk: HashMap<u64, (B256, Arc<Header>)> = {
+            let anchor = self.inner.read().headers.first_key_value().map(|(n, (_, hd))| (*n, hd.parent_hash));
+            match (self.history.get(), anchor) {
+                (Some(s), Some((mem_low, parent))) if from < mem_low => s
+                    .linked_range(from, to.min(mem_low - 1), mem_low, parent)
+                    .map_err(|e| DataError::Unavailable(e.to_string()))?
+                    .ok_or_else(|| DataError::Unavailable(format!("headers below {mem_low} changed (reorg); retry")))?
+                    .into_iter()
+                    .map(|(hash, h)| (h.number, (hash, Arc::new(h))))
+                    .collect(),
+                _ => HashMap::new(),
+            }
+        };
+        let g = self.inner.read();
+        let mut out = Vec::new();
+        let mut prev: Option<B256> = None;
+        for n in from..=to {
+            let Some((bh, h)) = g.headers.get(&n).cloned().or_else(|| disk.get(&n).cloned()) else {
+                return Err(DataError::Unavailable(format!("no header for block {n}")));
+            };
+            if prev.is_some_and(|p| p != h.parent_hash) {
+                return Err(DataError::Unavailable(format!("chain changed at block {n} during the scan; retry")));
+            }
+            prev = Some(bh);
+            out.push((n, bh, h));
+        }
+        Ok(out)
+    }
+
     /// The canonical hash at `n`, if skim holds that header: in memory, or on disk hash-linked to
     /// the oldest in-memory header.
     pub fn canonical_hash(&self, n: u64) -> Option<B256> {
