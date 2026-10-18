@@ -19,6 +19,7 @@ alloy-consensus.workspace = true
 alloy-rlp.workspace = true
 redb.workspace = true
 zstd = "0.13.3"
+mimalloc = { version = "=0.1.52", default-features = false }
 thiserror.workspace = true
 alloy-trie.workspace = true
 reth-eth-wire-types.workspace = true
