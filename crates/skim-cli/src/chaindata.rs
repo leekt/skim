@@ -146,6 +146,25 @@ pub struct ChainData {
     inflight: Mutex<HashMap<B256, Arc<tokio::sync::Semaphore>>>,
 }
 
+/// CPU-heavy verification (receipt roots: a trie over every receipt) runs off the async
+/// runtime, a bounded number at a time, so a long scan's verification can't starve request
+/// handling or the block follower.
+async fn cpu<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    static POOL: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(2, |n| n.get()).max(1)));
+    let _permit = pool.acquire().await.expect("never closed");
+    tokio::task::spawn_blocking(f).await.expect("verification task panicked")
+}
+
+/// Receipts checked against the header's `receipts_root` (off the async runtime).
+async fn receipts_match(r: Vec<Receipt>, root: B256) -> (Vec<Receipt>, bool) {
+    cpu(move || {
+        let ok = Receipt::calculate_receipt_root_no_memo(&r) == root;
+        (r, ok)
+    })
+    .await
+}
+
 /// Releases a scan's in-flight blocks (and wakes scans waiting for them) when it's done with
 /// them, whether the fetch succeeded or not.
 struct InflightGuard<'a> {
@@ -611,7 +630,8 @@ impl ChainData {
                         continue;
                     }
                 };
-                if Receipt::calculate_receipt_root_no_memo(&r) != header.receipts_root {
+                let (r, ok) = receipts_match(r, header.receipts_root).await;
+                if !ok {
                     tracing::debug!(peer = %p, number = header.number, n = r.len(), "receipts do not match receipts_root");
                     continue;
                 }
@@ -651,12 +671,15 @@ impl ChainData {
                     let hashes: Vec<B256> = chunk.iter().map(|(h, _)| *h).collect();
                     for p in self.peers().into_iter().take(3) {
                         let Ok(rs) = self.net.blocks_receipts(p, &hashes).await.0 else { continue };
-                        let ok: Vec<_> = rs
-                            .into_iter()
-                            .zip(chunk.iter())
-                            .filter(|(r, (_, h))| Receipt::calculate_receipt_root_no_memo(r) == h.receipts_root)
-                            .map(|(r, (hash, _))| (*hash, Arc::new(r)))
-                            .collect();
+                        let roots: Vec<(B256, B256)> = chunk.iter().map(|(hash, h)| (*hash, h.receipts_root)).collect();
+                        let ok: Vec<_> = cpu(move || {
+                            rs.into_iter()
+                                .zip(roots)
+                                .filter(|(r, (_, root))| Receipt::calculate_receipt_root_no_memo(r) == *root)
+                                .map(|(r, (hash, _))| (hash, Arc::new(r)))
+                                .collect::<Vec<_>>()
+                        })
+                        .await;
                         if !ok.is_empty() {
                             return ok;
                         }
