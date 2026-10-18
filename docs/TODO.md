@@ -24,9 +24,6 @@ Items are removed from this file when they're done, and the commit that closes o
 6. **Memory during a long catch-up.** skim reached 514 MB RSS catching up the post-fork history
    (113-124 MB following the head afterwards). Done: the cause identified and catch-up held near
    the head-following figure.
-7. **History disk size.** `--history local` stores every fetched block's full logs: Sepolia blocks
-   carry ~450 logs and the ENS bloom matches nearly every block, so 2.3 GB for 78k blocks. Done:
-   store what modules asked for, so the store grows with the filters, not the chain.
 
 ## Performance
 8. **EVM execution on a bounded CPU pool,** without slowing short warm calls (measured).

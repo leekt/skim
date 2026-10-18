@@ -19,71 +19,74 @@ use redb::ReadableTableMetadata;
 const HEADERS: TableDefinition<u64, (&[u8; 32], &[u8])> = TableDefinition::new("headers");
 /// "floor": the first post-fork block (once a walk reached a pre-fork header).
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
-/// block hash -> every log of the block (and its transaction hashes, when known): written when
-/// a scan fetched (and verified) the block's receipts, so it's never fetched again.
-const LOGS: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("logs");
+/// (filter set, block hash) -> the block's logs matching that filter set (possibly none): what a
+/// module's scans fetched, kept so the same blocks are never fetched again for it. Stored per
+/// filter set, not per block, so the store grows with what modules ask for, not with the chain.
+const MATCHED: TableDefinition<&[u8; 64], &[u8]> = TableDefinition::new("matched_logs");
+/// The earlier per-block table (every log of every fetched block): dropped on open.
+const OLD_LOGS: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("logs");
 
-/// All logs of one block, as fetched from verified receipts.
+/// One matching log with its position: transaction index and hash, log index in the block.
 #[derive(Debug, Clone, PartialEq)]
-pub struct BlockLogs {
-    /// Transaction hashes in block order (empty: not fetched yet).
-    pub tx_hashes: Vec<B256>,
-    /// `(transaction index, log)` in block order (log index = position).
-    pub logs: Vec<(u32, alloy_primitives::Log)>,
+pub struct MatchedLog {
+    pub tx_index: u32,
+    pub log_index: u32,
+    pub tx_hash: B256,
+    pub log: alloy_primitives::Log,
 }
 
-impl BlockLogs {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::new();
-        b.extend_from_slice(&(self.tx_hashes.len() as u32).to_be_bytes());
-        for h in &self.tx_hashes {
-            b.extend_from_slice(h.as_slice());
+pub fn encode_matched(logs: &[MatchedLog]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&(logs.len() as u32).to_be_bytes());
+    for m in logs {
+        b.extend_from_slice(&m.tx_index.to_be_bytes());
+        b.extend_from_slice(&m.log_index.to_be_bytes());
+        b.extend_from_slice(m.tx_hash.as_slice());
+        b.extend_from_slice(m.log.address.as_slice());
+        b.push(m.log.topics().len() as u8);
+        for t in m.log.topics() {
+            b.extend_from_slice(t.as_slice());
         }
-        b.extend_from_slice(&(self.logs.len() as u32).to_be_bytes());
-        for (ti, l) in &self.logs {
-            b.extend_from_slice(&ti.to_be_bytes());
-            b.extend_from_slice(l.address.as_slice());
-            b.push(l.topics().len() as u8);
-            for t in l.topics() {
-                b.extend_from_slice(t.as_slice());
-            }
-            b.extend_from_slice(&(l.data.data.len() as u32).to_be_bytes());
-            b.extend_from_slice(&l.data.data);
-        }
-        b
+        b.extend_from_slice(&(m.log.data.data.len() as u32).to_be_bytes());
+        b.extend_from_slice(&m.log.data.data);
     }
+    b
+}
 
-    pub fn decode(mut b: &[u8]) -> Option<Self> {
-        fn take<'a>(b: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
-            if b.len() < n {
-                return None;
-            }
-            let (x, rest) = b.split_at(n);
-            *b = rest;
-            Some(x)
+pub fn decode_matched(mut b: &[u8]) -> Option<Vec<MatchedLog>> {
+    fn take<'a>(b: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+        if b.len() < n {
+            return None;
         }
-        let u32_ = |b: &mut &[u8]| take(b, 4).map(|x| u32::from_be_bytes(x.try_into().unwrap()));
-        let n = u32_(&mut b)? as usize;
-        let mut tx_hashes = Vec::with_capacity(n);
-        for _ in 0..n {
-            tx_hashes.push(B256::from_slice(take(&mut b, 32)?));
-        }
-        let m = u32_(&mut b)? as usize;
-        let mut logs = Vec::with_capacity(m);
-        for _ in 0..m {
-            let ti = u32_(&mut b)?;
-            let address = alloy_primitives::Address::from_slice(take(&mut b, 20)?);
-            let k = take(&mut b, 1)?[0] as usize;
-            let mut topics = Vec::with_capacity(k);
-            for _ in 0..k {
-                topics.push(B256::from_slice(take(&mut b, 32)?));
-            }
-            let len = u32_(&mut b)? as usize;
-            let data = alloy_primitives::Bytes::copy_from_slice(take(&mut b, len)?);
-            logs.push((ti, alloy_primitives::Log::new_unchecked(address, topics, data)));
-        }
-        b.is_empty().then_some(Self { tx_hashes, logs })
+        let (x, rest) = b.split_at(n);
+        *b = rest;
+        Some(x)
     }
+    let u32_ = |b: &mut &[u8]| take(b, 4).map(|x| u32::from_be_bytes(x.try_into().unwrap()));
+    let n = u32_(&mut b)? as usize;
+    let mut out = Vec::with_capacity(n.min(4096));
+    for _ in 0..n {
+        let tx_index = u32_(&mut b)?;
+        let log_index = u32_(&mut b)?;
+        let tx_hash = B256::from_slice(take(&mut b, 32)?);
+        let address = alloy_primitives::Address::from_slice(take(&mut b, 20)?);
+        let k = take(&mut b, 1)?[0] as usize;
+        let mut topics = Vec::with_capacity(k);
+        for _ in 0..k {
+            topics.push(B256::from_slice(take(&mut b, 32)?));
+        }
+        let len = u32_(&mut b)? as usize;
+        let data = alloy_primitives::Bytes::copy_from_slice(take(&mut b, len)?);
+        out.push(MatchedLog { tx_index, log_index, tx_hash, log: alloy_primitives::Log::new_unchecked(address, topics, data) });
+    }
+    b.is_empty().then_some(out)
+}
+
+fn matched_key(filters: &B256, block: &B256) -> [u8; 64] {
+    let mut k = [0u8; 64];
+    k[..32].copy_from_slice(filters.as_slice());
+    k[32..].copy_from_slice(block.as_slice());
+    k
 }
 
 /// redb page cache for the header store.
@@ -119,12 +122,17 @@ impl HeaderStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         // Bounded page cache: reads walk many headers, and redb's default cache (1 GiB) would
         // keep most of the file in memory.
-        let db = Database::builder().set_cache_size(CACHE_BYTES).create(path)?;
+        let mut db = Database::builder().set_cache_size(CACHE_BYTES).create(path)?;
         let tx = db.begin_write()?;
         tx.open_table(HEADERS)?;
         tx.open_table(META)?;
-        tx.open_table(LOGS)?;
+        tx.open_table(MATCHED)?;
+        let dropped = tx.delete_table(OLD_LOGS)?;
         tx.commit()?;
+        if dropped {
+            // The old per-block logs could be gigabytes: give the space back.
+            let _ = db.compact();
+        }
         Ok(Self { db })
     }
 
@@ -227,36 +235,39 @@ impl HeaderStore {
         Ok(Some(out))
     }
 
-    /// Stores blocks' logs (by block hash; a hash names one block, so a reorg can't make an
-    /// entry wrong, only unused).
-    pub fn put_logs(&self, blocks: &[(B256, &BlockLogs)]) -> Result<(), StoreError> {
+    /// Stores, for the filter set `filters` (a fingerprint), each block's matching logs.
+    pub fn put_matched(&self, filters: &B256, blocks: &[(B256, &[MatchedLog])]) -> Result<(), StoreError> {
         if blocks.is_empty() {
             return Ok(());
         }
         let tx = self.db.begin_write()?;
         {
-            let mut t = tx.open_table(LOGS)?;
-            for (h, l) in blocks {
-                // zstd: a Sepolia block's logs are ~75 KB raw, ~16 KB compressed.
-                let z = zstd::bulk::compress(&l.encode(), 3).map_err(|e| StoreError(e.to_string()))?;
-                t.insert(&h.0, z.as_slice())?;
+            let mut t = tx.open_table(MATCHED)?;
+            for (h, logs) in blocks {
+                let raw = encode_matched(logs);
+                let v = if raw.len() > 256 { [&[1u8][..], &zstd::bulk::compress(&raw, 3).map_err(|e| StoreError(e.to_string()))?].concat() } else { [&[0u8][..], &raw].concat() };
+                t.insert(&matched_key(filters, h), v.as_slice())?;
             }
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// The stored logs of whichever of `hashes` are stored.
-    pub fn get_logs(&self, hashes: &[B256]) -> Result<std::collections::HashMap<B256, BlockLogs>, StoreError> {
+    /// The stored matches for whichever of `blocks` were scanned with `filters` before.
+    pub fn get_matched(&self, filters: &B256, blocks: &[B256]) -> Result<std::collections::HashMap<B256, Vec<MatchedLog>>, StoreError> {
         let tx = self.db.begin_read()?;
-        let t = tx.open_table(LOGS)?;
+        let t = tx.open_table(MATCHED)?;
         let mut out = std::collections::HashMap::new();
-        for h in hashes {
-            if let Some(g) = t.get(&h.0)?
-                && let Ok(raw) = zstd::stream::decode_all(g.value())
-                && let Some(l) = BlockLogs::decode(&raw)
-            {
-                out.insert(*h, l);
+        for h in blocks {
+            let Some(g) = t.get(&matched_key(filters, h))? else { continue };
+            let v = g.value();
+            let raw = match v.first() {
+                Some(1) => zstd::stream::decode_all(&v[1..]).ok(),
+                Some(0) => Some(v[1..].to_vec()),
+                _ => None,
+            };
+            if let Some(m) = raw.as_deref().and_then(decode_matched) {
+                out.insert(*h, m);
             }
         }
         Ok(out)
@@ -387,19 +398,21 @@ mod tests {
     }
 
     #[test]
-    fn block_logs_round_trip() {
-        let l = BlockLogs {
-            tx_hashes: vec![B256::repeat_byte(1), B256::repeat_byte(2)],
-            logs: vec![
-                (0, alloy_primitives::Log::new_unchecked(alloy_primitives::Address::repeat_byte(9), vec![B256::repeat_byte(3)], vec![1, 2, 3].into())),
-                (1, alloy_primitives::Log::new_unchecked(alloy_primitives::Address::repeat_byte(8), vec![], alloy_primitives::Bytes::new())),
-            ],
-        };
-        assert_eq!(BlockLogs::decode(&l.encode()), Some(l.clone()));
+    fn matched_logs_round_trip_per_filter_set() {
+        let logs = vec![
+            MatchedLog { tx_index: 0, log_index: 3, tx_hash: B256::repeat_byte(1), log: alloy_primitives::Log::new_unchecked(alloy_primitives::Address::repeat_byte(9), vec![B256::repeat_byte(3)], vec![1, 2, 3].into()) },
+            MatchedLog { tx_index: 2, log_index: 9, tx_hash: B256::repeat_byte(2), log: alloy_primitives::Log::new_unchecked(alloy_primitives::Address::repeat_byte(8), vec![], vec![7; 600].into()) },
+        ];
+        assert_eq!(decode_matched(&encode_matched(&logs)), Some(logs.clone()));
         let d = tempfile::tempdir().unwrap();
         let s = HeaderStore::open(d.path().join("h.redb")).unwrap();
-        s.put_logs(&[(B256::repeat_byte(7), &l)]).unwrap();
-        assert_eq!(s.get_logs(&[B256::repeat_byte(7), B256::repeat_byte(6)]).unwrap().get(&B256::repeat_byte(7)), Some(&l));
+        let (f1, f2, b) = (B256::repeat_byte(0xf1), B256::repeat_byte(0xf2), B256::repeat_byte(7));
+        s.put_matched(&f1, &[(b, &logs), (B256::repeat_byte(6), &[])]).unwrap();
+        let got = s.get_matched(&f1, &[b, B256::repeat_byte(6), B256::repeat_byte(5)]).unwrap();
+        assert_eq!(got.get(&b), Some(&logs));
+        assert_eq!(got.get(&B256::repeat_byte(6)), Some(&vec![]), "scanned, nothing matched");
+        assert!(!got.contains_key(&B256::repeat_byte(5)));
+        assert!(s.get_matched(&f2, &[b]).unwrap().is_empty(), "another filter set has its own entries");
     }
 
     #[test]

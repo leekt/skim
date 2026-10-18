@@ -146,6 +146,30 @@ pub struct ChainData {
     inflight: Mutex<HashMap<B256, Arc<tokio::sync::Semaphore>>>,
 }
 
+/// A filter set's identity for stored matches: the same filters (in any order) give the same
+/// fingerprint.
+fn filters_fingerprint(filters: &[Filter]) -> B256 {
+    let mut parts: Vec<String> = filters
+        .iter()
+        .map(|f| {
+            let mut a: Vec<String> = f.address.iter().map(|x| x.to_string().to_lowercase()).collect();
+            a.sort();
+            let t: Vec<String> = f
+                .topics
+                .iter()
+                .map(|set| {
+                    let mut v: Vec<String> = set.iter().map(|x| x.to_string()).collect();
+                    v.sort();
+                    v.join(",")
+                })
+                .collect();
+            format!("{}/{}", a.join(","), t.join(";"))
+        })
+        .collect();
+    parts.sort();
+    keccak256(parts.join("|"))
+}
+
 /// CPU-heavy verification (receipt roots: a trie over every receipt) runs off the async
 /// runtime, a bounded number at a time, so a long scan's verification can't starve request
 /// handling or the block follower.
@@ -942,7 +966,7 @@ impl ChainData {
         if to - from + 1 > self.max_log_range {
             return Err(DataError::RangeTooLarge(self.max_log_range));
         }
-        let scan = self.scan(std::slice::from_ref(filter), from, to, at).await?;
+        let scan = self.scan(std::slice::from_ref(filter), from, to, at, false).await?;
         Ok(Value::Array(scan.blocks.into_iter().flat_map(|b| b.logs).collect()))
     }
 
@@ -966,7 +990,7 @@ impl ChainData {
     /// are left out), plus the hash of `to`: one consistent chain (headers in memory, or on disk
     /// hash-linked to it). With `at`, the single block must be that block. Shared by
     /// `eth_getLogs` and block streams.
-    pub async fn scan(&self, filters: &[Filter], from: u64, to: u64, at: Option<B256>) -> Result<Scan, DataError> {
+    pub async fn scan(&self, filters: &[Filter], from: u64, to: u64, at: Option<B256>, persist: bool) -> Result<Scan, DataError> {
         self.ensure_headers(from).await?;
         // Receipts older than every connected peer serves (history expiry) can't be fetched;
         // say so instead of asking each peer for blocks it has dropped.
@@ -1026,30 +1050,35 @@ impl ChainData {
         let matches = |l: &alloy_primitives::Log| filters.iter().any(|f| f.matches(l));
         let mut blocks = Vec::new();
         let mut count = 0usize;
-        // Per chunk of candidates: logs already stored on disk (`--history local`) are read from
-        // there; the rest come from verified receipts, fetched in batches and stored, so no block's
-        // receipts are fetched twice. Receipts are dropped once their logs are extracted, so a long
-        // scan holds at most one chunk of them in memory.
-        let store = self.history.get();
+        // Per chunk of candidates. For a module's stream (`persist`) with `--history local`, the
+        // matches already stored for this filter set are read from disk; the rest come from
+        // verified receipts, fetched in batches, and their matches (possibly none) are stored, so
+        // the same blocks are never fetched again for these filters. Receipts are dropped once
+        // their matches are extracted: a long scan holds at most one chunk of them in memory.
+        let fp = persist.then(|| filters_fingerprint(filters));
+        let store = self.history.get().filter(|_| fp.is_some());
         for chunk in candidates.chunks(SCAN_CHUNK) {
             let hashes: Vec<B256> = chunk.iter().map(|(_, bh, _)| *bh).collect();
-            let mut known = store.map(|s| s.get_logs(&hashes).unwrap_or_default()).unwrap_or_default();
+            let mut known: HashMap<B256, Vec<crate::history::MatchedLog>> = match (store, &fp) {
+                (Some(s), Some(fp)) => s.get_matched(fp, &hashes).unwrap_or_default(),
+                _ => HashMap::new(),
+            };
             let mut need: Vec<(u64, B256, Arc<Header>)> = chunk.iter().filter(|(_, bh, _)| !known.contains_key(bh)).cloned().collect();
-            // Blocks another scan is already fetching: wait for it, then read what it stored.
-            // (With a store only; without one there's nothing to read back.)
+            // Blocks another scan with the same filters is fetching: wait for it, then read back.
             let mut mine = Vec::new();
-            if let Some(s) = store {
+            if let (Some(s), Some(fp)) = (store, &fp) {
                 let mut waits = Vec::new();
                 {
                     let mut f = self.inflight.lock();
                     for b in std::mem::take(&mut need) {
-                        match f.get(&b.1) {
+                        let key = keccak256([fp.as_slice(), b.1.as_slice()].concat());
+                        match f.get(&key) {
                             Some(n) => waits.push((b, n.clone())),
                             None => {
                                 // A closed semaphore is the "done" signal: acquiring it then
                                 // returns at once, even for a scan that starts waiting late.
-                                f.insert(b.1, Arc::new(tokio::sync::Semaphore::new(0)));
-                                mine.push(b.1);
+                                f.insert(key, Arc::new(tokio::sync::Semaphore::new(0)));
+                                mine.push(key);
                                 need.push(b);
                             }
                         }
@@ -1057,7 +1086,7 @@ impl ChainData {
                 }
                 for (b, n) in waits {
                     let _ = tokio::time::timeout(Duration::from_secs(60), n.acquire()).await;
-                    match s.get_logs(&[b.1]).ok().and_then(|mut m| m.remove(&b.1)) {
+                    match s.get_matched(fp, &[b.1]).ok().and_then(|mut m| m.remove(&b.1)) {
                         Some(l) => {
                             known.insert(b.1, l);
                         }
@@ -1073,13 +1102,36 @@ impl ChainData {
             };
             let batch = &batch;
             let fetched: Vec<_> = futures::stream::iter(need.iter().cloned())
-                .map(|(_, bh, h)| async move {
+                .map(|(n, bh, h)| async move {
                     let r = match batch.get(&bh) {
                         Some(r) => r.clone(),
                         None => self.block_receipts(bh, &h).await?,
                     };
-                    let logs = r.iter().enumerate().flat_map(|(ti, r)| r.logs.iter().map(move |l| (ti as u32, l.clone()))).collect();
-                    Ok::<_, DataError>((bh, crate::history::BlockLogs { tx_hashes: Vec::new(), logs }))
+                    // Matching logs with their positions; the receipts themselves are dropped here.
+                    let mut found = Vec::new();
+                    let mut li = 0u32;
+                    for (ti, rc) in r.iter().enumerate() {
+                        for l in &rc.logs {
+                            if matches(l) {
+                                found.push((ti as u32, li, l.clone()));
+                            }
+                            li += 1;
+                        }
+                    }
+                    drop(r);
+                    let txs = if found.is_empty() {
+                        None
+                    } else {
+                        Some(match self.block_tx_hashes(n, bh) {
+                            Some(hs) => hs,
+                            None => Arc::new(tx_hashes(&self.block_txs(bh, &h).await?)),
+                        })
+                    };
+                    let logs = found
+                        .into_iter()
+                        .map(|(ti, li, log)| crate::history::MatchedLog { tx_index: ti, log_index: li, tx_hash: txs.as_ref().map_or(B256::ZERO, |t| t[ti as usize]), log })
+                        .collect::<Vec<_>>();
+                    Ok::<_, DataError>((bh, logs))
                 })
                 .buffered(8)
                 .collect()
@@ -1091,33 +1143,14 @@ impl ChainData {
                 to_store.push(bh);
             }
             for (n, bh, h) in chunk {
-                let Some(bl) = known.get_mut(bh) else { continue };
-                if !bl.logs.iter().any(|(_, l)| matches(l)) {
-                    continue;
-                }
-                // Transaction hashes, for blocks with a match (from the index, or the body).
-                if bl.tx_hashes.is_empty() {
-                    bl.tx_hashes = match self.block_tx_hashes(*n, *bh) {
-                        Some(hs) => (*hs).clone(),
-                        None => tx_hashes(&self.block_txs(*bh, h).await?),
-                    };
-                    if !to_store.contains(bh) {
-                        to_store.push(*bh);
-                    }
-                }
-                let logs: Vec<Value> = bl
-                    .logs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (_, l))| matches(l))
-                    .map(|(li, (ti, l))| Self::log_json(l, *bh, *n, h.timestamp, bl.tx_hashes[*ti as usize], *ti, li as u64))
-                    .collect();
+                let Some(m) = known.get(bh).filter(|m| !m.is_empty()) else { continue };
+                let logs: Vec<Value> = m.iter().map(|x| Self::log_json(&x.log, *bh, *n, h.timestamp, x.tx_hash, x.tx_index, x.log_index as u64)).collect();
                 count += logs.len();
                 blocks.push(ScanBlock { number: *n, hash: *bh, parent_hash: h.parent_hash, timestamp: h.timestamp, logs });
             }
-            if let Some(s) = store {
-                let entries: Vec<(B256, &crate::history::BlockLogs)> = to_store.iter().filter_map(|h| known.get(h).map(|l| (*h, l))).collect();
-                if let Err(e) = s.put_logs(&entries) {
+            if let (Some(s), Some(fp)) = (store, &fp) {
+                let entries: Vec<(B256, &[crate::history::MatchedLog])> = to_store.iter().filter_map(|h| known.get(h).map(|l| (*h, l.as_slice()))).collect();
+                if let Err(e) = s.put_matched(fp, &entries) {
                     tracing::warn!("{e}");
                 }
             }

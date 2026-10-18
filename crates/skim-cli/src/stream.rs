@@ -97,7 +97,7 @@ pub async fn next(chain: &ChainData, head: impl Fn() -> Option<u64>, finalized: 
     // The new position: the last block scanned, else where the rewind/gap left the module.
     let cursor = if pos < tip {
         let to = tip.min(pos + req.max_blocks.unwrap_or(chain.max_log_range).clamp(1, chain.max_log_range));
-        let scan = chain.scan(&req.filters, pos + 1, to, None).await?;
+        let scan = chain.scan(&req.filters, pos + 1, to, None, true).await?;
         for b in scan.blocks {
             events.push(json!({
                 "type": "apply",
