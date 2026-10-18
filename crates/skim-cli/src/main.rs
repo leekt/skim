@@ -1,9 +1,11 @@
 #![recursion_limit = "512"]
 //! `skim` command line. For now: M0 probes (PROJECT.md §10).
 
-// mimalloc returns freed memory to the OS: with glibc's allocator, a long catch-up left RSS at
-// 2.4x the live heap (heaptrack on aarch64 Linux: 228 MB peak heap, 554 MB RSS), as freed receipt
-// buffers stayed in per-thread arenas.
+// Linux only. With glibc's allocator a long catch-up left RSS at 2.4x the live heap (heaptrack
+// on aarch64 Linux: 228 MB peak heap, 554 MB RSS), as freed receipt buffers stayed in per-thread
+// arenas; mimalloc returns them. On macOS the system allocator is the smaller one: following the
+// head with the same load, mimalloc's footprint was 236-255 MB against 86-94 MB (M7, "Memory").
+#[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

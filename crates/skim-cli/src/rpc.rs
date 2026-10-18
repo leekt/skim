@@ -767,9 +767,10 @@ impl Rpc {
         let ms = t.elapsed().as_secs_f64() * 1e3;
         tracing::debug!(method, ms, ok = res.is_ok(), "rpc");
         if method != "skim_dashboard" {
-            self.dash.record_method(method, ms, res.is_ok());
-            // Method names come from the request: only known ones get their own series.
+            // Method names come from the request: only known ones get their own series (in the
+            // dashboard too, whose per-method table would otherwise grow with every new name).
             let m = if known_method(method) { method.to_string() } else { "other".to_string() };
+            self.dash.record_method(&m, ms, res.is_ok());
             metrics::histogram!("skim_rpc_request_duration_seconds", "method" => m.clone()).record(ms / 1e3);
             let outcome = match &res {
                 Ok(_) => "ok",

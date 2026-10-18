@@ -16,6 +16,9 @@ use std::{
 
 use reth_network_api::PeerId;
 
+/// Peers remembered at most (each session with a new peer adds one; crawlers churn through many).
+pub const MAX_RECORDS: usize = 4096;
+
 /// A session that lasted this long counts as "held".
 pub const HELD: Duration = Duration::from_secs(60);
 
@@ -86,6 +89,9 @@ impl PeerBook {
         if snap && kind != "enrscout" && self.first_snap.is_none() {
             self.first_snap = self.started.map(|s| now.saturating_duration_since(s));
         }
+        if self.records.len() >= MAX_RECORDS && !self.records.contains_key(&id) {
+            self.trim();
+        }
         let r = self.records.entry(id).or_default();
         r.client = kind;
         r.snap |= snap;
@@ -104,6 +110,19 @@ impl PeerBook {
         r.longest = r.longest.max(up);
         if reason == "TooManyPeers" {
             r.full += 1;
+        }
+    }
+
+    /// Bounds the history: peers not worth a saved slot (crawlers, ones that only dropped us) go
+    /// first, then the lowest-ranked. Aggregate counts (sessions, closes) are kept as they are.
+    fn trim(&mut self) {
+        self.records.retain(|_, r| r.score() > 0);
+        if self.records.len() >= MAX_RECORDS {
+            let mut v: Vec<(PeerId, i32)> = self.records.iter().map(|(id, r)| (*id, r.score())).collect();
+            v.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+            for (id, _) in v.into_iter().take(MAX_RECORDS / 4) {
+                self.records.remove(&id);
+            }
         }
     }
 
@@ -166,5 +185,25 @@ mod tests {
         assert_eq!(s.first_snap, Some(Duration::from_secs(5)), "first SNAP-capable session, crawlers excluded");
         assert_eq!((s.snap_peers_seen, s.snap_peers_held), (2, 1));
         assert!(s.closes.contains(&("TooManyPeers".to_string(), 3)));
+    }
+
+    #[test]
+    fn crawler_churn_doesnt_grow_the_book_or_evict_good_peers() {
+        let mut b = PeerBook::default();
+        let t0 = Instant::now();
+        b.start(t0);
+        b.on_session(id(1), "Geth/v1.17", true, t0);
+        b.on_addr(id(1), "1.2.3.4:30303".parse().unwrap());
+        b.on_close(id(1), Duration::from_secs(300), None);
+        // Far more distinct crawlers than the book keeps.
+        for i in 0..(MAX_RECORDS as u32 * 3) {
+            let mut raw = [0u8; 64];
+            raw[..4].copy_from_slice(&(i + 1000).to_be_bytes());
+            b.on_session(PeerId::from(raw), "enrscout", false, t0);
+        }
+        assert!(b.records.len() <= MAX_RECORDS, "{} records", b.records.len());
+        assert_eq!(b.ranked().first().map(|r| r.0), Some(id(1)), "the held SNAP peer survives");
+        let crawler_sessions: u64 = b.summary().sessions.iter().filter(|(c, _, _)| c == "enrscout").map(|(_, _, n)| n).sum();
+        assert_eq!(crawler_sessions, MAX_RECORDS as u64 * 3, "aggregate counts are kept");
     }
 }

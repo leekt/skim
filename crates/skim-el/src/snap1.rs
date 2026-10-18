@@ -206,18 +206,23 @@ impl Stream for Snap1Connection {
                 Poll::Pending => break,
             }
         }
-        match this.commands.poll_recv(cx) {
-            Poll::Ready(Some(Command { request, response })) => {
-                let (id, out) = match &request {
-                    Snap1Request::AccountRange(m) => (m.request_id, frame(GET_ACCOUNT_RANGE, m)),
-                    Snap1Request::StorageRanges(m) => (m.request_id, frame(GET_STORAGE_RANGES, m)),
-                    Snap1Request::ByteCodes(m) => (m.request_id, frame(GET_BYTE_CODES, m)),
-                };
-                this.pending.insert(id, response);
-                Poll::Ready(Some(out))
+        loop {
+            let Poll::Ready(cmd) = this.commands.poll_recv(cx) else { return Poll::Pending };
+            let Some(Command { request, response }) = cmd else { return Poll::Ready(None) };
+            // The caller already gave up (timed out while queued): don't send it.
+            if response.is_closed() {
+                continue;
             }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            let (id, out) = match &request {
+                Snap1Request::AccountRange(m) => (m.request_id, frame(GET_ACCOUNT_RANGE, m)),
+                Snap1Request::StorageRanges(m) => (m.request_id, frame(GET_STORAGE_RANGES, m)),
+                Snap1Request::ByteCodes(m) => (m.request_id, frame(GET_BYTE_CODES, m)),
+            };
+            // Requests whose callers timed out are never answered by some peers: without this
+            // they would stay here for the whole session.
+            this.pending.retain(|_, tx| !tx.is_closed());
+            this.pending.insert(id, response);
+            return Poll::Ready(Some(out));
         }
     }
 }

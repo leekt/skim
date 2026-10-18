@@ -298,3 +298,31 @@ async fn high_is_not_starved_by_a_large_background_backlog_under_aimd() {
     assert!(t.elapsed() < Duration::from_millis(300), "high waited {:?}", t.elapsed());
     bg_task.abort();
 }
+
+#[tokio::test]
+async fn a_job_nobody_waits_for_is_dropped_not_sent() {
+    // One slot: A is in flight, B queues behind it. B's caller gives up before it is sent.
+    let m = Mock::new(&[(1, Behav::Ok { ms: 100 })]);
+    let s = Scheduler::new(m.clone(), Config { per_peer_inflight: 1, adaptive: false, ..cfg() });
+    let mut a = s.submit(&[slot(1)], Priority::High);
+    let b = s.submit(&[slot(2)], Priority::High);
+    drop(b);
+    assert!(a.pop().unwrap().await.0.is_ok());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(m.requests.load(Ordering::SeqCst), 1, "the cancelled job was never sent");
+    assert_eq!(s.stats().orphaned, 1);
+    assert_eq!(s.queue_lens(), (0, 0));
+    // The same key submitted again is fetched once, not twice from a stale queue entry.
+    assert!(s.fetch(&[slot(2)]).await[0].is_ok());
+    assert_eq!(m.requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn background_work_runs_on_a_peer_with_a_cap_of_one() {
+    // Half of a cap of 1 is 0: without the idle-peer allowance this job would wait forever.
+    let m = Mock::new(&[(1, Behav::Ok { ms: 5 })]);
+    let s = Scheduler::new(m, Config { per_peer_inflight: 1, adaptive: false, ..cfg() });
+    let f = s.submit(&[slot(1)], Priority::Low).pop().unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(2), f).await.expect("background job ran");
+    assert!(r.0.is_ok());
+}

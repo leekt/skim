@@ -395,7 +395,8 @@ pub async fn seed_recent_bals(store: Arc<Store>, cl: &(impl EnvelopeSource + ?Si
     let want = first.number - low;
     let r = walk_envelopes(cl, head_slot.saturating_sub(1), window * 2, want, &mut trace, |h, w| {
         if (low..first.number).contains(&h.number) {
-            got.insert(h.number, (h, w));
+            // Only the writes are indexed: drop reads, touched addresses and code right away.
+            got.insert(h.number, (h, BlockWrites { writes: w.writes, ..Default::default() }));
         }
         got.len() as u64 == want
     })
@@ -433,8 +434,7 @@ pub fn verify_and_replay(saved: &Saved, blocks: &[(alloy_consensus::Header, Bloc
         number = h.number;
     }
     anyhow::ensure!(number == head.number && prev == head.hash, "replayed chain ends at {number}/{prev}, not the head {}/{}", head.number, head.hash);
-    let writes: Vec<BlockWrites> = blocks.iter().map(|(_, w)| w.clone()).collect();
-    Ok(skim_state::persist::replay(saved, &writes))
+    Ok(skim_state::persist::replay(saved, blocks.iter().map(|(_, w)| w)))
 }
 
 #[cfg(test)]

@@ -179,6 +179,8 @@ pub struct Stats {
     /// Requests sent for Low (background) jobs; `requests` counts all.
     pub requests_low: u64,
     pub upgraded: u64,
+    /// Jobs dropped because every caller had stopped waiting.
+    pub orphaned: u64,
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -473,8 +475,11 @@ impl<T: Transport> Inner<T> {
         let eligible = |(id, p): &(&PeerId, &Peer)| {
             allowed.as_ref().is_none_or(|a| a.contains(*id))
                 && p.inflight < if job.low {
-                    // Background work keeps at least one slot free for simulations.
-                    (p.cap(&self.cfg) / 2).min(p.cap(&self.cfg).saturating_sub(1))
+                    // Background work keeps at least one slot free for simulations, except on an
+                    // idle peer with no simulation waiting: at an adaptive cap of 1 the half-cap
+                    // rule is 0, and background jobs would otherwise never run.
+                    let half = (p.cap(&self.cfg) / 2).min(p.cap(&self.cfg).saturating_sub(1));
+                    if half == 0 && p.inflight == 0 && st.queue.is_empty() { 1 } else { half }
                 } else {
                     p.cap(&self.cfg)
                 }
@@ -500,6 +505,21 @@ impl<T: Transport> Inner<T> {
         st.peers.retain(|id, _| live.contains(id));
         for id in live {
             st.peers.entry(id).or_default();
+        }
+
+        // Jobs nobody waits for any more (callers timed out or were cancelled): drop closed
+        // waiters, and drop the job unless a request for it is in flight (that one finishes and
+        // keeps the peer accounting right). Their queue entries are skipped when placed.
+        let mut orphaned = Vec::new();
+        for (k, j) in st.jobs.iter_mut() {
+            j.waiters.retain(|(w, _)| !w.is_closed());
+            if j.waiters.is_empty() && j.inflight == 0 {
+                orphaned.push(*k);
+            }
+        }
+        for k in orphaned {
+            st.jobs.remove(&k);
+            st.stats.orphaned += 1;
         }
 
         // Deadlines and hedges.
@@ -558,8 +578,10 @@ impl<T: Transport> Inner<T> {
             let next = if low { st.queue_lo.pop_front() } else { st.queue.pop_front() };
             let Some(key) = next else { break };
             let Some(job) = st.jobs.get(&key) else { continue };
-            if job.low != low {
-                continue; // promoted or demoted while queued; it sits in the other queue
+            if job.low != low || !job.queued {
+                // Promoted or demoted while queued (it sits in the other queue). `queued` is
+                // checked too so a stray duplicate entry could never send a job twice.
+                continue;
             }
             let Some(peer) = self.pick_peer(st, &key, job) else {
                 deferred.push_back(key);
@@ -571,7 +593,7 @@ impl<T: Transport> Inner<T> {
                 let q = if low { &mut st.queue_lo } else { &mut st.queue };
                 let mut rest = VecDeque::new();
                 while let Some(k) = q.pop_front() {
-                    if matches!(k, Key::Code(_)) && keys.len() < self.cfg.code_batch && st.jobs.get(&k).is_some_and(|j| j.low == low) {
+                    if matches!(k, Key::Code(_)) && keys.len() < self.cfg.code_batch && st.jobs.get(&k).is_some_and(|j| j.low == low && j.queued) {
                         keys.push(k);
                     } else {
                         rest.push_back(k);

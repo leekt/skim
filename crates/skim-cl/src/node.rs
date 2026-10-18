@@ -236,6 +236,11 @@ struct PeerState {
     gossip_first: u64,
 }
 
+/// Discovery bookkeeping bounds: dial cooldowns are pruned past this many entries, and the
+/// distinct-node set behind the `discovered` stats resets at this size.
+const MAX_DIAL_RECORDS: usize = 1024;
+const MAX_SEEN_NODES: usize = 65_536;
+
 #[derive(Clone)]
 pub struct ClNode {
     pub stats: Arc<Mutex<NodeStats>>,
@@ -727,6 +732,11 @@ impl Runner {
     fn on_found(&mut self, enrs: Vec<Enr>) {
         for enr in enrs {
             let matching = enr_digest(&enr) == Some(self.cfg.fork_digest);
+            // Distinct nodes for the `discovered` stats: bounded, so after a reset a node may be
+            // counted again (the stat is distinct nodes since the last reset).
+            if self.seen_nodes.len() >= MAX_SEEN_NODES {
+                self.seen_nodes.clear();
+            }
             if self.seen_nodes.insert(enr.node_id()) {
                 let mut s = self.stats.lock().unwrap();
                 s.discovered += 1;
@@ -741,6 +751,10 @@ impl Runner {
             }
             if self.last_dial.get(&peer).is_some_and(|t| t.elapsed() < Duration::from_secs(120)) {
                 continue;
+            }
+            if self.last_dial.len() >= MAX_DIAL_RECORDS {
+                // Only cooldowns still running matter; the rest would grow with every peer seen.
+                self.last_dial.retain(|_, t| t.elapsed() < Duration::from_secs(120));
             }
             self.last_dial.insert(peer, Instant::now());
             let opts = DialOpts::peer_id(peer)

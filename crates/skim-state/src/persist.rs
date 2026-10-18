@@ -118,7 +118,7 @@ impl Persist {
 /// Replays verified BAL writes over a snapshot: `blocks` are the writes of each block after the
 /// snapshot's block, in order. Only keys in the snapshot are kept; code for changed code
 /// hashes comes from the blocks.
-pub fn replay(saved: &Saved, blocks: &[crate::BlockWrites]) -> (Vec<(StateKey, U256)>, Vec<(B256, Bytes)>) {
+pub fn replay<'a>(saved: &Saved, blocks: impl IntoIterator<Item = &'a crate::BlockWrites>) -> (Vec<(StateKey, U256)>, Vec<(B256, Bytes)>) {
     let mut values: std::collections::HashMap<StateKey, U256> = saved.values.iter().copied().collect();
     let mut code: std::collections::HashMap<B256, Bytes> = saved.code.iter().cloned().collect();
     for w in blocks {

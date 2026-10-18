@@ -84,12 +84,7 @@ impl Dashboard {
         for (a, _) in fetched_storage {
             u.entry(*a).or_default().fetched += 1;
         }
-        if u.len() > MAX_ADDRESSES {
-            let mut calls: Vec<u64> = u.values().map(|e| e.calls).collect();
-            calls.sort_unstable();
-            let cut = calls[calls.len() - MAX_ADDRESSES * 9 / 10];
-            u.retain(|_, e| e.calls > cut);
-        }
+        prune(&mut u);
     }
 
     /// A call answered from the result cache: the same addresses were read again.
@@ -100,6 +95,7 @@ impl Dashboard {
             e.calls += 1;
             e.last_block = block;
         }
+        prune(&mut u);
     }
 
     pub fn record_method(&self, method: &str, ms: f64, ok: bool) {
@@ -230,6 +226,16 @@ pub fn by_kind<'a>(kinds: impl Iterator<Item = &'a str>) -> Vec<Value> {
     v.into_iter().map(|(k, n)| json!({"client": k, "count": n})).collect()
 }
 
+/// Keeps the per-address table bounded: past `MAX_ADDRESSES`, the least-called tenth goes.
+fn prune(u: &mut HashMap<Address, AddrUsage>) {
+    if u.len() > MAX_ADDRESSES {
+        let mut calls: Vec<u64> = u.values().map(|e| e.calls).collect();
+        calls.sort_unstable();
+        let cut = calls[calls.len() - MAX_ADDRESSES * 9 / 10];
+        u.retain(|_, e| e.calls > cut);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +250,17 @@ mod tests {
         let u = d.usage.lock();
         assert_eq!((u[&a].calls, u[&a].slots.len(), u[&a].fetched, u[&a].last_block), (2, 2, 0, 11));
         assert_eq!((u[&b].calls, u[&b].slots.len(), u[&b].fetched), (2, 1, 1));
+    }
+
+    #[test]
+    fn cache_hits_on_many_addresses_stay_bounded() {
+        let d = Dashboard::default();
+        for i in 0..(MAX_ADDRESSES as u64 * 2) {
+            let mut raw = [0u8; 20];
+            raw[..8].copy_from_slice(&(i + 1).to_be_bytes());
+            d.record_hit(1, &[Address::from(raw)]);
+        }
+        assert!(d.usage.lock().len() <= MAX_ADDRESSES);
     }
 
     #[test]
