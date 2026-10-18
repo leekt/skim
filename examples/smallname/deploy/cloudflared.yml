@@ -1,11 +1,16 @@
-# A Cloudflare tunnel in front of smallname only. skim's RPC stays on 127.0.0.1.
+# A Cloudflare tunnel in front of smallname and skim's read-only dashboard. skim's RPC stays on
+# 127.0.0.1 (the dashboard serves only its page and /dashboard.json, never JSON-RPC).
 #   cloudflared tunnel login              # authorize the zone (prints a URL)
 #   cloudflared tunnel create smallname   # or: npx wrangler tunnel create smallname
 #   cloudflared tunnel route dns smallname <hostname>
+#   cloudflared tunnel route dns smallname <dashboard-hostname>
 tunnel: <tunnel-id>
 credentials-file: /home/skim/.cloudflared/<tunnel-id>.json
 ingress:
   - hostname: <hostname>
     path: ^/(v1/.*|healthz|index\.html)?$
     service: http://127.0.0.1:8787
+  - hostname: <dashboard-hostname>
+    path: ^/(dashboard\.json)?$
+    service: http://127.0.0.1:8546
   - service: http_status:404

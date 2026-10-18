@@ -347,6 +347,7 @@ impl ChainData {
         self.bals.lock().put(hash, Arc::new(bal));
     }
 
+    #[cfg(test)]
     pub fn history_store(&self) -> Option<&crate::history::HeaderStore> {
         self.history.get()
     }

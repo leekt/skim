@@ -89,6 +89,10 @@ pub struct Args {
     /// Don't cache `eth_call` results per (block, request) (measurements of raw execution).
     #[arg(long)]
     no_call_cache: bool,
+    /// Serve a read-only web dashboard at http://<addr>/ (e.g. 127.0.0.1:8546; off unless set):
+    /// node, subscription and peer state only, no JSON-RPC, so it can be put on a public host.
+    #[arg(long, value_name = "ADDR")]
+    dashboard: Option<SocketAddr>,
     /// Serve Prometheus metrics at http://<addr>/metrics (e.g. 127.0.0.1:9465; off unless set).
     /// `metrics/` has a Prometheus + Grafana stack with skim's dashboard.
     #[arg(long, value_name = "ADDR")]
@@ -361,6 +365,14 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         dash: dash.clone(),
     });
     tokio::spawn(serve(rpc.clone(), args.rpc));
+    if let Some(addr) = args.dashboard {
+        let rpc = rpc.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::web_dashboard::serve(rpc, addr).await {
+                tracing::error!("dashboard endpoint: {e}");
+            }
+        });
+    }
     if let (Some(addr), Some(handle)) = (args.metrics, metrics_handle) {
         let top = args.metrics_addresses;
         tokio::spawn(async move {

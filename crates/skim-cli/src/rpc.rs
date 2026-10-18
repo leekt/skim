@@ -1025,7 +1025,7 @@ impl Rpc {
     }
 
     /// The block `latest` means for this request (the head, or the verified head).
-    fn latest(&self) -> Option<BlockRef> {
+    pub(crate) fn latest(&self) -> Option<BlockRef> {
         if self.require_verified {
             self.light.as_ref().and_then(|l| l.status().verified_block).and_then(|v| crate::light::resolve(&self.sim.store, &v))
         } else {
