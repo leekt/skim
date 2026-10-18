@@ -141,6 +141,27 @@ pub struct ChainData {
     /// Post-Amsterdam headers on disk (`history.redb` in the data dir), so logs and receipts
     /// cover the whole post-fork history. `None` with `--ephemeral`: memory only.
     history: std::sync::OnceLock<crate::history::HeaderStore>,
+    /// Blocks whose receipts a scan is fetching right now: concurrent scans of the same blocks
+    /// (several modules, or eth_getLogs) wait for that fetch and read the stored result.
+    inflight: Mutex<HashMap<B256, Arc<tokio::sync::Semaphore>>>,
+}
+
+/// Releases a scan's in-flight blocks (and wakes scans waiting for them) when it's done with
+/// them, whether the fetch succeeded or not.
+struct InflightGuard<'a> {
+    map: &'a Mutex<HashMap<B256, Arc<tokio::sync::Semaphore>>>,
+    hashes: Vec<B256>,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        let mut m = self.map.lock();
+        for h in &self.hashes {
+            if let Some(n) = m.remove(h) {
+                n.close();
+            }
+        }
+    }
 }
 
 /// A block with logs matching a scan's filters.
@@ -175,6 +196,7 @@ impl ChainData {
             max_log_range,
             rr: AtomicUsize::new(0),
             history: Default::default(),
+            inflight: Default::default(),
         });
         let me = Arc::downgrade(&cd);
         tokio::spawn(async move {
@@ -989,7 +1011,38 @@ impl ChainData {
         for chunk in candidates.chunks(SCAN_CHUNK) {
             let hashes: Vec<B256> = chunk.iter().map(|(_, bh, _)| *bh).collect();
             let mut known = store.map(|s| s.get_logs(&hashes).unwrap_or_default()).unwrap_or_default();
-            let need: Vec<(u64, B256, Arc<Header>)> = chunk.iter().filter(|(_, bh, _)| !known.contains_key(bh)).cloned().collect();
+            let mut need: Vec<(u64, B256, Arc<Header>)> = chunk.iter().filter(|(_, bh, _)| !known.contains_key(bh)).cloned().collect();
+            // Blocks another scan is already fetching: wait for it, then read what it stored.
+            // (With a store only; without one there's nothing to read back.)
+            let mut mine = Vec::new();
+            if let Some(s) = store {
+                let mut waits = Vec::new();
+                {
+                    let mut f = self.inflight.lock();
+                    for b in std::mem::take(&mut need) {
+                        match f.get(&b.1) {
+                            Some(n) => waits.push((b, n.clone())),
+                            None => {
+                                // A closed semaphore is the "done" signal: acquiring it then
+                                // returns at once, even for a scan that starts waiting late.
+                                f.insert(b.1, Arc::new(tokio::sync::Semaphore::new(0)));
+                                mine.push(b.1);
+                                need.push(b);
+                            }
+                        }
+                    }
+                }
+                for (b, n) in waits {
+                    let _ = tokio::time::timeout(Duration::from_secs(60), n.acquire()).await;
+                    match s.get_logs(&[b.1]).ok().and_then(|mut m| m.remove(&b.1)) {
+                        Some(l) => {
+                            known.insert(b.1, l);
+                        }
+                        None => need.push(b), // that fetch failed: fetch it here
+                    }
+                }
+            }
+            let _done = InflightGuard { map: &self.inflight, hashes: mine };
             let batch = if need.len() > 4 {
                 self.receipts_many(&need.iter().map(|(_, bh, h)| (*bh, h.clone())).collect::<Vec<_>>()).await
             } else {
