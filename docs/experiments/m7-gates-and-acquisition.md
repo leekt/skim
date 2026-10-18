@@ -176,3 +176,12 @@ Also from the review: stored matches are encoded and compressed before the write
   - 2 missed the 180 s gate: 407 s and 215 s. Both were config switches, where the new config subscribes keys the snapshot doesn't hold, so readiness waits for SNAP fetches.
 - **Freshness:** the head was stale for 4.1% of steady-state time, over the 2% gate. This run measured gaps between head arrivals, the metric the seventh review replaced, so the figure includes the time the probe loop itself was busy.
 - **Next:** rerun with the new freshness sampler. If config-switch recovery still misses 180 s, time the SNAP fetch to see whether it is waiting for peers or fetching.
+
+**Second full soak (150 min, binary `5237bc1`, harness with the head-age freshness sampler and scheduled-downtime exclusion): FAIL on recovery only, no wrong answers.**
+- **Answers:** 7,426 matches, 0 wrong, 0 refusals. 8 were unavailable from the reference; 23 skim requests failed in transport (counted).
+- **Steady-state answer rate:** 99.8% or higher for every kind; all required kinds sampled.
+- **Freshness:** head stale 0.0% of steady-state time (gate passed); longest gap between new heads 35.6 s.
+- **Memory:** RSS at most 134 MB. Subscribed keys never over the limit. 52 BAL promotions.
+- **Restarts:** 16; 14 recovered in 34-160 s.
+  - **428 s (sigkill, config B):** after 133 s of following, one gossip payload was missed. The gap could only be filled from eth/71 EL peers, and only crawlers were connected on the EL side for 5 minutes. Fixed after this build: a live gap now falls back to payload envelopes from consensus peers (commit `0ce59c6`).
+  - **245 s (graceful, config A):** the chain was followed from 33 s on, but no SNAP-serving peer was connected to fill the subscriptions until ~245 s. This is peer acquisition (section 3), not the store; the soak ran next to two other skim nodes on the same machine and IP.
