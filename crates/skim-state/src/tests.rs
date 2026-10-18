@@ -794,3 +794,27 @@ fn an_archived_key_seeded_from_earlier_bals_gets_archive_coverage() {
     assert_eq!(ar.get(&slot(1), 30).unwrap(), archive::ArchiveRead::Value(U256::from(5)));
     assert!(matches!(ar.get(&slot(1), 17).unwrap(), archive::ArchiveRead::NotCovered { .. }), "never backdated before the archive");
 }
+
+#[test]
+fn archived_keys_reloaded_after_a_restart_hold_no_slots_until_asked_for() {
+    // Fifth soak: each restart archived a new account, the previous ones reloaded from the
+    // archive as subscribed, and the limit filled with keys nothing asked for any more.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("a.redb");
+    {
+        let s = Store::with_archive(64, archive::Archive::open(&path).unwrap()).unwrap();
+        s.apply_block(blk(1, 0), writes(&[])).unwrap();
+        for i in 1..=3 {
+            s.archive_key(slot(i));
+        }
+    }
+    let s = Store::with_archive(64, archive::Archive::open(&path).unwrap()).unwrap();
+    s.set_max_subscribed(2);
+    assert_eq!(s.archived_keys().len(), 3, "still archived");
+    assert_eq!(s.sizes().watched_keys, 0, "but holding no subscribed slot");
+    // The current config asks for slot 1 (archived before) and a new slot 9: both fit.
+    assert!(s.archive_key_checked(slot(1)));
+    assert!(s.archive_key_checked(slot(9)));
+    assert_eq!(s.sizes().watched_keys, 2);
+    assert!(!s.archive_key_checked(slot(10)), "the limit still holds");
+}

@@ -318,10 +318,14 @@ impl Store {
     }
 
     /// A store that also archives every version of archived keys (reloaded from `archive`).
+    /// Reloaded keys stay archived (each block's writes to them keep being recorded) but hold
+    /// no subscribed slot until a subscription asks for them again: a key nothing re-requests
+    /// (a removed subscription, a call that stopped reading it) never crowds out the keys the
+    /// current config needs, however often skim restarts. Those are released after a while.
     pub fn with_archive(window: u64, archive: archive::Archive) -> Result<Arc<Self>, archive::ArchiveError> {
         let keys = archive.archived_keys()?;
         let keys: HashSet<StateKey> = keys.into_iter().collect();
-        let inner = Inner { archived: keys.clone(), watched_keys: keys, ..Default::default() };
+        let inner = Inner { archived: keys, ..Default::default() };
         Ok(Arc::new(Self {
             inner: RwLock::new(inner),
             window,
