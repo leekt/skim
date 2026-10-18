@@ -377,16 +377,23 @@ impl ChainData {
     pub fn history_json(&self) -> Value {
         let floor = self.history.get().and_then(|s| s.floor().ok().flatten());
         let (peers_from, reporting) = self.peers_serve_from();
-        let logs_from = match (floor, peers_from) {
-            (Some(f), Some(p)) => Some(f.max(p)),
-            (f, p) => p.or(f),
+        let mem_from = self.inner.read().headers.first_key_value().map(|(n, _)| *n);
+        let logs_from = if self.history.get().is_none() {
+            // Head-only (`--history off`): the in-memory window.
+            mem_from
+        } else {
+            match (floor, peers_from) {
+                (Some(f), Some(p)) => Some(f.max(p)),
+                (f, p) => p.or(f),
+            }
         };
         json!({
             "fork_floor": floor,
             "peers_serve_from": peers_from,
             "peers_reporting": reporting,
             "logs_from": logs_from,
-            "memory_headers_from": self.inner.read().headers.first_key_value().map(|(n, _)| *n),
+            "memory_headers_from": mem_from,
+            "mode": if self.history.get().is_some() { "local" } else { "off" },
         })
     }
 
@@ -974,51 +981,69 @@ impl ChainData {
         let matches = |l: &alloy_primitives::Log| filters.iter().any(|f| f.matches(l));
         let mut blocks = Vec::new();
         let mut count = 0usize;
-        // Receipts are fetched for a chunk of candidates at a time and dropped once their logs are
-        // extracted, so a long range scan holds at most one chunk of receipts in memory.
+        // Per chunk of candidates: logs already stored on disk (`--history local`) are read from
+        // there; the rest come from verified receipts, fetched in batches and stored, so no block's
+        // receipts are fetched twice. Receipts are dropped once their logs are extracted, so a long
+        // scan holds at most one chunk of them in memory.
+        let store = self.history.get();
         for chunk in candidates.chunks(SCAN_CHUNK) {
-            // Many candidates: fetch their receipts in batches first.
-            let batch = if chunk.len() > 4 {
-                self.receipts_many(&chunk.iter().map(|(_, bh, h)| (*bh, h.clone())).collect::<Vec<_>>()).await
+            let hashes: Vec<B256> = chunk.iter().map(|(_, bh, _)| *bh).collect();
+            let mut known = store.map(|s| s.get_logs(&hashes).unwrap_or_default()).unwrap_or_default();
+            let need: Vec<(u64, B256, Arc<Header>)> = chunk.iter().filter(|(_, bh, _)| !known.contains_key(bh)).cloned().collect();
+            let batch = if need.len() > 4 {
+                self.receipts_many(&need.iter().map(|(_, bh, h)| (*bh, h.clone())).collect::<Vec<_>>()).await
             } else {
                 HashMap::new()
             };
             let batch = &batch;
-            let fetched: Vec<_> = futures::stream::iter(chunk.iter().cloned())
-                .map(|(n, bh, h)| async move {
+            let fetched: Vec<_> = futures::stream::iter(need.iter().cloned())
+                .map(|(_, bh, h)| async move {
                     let r = match batch.get(&bh) {
                         Some(r) => r.clone(),
                         None => self.block_receipts(bh, &h).await?,
                     };
-                    let has = r.iter().any(|r| r.logs.iter().any(matches));
-                    let hashes = if has {
-                        match self.block_tx_hashes(n, bh) {
-                            Some(hs) => Some(hs),
-                            None => Some(Arc::new(tx_hashes(&self.block_txs(bh, &h).await?))),
-                        }
-                    } else {
-                        None
-                    };
-                    Ok::<_, DataError>((n, bh, h, r, hashes))
+                    let logs = r.iter().enumerate().flat_map(|(ti, r)| r.logs.iter().map(move |l| (ti as u32, l.clone()))).collect();
+                    Ok::<_, DataError>((bh, crate::history::BlockLogs { tx_hashes: Vec::new(), logs }))
                 })
                 .buffered(8)
                 .collect()
                 .await;
+            let mut to_store: Vec<B256> = Vec::new();
             for res in fetched {
-                let (n, bh, h, receipts, hashes) = res?;
-                let Some(hashes) = hashes else { continue };
-                let mut logs = Vec::new();
-                let mut li = 0u64;
-                for (ti, r) in receipts.iter().enumerate() {
-                    for l in &r.logs {
-                        if matches(l) {
-                            logs.push(Self::log_json(l, bh, n, h.timestamp, hashes[ti], ti as u32, li));
-                        }
-                        li += 1;
+                let (bh, l) = res?;
+                known.insert(bh, l);
+                to_store.push(bh);
+            }
+            for (n, bh, h) in chunk {
+                let Some(bl) = known.get_mut(bh) else { continue };
+                if !bl.logs.iter().any(|(_, l)| matches(l)) {
+                    continue;
+                }
+                // Transaction hashes, for blocks with a match (from the index, or the body).
+                if bl.tx_hashes.is_empty() {
+                    bl.tx_hashes = match self.block_tx_hashes(*n, *bh) {
+                        Some(hs) => (*hs).clone(),
+                        None => tx_hashes(&self.block_txs(*bh, h).await?),
+                    };
+                    if !to_store.contains(bh) {
+                        to_store.push(*bh);
                     }
                 }
+                let logs: Vec<Value> = bl
+                    .logs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, l))| matches(l))
+                    .map(|(li, (ti, l))| Self::log_json(l, *bh, *n, h.timestamp, bl.tx_hashes[*ti as usize], *ti, li as u64))
+                    .collect();
                 count += logs.len();
-                blocks.push(ScanBlock { number: n, hash: bh, parent_hash: h.parent_hash, timestamp: h.timestamp, logs });
+                blocks.push(ScanBlock { number: *n, hash: *bh, parent_hash: h.parent_hash, timestamp: h.timestamp, logs });
+            }
+            if let Some(s) = store {
+                let entries: Vec<(B256, &crate::history::BlockLogs)> = to_store.iter().filter_map(|h| known.get(h).map(|l| (*h, l))).collect();
+                if let Err(e) = s.put_logs(&entries) {
+                    tracing::warn!("{e}");
+                }
             }
         }
         tracing::debug!(scanned, candidates = candidates.len(), logs = count, ms = t.elapsed().as_millis() as u64, "log scan");

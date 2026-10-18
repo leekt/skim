@@ -5,7 +5,7 @@
 Smaller infrastructure and implementation (about 1,700 lines of JavaScript, one SQLite file, one skim node), but not feature-for-feature parity yet: see [Routes](#routes) and the history limits below.
 
 ```bash
-../target/release/skim run --config bigname/skim.yaml          # terminal 1: skim, ENS kept warm
+../target/release/skim run --config bigname/skim.yaml --history local   # terminal 1: skim, ENS kept warm, post-fork history on disk
 SKIM_RPC=http://localhost:8545 npm run smallname -- run          # terminal 2: index + API on :8787
 ```
 Open the test page at `/` on port 8787, or call the API:

@@ -19,6 +19,72 @@ use redb::ReadableTableMetadata;
 const HEADERS: TableDefinition<u64, (&[u8; 32], &[u8])> = TableDefinition::new("headers");
 /// "floor": the first post-fork block (once a walk reached a pre-fork header).
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+/// block hash -> every log of the block (and its transaction hashes, when known): written when
+/// a scan fetched (and verified) the block's receipts, so it's never fetched again.
+const LOGS: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("logs");
+
+/// All logs of one block, as fetched from verified receipts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockLogs {
+    /// Transaction hashes in block order (empty: not fetched yet).
+    pub tx_hashes: Vec<B256>,
+    /// `(transaction index, log)` in block order (log index = position).
+    pub logs: Vec<(u32, alloy_primitives::Log)>,
+}
+
+impl BlockLogs {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(self.tx_hashes.len() as u32).to_be_bytes());
+        for h in &self.tx_hashes {
+            b.extend_from_slice(h.as_slice());
+        }
+        b.extend_from_slice(&(self.logs.len() as u32).to_be_bytes());
+        for (ti, l) in &self.logs {
+            b.extend_from_slice(&ti.to_be_bytes());
+            b.extend_from_slice(l.address.as_slice());
+            b.push(l.topics().len() as u8);
+            for t in l.topics() {
+                b.extend_from_slice(t.as_slice());
+            }
+            b.extend_from_slice(&(l.data.data.len() as u32).to_be_bytes());
+            b.extend_from_slice(&l.data.data);
+        }
+        b
+    }
+
+    pub fn decode(mut b: &[u8]) -> Option<Self> {
+        fn take<'a>(b: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+            if b.len() < n {
+                return None;
+            }
+            let (x, rest) = b.split_at(n);
+            *b = rest;
+            Some(x)
+        }
+        let u32_ = |b: &mut &[u8]| take(b, 4).map(|x| u32::from_be_bytes(x.try_into().unwrap()));
+        let n = u32_(&mut b)? as usize;
+        let mut tx_hashes = Vec::with_capacity(n);
+        for _ in 0..n {
+            tx_hashes.push(B256::from_slice(take(&mut b, 32)?));
+        }
+        let m = u32_(&mut b)? as usize;
+        let mut logs = Vec::with_capacity(m);
+        for _ in 0..m {
+            let ti = u32_(&mut b)?;
+            let address = alloy_primitives::Address::from_slice(take(&mut b, 20)?);
+            let k = take(&mut b, 1)?[0] as usize;
+            let mut topics = Vec::with_capacity(k);
+            for _ in 0..k {
+                topics.push(B256::from_slice(take(&mut b, 32)?));
+            }
+            let len = u32_(&mut b)? as usize;
+            let data = alloy_primitives::Bytes::copy_from_slice(take(&mut b, len)?);
+            logs.push((ti, alloy_primitives::Log::new_unchecked(address, topics, data)));
+        }
+        b.is_empty().then_some(Self { tx_hashes, logs })
+    }
+}
 
 /// redb page cache for the header store.
 const CACHE_BYTES: usize = 16 << 20;
@@ -57,6 +123,7 @@ impl HeaderStore {
         let tx = db.begin_write()?;
         tx.open_table(HEADERS)?;
         tx.open_table(META)?;
+        tx.open_table(LOGS)?;
         tx.commit()?;
         Ok(Self { db })
     }
@@ -158,6 +225,41 @@ impl HeaderStore {
         }
         out.reverse();
         Ok(Some(out))
+    }
+
+    /// Stores blocks' logs (by block hash; a hash names one block, so a reorg can't make an
+    /// entry wrong, only unused).
+    pub fn put_logs(&self, blocks: &[(B256, &BlockLogs)]) -> Result<(), StoreError> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(LOGS)?;
+            for (h, l) in blocks {
+                // zstd: a Sepolia block's logs are ~75 KB raw, ~16 KB compressed.
+                let z = zstd::bulk::compress(&l.encode(), 3).map_err(|e| StoreError(e.to_string()))?;
+                t.insert(&h.0, z.as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The stored logs of whichever of `hashes` are stored.
+    pub fn get_logs(&self, hashes: &[B256]) -> Result<std::collections::HashMap<B256, BlockLogs>, StoreError> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(LOGS)?;
+        let mut out = std::collections::HashMap::new();
+        for h in hashes {
+            if let Some(g) = t.get(&h.0)?
+                && let Ok(raw) = zstd::stream::decode_all(g.value())
+                && let Some(l) = BlockLogs::decode(&raw)
+            {
+                out.insert(*h, l);
+            }
+        }
+        Ok(out)
     }
 
     pub fn floor(&self) -> Result<Option<u64>, StoreError> {
@@ -282,6 +384,22 @@ mod tests {
         s.put_tip(b.hash_slow(), &b).unwrap();
         assert_eq!(s.len().unwrap(), 6);
         assert!(s.get(16).unwrap().is_none());
+    }
+
+    #[test]
+    fn block_logs_round_trip() {
+        let l = BlockLogs {
+            tx_hashes: vec![B256::repeat_byte(1), B256::repeat_byte(2)],
+            logs: vec![
+                (0, alloy_primitives::Log::new_unchecked(alloy_primitives::Address::repeat_byte(9), vec![B256::repeat_byte(3)], vec![1, 2, 3].into())),
+                (1, alloy_primitives::Log::new_unchecked(alloy_primitives::Address::repeat_byte(8), vec![], alloy_primitives::Bytes::new())),
+            ],
+        };
+        assert_eq!(BlockLogs::decode(&l.encode()), Some(l.clone()));
+        let d = tempfile::tempdir().unwrap();
+        let s = HeaderStore::open(d.path().join("h.redb")).unwrap();
+        s.put_logs(&[(B256::repeat_byte(7), &l)]).unwrap();
+        assert_eq!(s.get_logs(&[B256::repeat_byte(7), B256::repeat_byte(6)]).unwrap().get(&B256::repeat_byte(7)), Some(&l));
     }
 
     #[test]

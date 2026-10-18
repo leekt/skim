@@ -50,6 +50,14 @@ pub struct Args {
     /// Largest block range one `eth_getLogs` request may scan.
     #[arg(long, default_value_t = 2048)]
     max_logs_range: u64,
+    /// History beyond the in-memory window (about a day of headers): `off` keeps skim head-only
+    /// (no history database; logs and block streams cover the in-memory window, older ranges
+    /// are a `gap`), for when an external indexer keeps what it needs. `local` keeps post-fork
+    /// headers and every fetched block's logs on disk (`history.redb` in the data dir), so
+    /// history reaches back to the fork and nothing is fetched twice. Memory stays bounded
+    /// either way.
+    #[arg(long, value_enum, default_value_t = HistoryMode::Off)]
+    history: HistoryMode,
     /// Consensus-layer gossip mesh degree (more = more eager-push paths for new payloads).
     #[arg(long, default_value_t = 8)]
     cl_mesh: usize,
@@ -103,6 +111,12 @@ pub struct Args {
     /// Disable the learned-set pattern tier (A/B measurements).
     #[arg(long)]
     no_learned_patterns: bool,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryMode {
+    Off,
+    Local,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -317,7 +331,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let light = crate::light::Light::new(cl.clone(), persist.clone());
     light.start(args.checkpoint, args.checkpoint_url.clone());
     let chaindata = crate::chaindata::ChainData::new(net.clone(), args.max_logs_range);
-    if !args.ephemeral {
+    if args.history == HistoryMode::Local {
+        anyhow::ensure!(!args.ephemeral, "--history local needs a data dir (not --ephemeral)");
         let dir = args.data_dir.clone().unwrap_or_else(|| {
             std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".skim/sepolia")
         });
