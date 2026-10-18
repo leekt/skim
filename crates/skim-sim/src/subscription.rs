@@ -127,6 +127,34 @@ pub struct Status {
     pub results: Vec<String>,
 }
 
+/// Where `storage: all` downloads come from: SNAP-capable peers, each asked for a contract's
+/// whole storage at a state root.
+pub trait StorageSource {
+    fn storage_peers(&self) -> Vec<skim_snap::PeerId>;
+    fn storage_all(
+        &self,
+        peer: skim_snap::PeerId,
+        root: alloy_primitives::B256,
+        address: Address,
+        max_slots: usize,
+    ) -> impl std::future::Future<Output = Result<skim_snap::el::StorageAll, skim_snap::TransportError>>;
+}
+
+impl StorageSource for skim_snap::el::ElTransport {
+    fn storage_peers(&self) -> Vec<skim_snap::PeerId> {
+        self.net.peers().into_iter().filter(|(_, p)| p.snap1 || p.snap2).map(|(id, _)| id).collect()
+    }
+    async fn storage_all(
+        &self,
+        peer: skim_snap::PeerId,
+        root: alloy_primitives::B256,
+        address: Address,
+        max_slots: usize,
+    ) -> Result<skim_snap::el::StorageAll, skim_snap::TransportError> {
+        skim_snap::el::ElTransport::storage_all(self, peer, root, address, max_slots).await
+    }
+}
+
 pub struct Subscriptions {
     specs: Vec<SubscriptionSpec>,
     max_keys: usize,
@@ -266,36 +294,10 @@ impl Subscriptions {
             head_moved = sim.store.head().is_some_and(|h| h.number > head.number), "subscription pass");
     }
 
-    async fn maintain_inner(&self, sim: &Simulator, head: &BlockRef) {
-        sim.store.set_max_subscribed(self.max_keys);
-        // Without a SNAP peer nothing can be fetched: don't wait for one (that wait is for
-        // interactive requests). Run on what is held (e.g. a restart snapshot) and let the next
-        // pass, a block later, fetch the rest. Measured: waiting made the first pass after a
-        // restart take 40 s and readiness ~2 min, though the snapshot was restored in seconds.
-        let fetch = !skim_snap::Transport::snap_peers(sim.sched.transport()).is_empty();
-        // 1. Declared keys: subscribe (or archive) and fetch whatever is unknown.
-        let declared: Vec<StateKey> = self.declared.values().flat_map(|k| k.iter().copied()).collect();
-        let archived_specs: HashSet<&str> = self.specs.iter().filter(|s| s.archive()).map(|s| s.name.as_str()).collect();
-        for (name, keys) in &self.declared {
-            for k in keys {
-                if archived_specs.contains(name.as_str()) {
-                    sim.store.archive_key_checked(*k);
-                } else {
-                    sim.store.watch_key(*k);
-                }
-            }
-        }
-        if let Ok(snap) = sim.store.snapshot(head) {
-            let (accts, slots) = crate::unknown_split(&snap, &declared);
-            if fetch && (!accts.is_empty() || !slots.is_empty()) {
-                let at = if sim.miss_at_parent { sim.store.block(head.number.saturating_sub(1)).unwrap_or(*head) } else { *head };
-                prefetch::resolve_retained(&sim.store, &sim.sched, &at, &accts, &slots, &[], skim_snap::Priority::High, Retention::Subscribed)
-                    .await;
-            }
-        }
-
-        // 1b. `storage: all`: download each contract's whole storage once (verified against its
-        //     storage root), then BALs keep it current. A reorg below the download drops it.
+    /// `storage: all`: download each contract's whole storage once (verified against its
+    /// storage root), then BALs keep it current. A reorg below the download drops it. Generic
+    /// over where the storage comes from (SNAP peers, or a mock in tests).
+    async fn maintain_storage_all<S: StorageSource>(&self, store: &skim_state::Store, head: &BlockRef, miss_at_parent: bool, src: &S) {
         for spec in self.specs.iter().filter(|s| s.storage_all()) {
             let Some(a) = spec.address else { continue };
             let max = spec.max_slots.map_or(DEFAULT_MAX_SLOTS, |l| l.0);
@@ -304,7 +306,7 @@ impl Subscriptions {
                 continue;
             }
             // The store drops a whole-storage contract whose growth hits the global budget.
-            if let Some(e) = sim.store.take_complete_drop(&a) {
+            if let Some(e) = store.take_complete_drop(&a) {
                 tracing::warn!(subscription = %spec.name, address = %a, "{e}");
                 self.too_large.write().insert(spec.name.clone(), e.clone());
                 self.status.write().entry(spec.name.clone()).or_default().error = Some(e);
@@ -313,12 +315,12 @@ impl Subscriptions {
             // Not watched until installed: a pending download (failing, oversized, over budget,
             // backing off) must not track the address, or every BAL write to it would be kept
             // with no budget check. Installation replays the writes since the download block.
-            if let Some(n) = sim.store.complete_storage_len(&a) {
+            if let Some(n) = store.complete_storage_len(&a) {
                 // The limit holds for the contract's whole life: slots first written after the
                 // (verified) download count too, and those writes come from verified BALs. Past
                 // it, stop tracking the contract (not just its new slots).
                 if n > max {
-                    sim.store.drop_complete_storage(&a);
+                    store.drop_complete_storage(&a);
                     let e = format!("storage grew to {n} slots, past max_slots {max}; raise max_slots (or set it to unlimited)");
                     tracing::warn!(subscription = %spec.name, address = %a, "{e}");
                     self.too_large.write().insert(spec.name.clone(), e.clone());
@@ -329,16 +331,15 @@ impl Subscriptions {
             if self.retry_at.read().get(&spec.name).is_some_and(|(at, _)| head.number < *at) {
                 continue; // backing off; the last error stays in the status
             }
-            let at = if sim.miss_at_parent { sim.store.block(head.number.saturating_sub(1)).unwrap_or(*head) } else { *head };
-            let tr = sim.sched.transport();
+            let at = if miss_at_parent { store.block(head.number.saturating_sub(1)).unwrap_or(*head) } else { *head };
             let mut err = Some("no peer served the storage yet".to_string());
             let mut back_off = false;
             let mut oversized_reports = Vec::new();
-            for peer in tr.net.peers().into_iter().filter(|(_, p)| p.snap1 || p.snap2).map(|(id, _)| id).take(4) {
-                match tr.storage_all(peer, at.state_root, a, max).await {
+            for peer in src.storage_peers().into_iter().take(4) {
+                match src.storage_all(peer, at.state_root, a, max).await {
                     Ok(skim_snap::el::StorageAll::Complete { slots, .. }) => {
                         let n = slots.len();
-                        err = match sim.store.install_complete_storage(&at, a, slots) {
+                        err = match store.install_complete_storage(&at, a, slots) {
                             Ok(()) => {
                                 tracing::info!(subscription = %spec.name, address = %a, slots = n, block = at.number, "storage: all downloaded and verified");
                                 None
@@ -385,6 +386,38 @@ impl Subscriptions {
                 self.status.write().entry(spec.name.clone()).or_default().error = Some(e);
             }
         }
+    }
+
+    async fn maintain_inner(&self, sim: &Simulator, head: &BlockRef) {
+        sim.store.set_max_subscribed(self.max_keys);
+        // Without a SNAP peer nothing can be fetched: don't wait for one (that wait is for
+        // interactive requests). Run on what is held (e.g. a restart snapshot) and let the next
+        // pass, a block later, fetch the rest. Measured: waiting made the first pass after a
+        // restart take 40 s and readiness ~2 min, though the snapshot was restored in seconds.
+        let fetch = !skim_snap::Transport::snap_peers(sim.sched.transport()).is_empty();
+        // 1. Declared keys: subscribe (or archive) and fetch whatever is unknown.
+        let declared: Vec<StateKey> = self.declared.values().flat_map(|k| k.iter().copied()).collect();
+        let archived_specs: HashSet<&str> = self.specs.iter().filter(|s| s.archive()).map(|s| s.name.as_str()).collect();
+        for (name, keys) in &self.declared {
+            for k in keys {
+                if archived_specs.contains(name.as_str()) {
+                    sim.store.archive_key_checked(*k);
+                } else {
+                    sim.store.watch_key(*k);
+                }
+            }
+        }
+        if let Ok(snap) = sim.store.snapshot(head) {
+            let (accts, slots) = crate::unknown_split(&snap, &declared);
+            if fetch && (!accts.is_empty() || !slots.is_empty()) {
+                let at = if sim.miss_at_parent { sim.store.block(head.number.saturating_sub(1)).unwrap_or(*head) } else { *head };
+                prefetch::resolve_retained(&sim.store, &sim.sched, &at, &accts, &slots, &[], skim_snap::Priority::High, Retention::Subscribed)
+                    .await;
+            }
+        }
+
+        // 1b. `storage: all` (see `maintain_storage_all`).
+        self.maintain_storage_all(&sim.store, head, sim.miss_at_parent, sim.sched.transport()).await;
 
         // 2. Calls: run at this block (fetched state is on demand until admitted).
         for spec in self.specs.iter().filter(|s| !s.calls.is_empty()) {
@@ -502,6 +535,61 @@ impl Subscriptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whole-storage downloads that never succeed: every peer is unavailable, or every
+    /// download verifies but doesn't fit the key budget.
+    struct Failing {
+        complete: bool,
+    }
+
+    impl StorageSource for Failing {
+        fn storage_peers(&self) -> Vec<skim_snap::PeerId> {
+            vec![skim_snap::PeerId::repeat_byte(1)]
+        }
+        async fn storage_all(
+            &self,
+            _: skim_snap::PeerId,
+            _: alloy_primitives::B256,
+            _: Address,
+            _: usize,
+        ) -> Result<skim_snap::el::StorageAll, skim_snap::TransportError> {
+            Ok(if self.complete {
+                let slots = (1..=10u8).map(|i| (alloy_primitives::B256::repeat_byte(i), U256::from(i))).collect();
+                skim_snap::el::StorageAll::Complete { slots, storage_root: alloy_primitives::B256::ZERO }
+            } else {
+                skim_snap::el::StorageAll::Unavailable
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_storage_all_download_never_tracks_the_contract() {
+        // TODO 3: while `storage: all` can't be installed (no peer serves it, or it doesn't fit the
+        // budget), blocks keep writing new slots of the contract. None of them may be retained.
+        let a = Address::repeat_byte(0xc0);
+        for complete in [false, true] {
+            let spec: SubscriptionSpec = serde_yaml_ng::from_str(&format!("name: pool\naddress: \"{a}\"\nstorage: all\n")).unwrap();
+            let subs = Subscriptions::new(vec![spec], 5).unwrap(); // 10 downloaded slots > 5 keys
+            let store = skim_state::Store::new(64);
+            store.set_max_subscribed(5);
+            let blk = |n: u64| {
+                let h = |n: u64| alloy_primitives::B256::from(U256::from(n));
+                BlockRef { number: n, hash: h(n), parent_hash: h(n - 1), state_root: alloy_primitives::B256::repeat_byte(7), timestamp: n * 12 }
+            };
+            for n in 1..=200u64 {
+                let w = skim_state::BlockWrites {
+                    writes: vec![(StateKey::Storage(a, U256::from(1000 + n)), U256::from(n))],
+                    touched: vec![a],
+                    ..Default::default()
+                };
+                store.apply_block(blk(n), std::sync::Arc::new(w)).unwrap();
+                subs.maintain_storage_all(&store, &blk(n), false, &Failing { complete }).await;
+            }
+            let z = store.sizes();
+            assert_eq!((z.keys, z.versions, z.watched_addresses, z.complete_slots), (0, 0, 0, 0), "complete={complete}: {z:?}");
+            assert!(subs.status.read().get("pool").and_then(|s| s.error.clone()).is_some(), "the failure is reported");
+        }
+    }
 
     #[test]
     fn unverified_oversized_answers_back_off_instead_of_disabling() {
