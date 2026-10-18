@@ -444,6 +444,18 @@ impl Store {
         true
     }
 
+    /// Writes `k`'s in-memory versions to the archive as its base (hash-checked against the
+    /// archived blocks; a version older than the archive starts at its first block instead).
+    /// Callers hold the write lock, so archive and memory change together.
+    fn archive_known_versions(&self, st: &Inner, k: &StateKey) {
+        let Some(ar) = &self.archive else { return };
+        let mem = st.archivable_versions(k, &|n, h| ar.hash(n).ok().flatten() == Some(h));
+        if let Some(((b0, h0, v0), rest)) = mem.split_first() {
+            let r = ar.write_base(k, *b0, *h0, *v0, rest);
+            self.archive_try(r);
+        }
+    }
+
     fn watch_key_unchecked(&self, k: StateKey) -> bool {
         let mut st = self.inner.write();
         st.temp.remove(&k);
@@ -754,6 +766,11 @@ impl Store {
         for k in waiting {
             if st.seed_from_bal(&k) {
                 self.bal_promotions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // An archived key now known: its archive coverage starts here too (at the first
+                // block the archive holds, if the value predates it), as when it was archived.
+                if st.archived.contains(&k) {
+                    self.archive_known_versions(&st, &k);
+                }
             }
         }
         Ok(added)

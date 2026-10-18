@@ -773,3 +773,24 @@ fn blocks_from_before_the_start_seed_the_bal_index_and_promote_waiting_keys() {
     assert!(s.watch_key(slot(2)));
     assert_eq!(known(&s.snapshot(&blk(22, 0)).unwrap(), slot(2)), None);
 }
+
+#[test]
+fn an_archived_key_seeded_from_earlier_bals_gets_archive_coverage() {
+    // Review finding: start at 20 with an archive; K is archived but unknown; startup seeding
+    // supplies K = 5 from block 17. Its history must be readable from the archive's first block
+    // (20, not 17), long after the memory window moved on.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::with_archive(8, archive::Archive::open(d.path().join("a.redb")).unwrap()).unwrap();
+    s.apply_block(blk(20, 0), writes(&[])).unwrap();
+    s.archive_key(slot(1));
+    let run: Vec<_> = (13..=19).map(|n| (blk(n, 0), if n == 17 { writes(&[(slot(1), 5)]) } else { writes(&[]) })).collect();
+    s.seed_recent(&run).unwrap();
+    assert_eq!(known(&s.snapshot(&blk(20, 0)).unwrap(), slot(1)), Some(5));
+    for n in 21..=40 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap();
+    }
+    let ar = s.archive().unwrap();
+    assert_eq!(ar.get(&slot(1), 20).unwrap(), archive::ArchiveRead::Value(U256::from(5)));
+    assert_eq!(ar.get(&slot(1), 30).unwrap(), archive::ArchiveRead::Value(U256::from(5)));
+    assert!(matches!(ar.get(&slot(1), 17).unwrap(), archive::ArchiveRead::NotCovered { .. }), "never backdated before the archive");
+}

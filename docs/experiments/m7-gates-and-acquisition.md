@@ -165,6 +165,17 @@ The 150-minute soak predates this history path; it doesn't validate it.
 
 Also from the review: stored matches are encoded and compressed before the write transaction opens; the transaction only stores finished bytes.
 
+## Eleventh review: one chain per stream response, atomic coverage, seeded archive keys
+| Finding | Fix | Regression test |
+|---|---|---|
+| P1: a combined stream scanned logs and BAL changes separately, each resolving its own headers, and merged them by block number. A reorg between the two could return A101's block and logs with B101's state changes. BAL-only streams never checked the cursor's parent, and the cursor was looked up again at the end | One hash-linked header range (`linked_headers`) is captured per response, checked to continue the module's cursor by hash (BAL-only too), and used for logs (`scan_headers`), BAL changes and the new cursor. Nothing is resolved again. BAL entries whose hash isn't the range's are refused | `logs_state_changes_and_cursor_come_from_one_chain_despite_a_reorg_mid_request` (reorg after the log scan: all-A response; fails if BALs re-resolve the range). `a_bal_only_stream_never_continues_a_cursor_onto_another_fork` (reorg before capture: refused, then the retry rewinds; fails without the parent check) |
+| P2: an expired-receipts `gap` at a block took that block's BAL changes into the gap event, so a consumer skipped them | Logs and state changes are separate channels. Gaps carry `scope` (`logs`, or `all` for no headers). A block in a logs gap still gets an `apply` with its `stateChanges` and `logsAvailable: false` | `state_changes_still_arrive_for_a_block_whose_receipts_expired` |
+| P2: a scan read a block's stored coverage before reserving it, and `put_block_logs` replaced the entry, so two scans could overwrite each other's coverage and logs | `put_block_logs` merges with the stored entry inside its write transaction (union of coverage, and logs by position). The common case still stores bytes compressed beforehand | `a_scan_storing_from_a_stale_snapshot_never_drops_what_another_stored_since` |
+| P2: startup BAL seeding made an archived key known in memory without writing it to the archive, and later registration returned early, so its history stayed uncovered | Keys promoted by seeding that are archived get their versions written through the hash-checked base path. A value older than the archive starts at its first block, never earlier | `an_archived_key_seeded_from_earlier_bals_gets_archive_coverage`: readable at 20 and 30 after the window moved on, not at 17 |
+| Earlier finding, partly open: `eth_getLogs` scans with `persist = false`, which also stopped it reading stored matches | Reading and storing are separate: stored entries are read whenever every atom of the filters is known; only streams store | `eth_get_logs_answers_from_stored_matches_after_peers_expire_them` (and a filter never stored for still refuses) |
+
+Every fix above was mutation-checked: reverting it fails its test.
+
 ## Peer requests: coalescing and fetch order
 Measured on the aarch64 Linux deployment host (2 cores), each run on a fresh instance with its own ports and data directory, counted with `skim_status.peer_requests`.
 

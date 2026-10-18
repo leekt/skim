@@ -12,12 +12,16 @@
 //! Events, in order:
 //! - `rewind {to}`: the module's cursor is no longer on the chain; undo everything above `to`
 //!   (the newest block of the module's `recent` list that still is).
-//! - `gap {from, to}`: blocks skim can't serve logs for any more (before the fork, or expired
-//!   on every connected peer); the module decides how to mark them.
-//! - `apply {block, logs, stateChanges?}`: a block with logs matching the module's filters, or
-//!   (with `bal`) changes to its accounts from the block's access list, each with its
-//!   `block_access_index` (blocks with neither are skipped; `cursor` says how far the scan
-//!   went).
+//! - `gap {from, to, scope}`: blocks skim can't serve any more (`scope: "all"` before the fork
+//!   or the in-memory window: no headers; `"logs"` when receipts expired on every connected
+//!   peer); the module decides how to mark them.
+//! - `apply {block, logs, stateChanges?, logsAvailable?}`: a block with logs matching the
+//!   module's filters, or (with `bal`) changes to its accounts from the block's access list, each
+//!   with its `block_access_index` (blocks with neither are skipped; `cursor` says how far the
+//!   scan went). Logs and state changes are separate channels: a block in a logs gap still gets
+//!   its state changes, marked `logsAvailable: false`.
+//! Everything in a response (logs, state changes, the cursor) comes from one hash-linked range
+//! of headers that continues the module's cursor.
 //! Each response also reports `finalized` (verified by the light client), so a module can hold
 //! irreversible exports until then.
 //!
@@ -120,7 +124,7 @@ pub async fn next(
     let history = chain.history_json();
     let logs_from = history["fork_floor"].as_u64().or_else(|| (history["mode"] == "off").then(|| history["memory_headers_from"].as_u64()).flatten()).unwrap_or(0);
     if pos + 1 < logs_from {
-        events.push(json!({"type": "gap", "from": pos + 1, "to": logs_from - 1, "reason": "no headers: before the fork, or outside the in-memory window with --history off"}));
+        events.push(json!({"type": "gap", "from": pos + 1, "to": logs_from - 1, "scope": "all", "reason": "no headers: before the fork, or outside the in-memory window with --history off"}));
         pos = logs_from - 1;
         anchor = chain.canonical_hash(pos);
     }
@@ -151,57 +155,74 @@ pub async fn next(
     // (never another block's hash at that height).
     let cursor = if pos < tip {
         let to = tip.min(pos + req.max_blocks.unwrap_or(chain.max_log_range).clamp(1, chain.max_log_range));
-        let scan = if req.filters.is_empty() { None } else { Some(chain.scan(&req.filters, pos + 1, to, None, true).await?) };
-        let bal = if bal_addresses.is_empty() { Vec::new() } else { chain.bal_changes(&bal_addresses, pos + 1, to).await? };
-        // The range must continue the module's position, by hash.
-        if let (Some(a), Some(sc)) = (anchor, &scan)
-            && sc.first_parent != a
+        // One hash-linked range of headers for everything this response reports: logs, state
+        // changes and the new cursor all come from it (never re-resolved), and it must continue
+        // the module's position by hash. A reorg after this point leaves the response consistent
+        // with the chain it was captured from; the next request then rewinds.
+        #[cfg(test)]
+        chain.run_test_hook("before_capture");
+        let headers = chain.linked_headers(pos + 1, to).await?;
+        #[cfg(test)]
+        chain.run_test_hook("after_capture");
+        if let Some(a) = anchor
+            && headers.first().is_none_or(|(_, _, h)| h.parent_hash != a)
         {
             return Err(DataError::Unavailable("the chain reorganized during the request; retry".into()));
         }
-        // One `apply` per block with logs, state changes, or both, in block order; candidate
-        // blocks whose receipts expired on every peer (and aren't stored) as gaps between them.
-        let mut by_block: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
+        let scan = if req.filters.is_empty() { None } else { Some(chain.scan_headers(&req.filters, &headers, true).await?) };
+        #[cfg(test)]
+        chain.run_test_hook("after_scan");
+        let bal = if bal_addresses.is_empty() { Vec::new() } else { chain.bal_changes(&bal_addresses, &headers).await? };
+        let hash_at: std::collections::HashMap<u64, B256> = headers.iter().map(|(n, bh, _)| (*n, *bh)).collect();
+        // Per block: an `apply` with logs, state changes, or both. Logs and state changes are
+        // separate channels: a block whose receipts expired on every peer (and aren't stored) is
+        // in a `gap` scoped to logs, and still gets an `apply` for its state changes, marked
+        // `logsAvailable: false`.
+        let mut applies: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
+        let block_json = |n: u64, bh: B256, h: &alloy_consensus::Header| json!({"number": n, "hash": bh, "parentHash": h.parent_hash, "timestamp": h.timestamp});
+        let mut expired: Vec<u64> = Vec::new();
         if let Some(scan) = &scan {
             for b in &scan.blocks {
-                by_block.insert(b.number, json!({
+                debug_assert_eq!(hash_at.get(&b.number), Some(&b.hash));
+                applies.insert(b.number, json!({
                     "type": "apply",
                     "block": {"number": b.number, "hash": b.hash, "parentHash": b.parent_hash, "timestamp": b.timestamp},
                     "logs": b.logs,
                 }));
             }
-            let mut run: Option<(u64, u64)> = None;
-            let flush = |run: &mut Option<(u64, u64)>, by_block: &mut std::collections::BTreeMap<u64, Value>| {
-                if let Some((a, b)) = run.take() {
-                    by_block.insert(a, json!({"type": "gap", "from": a, "to": b, "reason": "receipts expired on every connected peer and not stored locally"}));
-                }
-            };
-            for &n in &scan.expired {
-                match run {
-                    Some((a, b)) if by_block.range(b + 1..n).next().is_none() => run = Some((a, n)),
-                    _ => {
-                        flush(&mut run, &mut by_block);
-                        run = Some((n, n));
-                    }
-                }
-            }
-            flush(&mut run, &mut by_block);
+            expired = scan.expired.clone();
         }
         for (n, bh, h, changes) in bal {
-            let e = by_block.entry(n).or_insert_with(|| json!({
-                "type": "apply",
-                "block": {"number": n, "hash": bh, "parentHash": h.parent_hash, "timestamp": h.timestamp},
-                "logs": [],
-            }));
+            if hash_at.get(&n) != Some(&bh) {
+                return Err(DataError::Unavailable("the chain reorganized during the request; retry".into()));
+            }
+            let e = applies.entry(n).or_insert_with(|| json!({"type": "apply", "block": block_json(n, bh, &h), "logs": []}));
             e["stateChanges"] = Value::Array(changes);
+            if expired.contains(&n) {
+                e["logsAvailable"] = json!(false);
+            }
         }
-        events.extend(by_block.into_values());
-        let last = match &scan {
-            Some(s) => s.last,
-            None => (to, chain.canonical_hash(to).ok_or_else(|| DataError::Unavailable(format!("no header for block {to}")))?),
-        };
-        pos = last.0;
-        Some(json!({"number": last.0, "hash": last.1}))
+        // Expired blocks as `gap` runs (consecutive numbers), each before the applies it spans.
+        let mut gaps: Vec<(u64, u64)> = Vec::new();
+        for &n in &expired {
+            match gaps.last_mut() {
+                Some((_, b)) if *b + 1 == n => *b = n,
+                _ => gaps.push((n, n)),
+            }
+        }
+        let mut gaps = gaps.into_iter().peekable();
+        for (n, e) in applies {
+            while let Some((a, b)) = gaps.next_if(|(a, _)| *a <= n) {
+                events.push(json!({"type": "gap", "from": a, "to": b, "scope": "logs", "reason": "receipts expired on every connected peer and not stored locally"}));
+            }
+            events.push(e);
+        }
+        for (a, b) in gaps {
+            events.push(json!({"type": "gap", "from": a, "to": b, "scope": "logs", "reason": "receipts expired on every connected peer and not stored locally"}));
+        }
+        let (n, bh, _) = headers.last().expect("pos < to");
+        pos = *n;
+        Some(json!({"number": n, "hash": bh}))
     } else {
         anchor.map(|h| json!({"number": pos, "hash": h})).or_else(|| chain.canonical_hash(pos).map(|h| json!({"number": pos, "hash": h})))
     };
@@ -480,5 +501,114 @@ mod tests {
         extend(&cd, 104, 112, a[3], 0xb);
         let after = cd.logs(&f, n, n, Some(a[5])).await;
         assert!(matches!(after, Err(DataError::Unavailable(ref m)) if m.contains("no longer on the chain")), "{after:?}");
+    }
+
+    const WATCHED: Address = Address::repeat_byte(0xba);
+
+    /// A BAL in which WATCHED's balance becomes `value` (by transaction 0).
+    fn bal(value: u64) -> skim_bal::BlockAccessList {
+        use skim_bal::alloy_eip7928::{BalanceChange, BlockAccessIndex};
+        vec![skim_bal::AccountChanges::new(WATCHED).with_balance_change(BalanceChange::new(BlockAccessIndex(1), alloy_primitives::U256::from(value)))]
+    }
+
+    fn req_bal(cursor: Option<BlockId>, recent: Vec<BlockId>, logs: bool) -> Request {
+        let mut r = req(cursor, recent, None);
+        r.bal = Some(BalFilter { addresses: vec![WATCHED] });
+        if !logs {
+            r.filters.clear();
+        }
+        r
+    }
+
+    /// Per apply: (number, hash, state change values).
+    fn changes(r: &Value) -> Vec<(u64, B256, Vec<u64>)> {
+        r["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["type"] == "apply")
+            .map(|e| {
+                let vals = e["stateChanges"].as_array().map(|c| c.iter().map(|x| u64::from_str_radix(x["value"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap()).collect()).unwrap_or_default();
+                (e["block"]["number"].as_u64().unwrap(), e["block"]["hash"].as_str().unwrap().parse().unwrap(), vals)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn logs_state_changes_and_cursor_come_from_one_chain_despite_a_reorg_mid_request() {
+        // Review P1: cursor A100; the logs of A101 are scanned, then A100/A101 are replaced by
+        // B100/B101 before the BALs are read. The response must be all A (consistent; the next
+        // request rewinds), never A101's block and logs with B101's state changes.
+        let cd = ChainData::offline(2048);
+        let a = extend(&cd, 99, 101, B256::repeat_byte(0x99), 0xa);
+        cd.note_bal(a[2], bal(0xa));
+        let cd2 = cd.clone();
+        let a99 = a[0];
+        cd.test_hooks.lock().insert("after_scan", Box::new(move || {
+            let b = extend(&cd2, 100, 101, a99, 0xb);
+            cd2.note_bal(b[1], bal(0xb));
+        }));
+        let r = next(&cd, || Some(101), tokio::sync::broadcast::channel(1).1, None, req_bal(Some(id(100, a[1])), vec![id(99, a[0])], true)).await.unwrap();
+        assert_eq!(applied(&r), vec![(101, a[2], vec![0xa])], "{r}");
+        assert_eq!(changes(&r), vec![(101, a[2], vec![0xa])], "{r}");
+        assert_eq!(r["cursor"]["hash"].as_str().unwrap().parse::<B256>().unwrap(), a[2]);
+    }
+
+    #[tokio::test]
+    async fn a_bal_only_stream_never_continues_a_cursor_onto_another_fork() {
+        // Review P1: with no log filters there was no cursor-parent check. Cursor A100 is
+        // accepted, then the chain becomes B100/B101 before the range is read: refuse (retry),
+        // never Apply(B101) after A100 without a rewind.
+        let cd = ChainData::offline(2048);
+        let a = extend(&cd, 99, 101, B256::repeat_byte(0x99), 0xa);
+        cd.note_bal(a[2], bal(0xa));
+        let cd2 = cd.clone();
+        let a99 = a[0];
+        cd.test_hooks.lock().insert("before_capture", Box::new(move || {
+            let b = extend(&cd2, 100, 101, a99, 0xb);
+            cd2.note_bal(b[0], vec![]);
+            cd2.note_bal(b[1], bal(0xb));
+        }));
+        let r = next(&cd, || Some(101), tokio::sync::broadcast::channel(1).1, None, req_bal(Some(id(100, a[1])), vec![id(99, a[0])], false)).await;
+        assert!(matches!(r, Err(DataError::Unavailable(_))), "{:?}", r.map(|v| v.to_string()));
+        // Retried: rewinds to 99, then B101's changes.
+        let r = next(&cd, || Some(101), tokio::sync::broadcast::channel(1).1, None, req_bal(Some(id(100, a[1])), vec![id(99, a[0])], false)).await.unwrap();
+        assert_eq!(r["events"][0]["type"], "rewind", "{r}");
+        assert_eq!(changes(&r).iter().map(|(n, _, v)| (*n, v.clone())).collect::<Vec<_>>(), vec![(101, vec![0xb])], "{r}");
+    }
+
+    #[tokio::test]
+    async fn state_changes_still_arrive_for_a_block_whose_receipts_expired() {
+        // Review P2: logs for 101 are unavailable (expired, not stored), its BAL is known. The
+        // changes must come as an apply with the block's hash, marked logsAvailable: false, and
+        // the gap must be scoped to logs.
+        let cd = ChainData::offline(2048);
+        let a = extend(&cd, 100, 101, B256::repeat_byte(0x99), 0xa);
+        cd.note_bal(a[1], bal(7));
+        *cd.test_peers_from.lock() = Some(200);
+        let r = next(&cd, || Some(101), tokio::sync::broadcast::channel(1).1, None, req_bal(Some(id(100, a[0])), vec![], true)).await.unwrap();
+        let ev = r["events"].as_array().unwrap();
+        assert_eq!(ev.len(), 2, "{r}");
+        assert_eq!((ev[0]["type"].as_str(), ev[0]["scope"].as_str(), ev[0]["from"].as_u64()), (Some("gap"), Some("logs"), Some(101)), "{r}");
+        assert!(ev[0].get("stateChanges").is_none());
+        assert_eq!(changes(&r), vec![(101, a[1], vec![7])], "{r}");
+        assert_eq!(ev[1]["logsAvailable"], false);
+    }
+
+    #[tokio::test]
+    async fn eth_get_logs_answers_from_stored_matches_after_peers_expire_them() {
+        // Review (earlier finding, partly open): a stream stored block 120's matches; peers then
+        // expire it. eth_getLogs only reads (persist = false) but must still use what's stored.
+        let dir = tempfile::tempdir().unwrap();
+        let cd = ChainData::offline(2048);
+        cd.set_history(crate::history::HeaderStore::open(dir.path().join("h.redb")).unwrap());
+        extend(&cd, 118, 122, B256::repeat_byte(0x99), 0xa);
+        next(&cd, || Some(122), tokio::sync::broadcast::channel(1).1, None, req(None, vec![], Some(118))).await.unwrap();
+        *cd.test_peers_from.lock() = Some(200);
+        let s = cd.scan(&[Filter::new().address(EMITTER)], 118, 122, None, false).await.map_err(|e| format!("{e:?}")).unwrap();
+        assert_eq!(s.blocks.len(), 5);
+        // A filter never stored for still refuses rather than answering from partial coverage.
+        let other = Filter::new().address(EMITTER).event_signature(B256::repeat_byte(0x70));
+        assert!(cd.scan(&[other], 118, 122, None, false).await.is_err());
     }
 }

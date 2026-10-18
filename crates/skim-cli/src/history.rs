@@ -97,6 +97,38 @@ pub struct BlockEntry {
     pub logs: Vec<MatchedLog>,
 }
 
+/// Stored form: a flag byte (1: zstd) and the encoded entry.
+fn pack_entry(e: &BlockEntry) -> Result<Vec<u8>, StoreError> {
+    let raw = encode_entry(e);
+    Ok(if raw.len() > 256 { [&[1u8][..], &zstd::bulk::compress(&raw, 3).map_err(|e| StoreError(e.to_string()))?].concat() } else { [&[0u8][..], &raw].concat() })
+}
+
+fn unpack_entry(v: &[u8]) -> Option<BlockEntry> {
+    let raw = match v.first() {
+        Some(1) => zstd::stream::decode_all(&v[1..]).ok(),
+        Some(0) => Some(v[1..].to_vec()),
+        _ => None,
+    };
+    raw.as_deref().and_then(decode_entry)
+}
+
+/// The union of two entries for the same block: coverage, and logs by position (the same block
+/// hash, so the same receipts).
+fn merge_entries(old: BlockEntry, new: &BlockEntry) -> BlockEntry {
+    let mut covered = old.covered;
+    covered.extend(&new.covered);
+    covered.sort_unstable();
+    covered.dedup();
+    let mut logs = old.logs;
+    for l in &new.logs {
+        if !logs.iter().any(|x| x.tx_index == l.tx_index && x.log_index == l.log_index) {
+            logs.push(l.clone());
+        }
+    }
+    logs.sort_by_key(|l| (l.tx_index, l.log_index));
+    BlockEntry { covered, logs }
+}
+
 fn encode_entry(e: &BlockEntry) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&(e.covered.len() as u32).to_be_bytes());
@@ -299,6 +331,14 @@ impl HeaderStore {
         Ok(ids)
     }
 
+    /// Ids of atoms already known, without creating any (read-only callers): `None` if one isn't,
+    /// in which case no stored entry can cover all of them.
+    pub fn known_atom_ids(&self, atoms: &[(B256, Vec<u8>)]) -> Result<Option<Vec<u32>>, StoreError> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(ATOM_IDS)?;
+        Ok(atoms.iter().map(|(h, _)| t.get(&h.0).ok().flatten().map(|g| g.value())).collect())
+    }
+
     /// Definitions of atom ids (as given to [`Self::atom_ids`]).
     pub fn atom_defs(&self, ids: &[u32]) -> Result<Vec<(u32, Vec<u8>)>, StoreError> {
         let tx = self.db.begin_read()?;
@@ -312,22 +352,28 @@ impl HeaderStore {
         Ok(out)
     }
 
-    /// Stores blocks' entries (replacing earlier ones; callers merge coverage first).
+    /// Stores blocks' entries, merged with what is stored: coverage only grows. The merge is
+    /// atomic: another scan may have stored more coverage for the same block since this one read
+    /// it (write transactions are serialized, and the check is made inside this one).
     pub fn put_block_logs(&self, blocks: &[(B256, &BlockEntry)]) -> Result<(), StoreError> {
         if blocks.is_empty() {
             return Ok(());
         }
-        // Encode and compress first; the write transaction only stores finished bytes.
+        // Encode and compress first; the write transaction only stores finished bytes, except
+        // for a block another scan stored more coverage for in between (merged there, rare).
         let mut values = Vec::with_capacity(blocks.len());
         for (h, e) in blocks {
-            let raw = encode_entry(e);
-            let v = if raw.len() > 256 { [&[1u8][..], &zstd::bulk::compress(&raw, 3).map_err(|e| StoreError(e.to_string()))?].concat() } else { [&[0u8][..], &raw].concat() };
-            values.push((h.0, v));
+            values.push((h.0, *e, pack_entry(e)?));
         }
         let tx = self.db.begin_write()?;
         {
             let mut t = tx.open_table(BLOCK_LOGS)?;
-            for (k, v) in &values {
+            for (k, e, v) in &values {
+                let stored = t.get(k)?.and_then(|g| unpack_entry(g.value()));
+                let v = match stored {
+                    Some(old) if !old.covered.iter().all(|id| e.covered.contains(id)) => pack_entry(&merge_entries(old, e))?,
+                    _ => v.clone(),
+                };
                 t.insert(k, v.as_slice())?;
             }
         }
@@ -342,13 +388,7 @@ impl HeaderStore {
         let mut out = std::collections::HashMap::new();
         for h in blocks {
             let Some(g) = t.get(&h.0)? else { continue };
-            let v = g.value();
-            let raw = match v.first() {
-                Some(1) => zstd::stream::decode_all(&v[1..]).ok(),
-                Some(0) => Some(v[1..].to_vec()),
-                _ => None,
-            };
-            if let Some(e) = raw.as_deref().and_then(decode_entry) {
+            if let Some(e) = unpack_entry(g.value()) {
                 out.insert(*h, e);
             }
         }
@@ -477,6 +517,30 @@ mod tests {
         s.put_tip(b.hash_slow(), &b).unwrap();
         assert_eq!(s.len().unwrap(), 6);
         assert!(s.get(16).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_scan_storing_from_a_stale_snapshot_never_drops_what_another_stored_since() {
+        // Review P3: A and B both read block H as unstored. A stores filter A's coverage and
+        // logs; B, still working from its empty snapshot, then stores filter B's. Both must remain.
+        let log = |i: u32, a: u8| MatchedLog {
+            tx_index: i,
+            log_index: i,
+            tx_hash: B256::repeat_byte(i as u8),
+            log: alloy_primitives::Log::new_unchecked(alloy_primitives::Address::repeat_byte(a), vec![], vec![a; 300].into()),
+        };
+        let d = tempfile::tempdir().unwrap();
+        let s = HeaderStore::open(d.path().join("h.redb")).unwrap();
+        let h = B256::repeat_byte(0x11);
+        s.put_block_logs(&[(h, &BlockEntry { covered: vec![1], logs: vec![log(0, 0xa)] })]).unwrap();
+        s.put_block_logs(&[(h, &BlockEntry { covered: vec![2], logs: vec![log(3, 0xb)] })]).unwrap();
+        let got = s.get_block_logs(&[h]).unwrap().remove(&h).unwrap();
+        assert_eq!(got.covered, vec![1, 2]);
+        assert_eq!(got.logs, vec![log(0, 0xa), log(3, 0xb)]);
+        // A writer that already merged (a superset) replaces as before; nothing is duplicated.
+        s.put_block_logs(&[(h, &BlockEntry { covered: vec![1, 2, 3], logs: vec![log(0, 0xa), log(3, 0xb)] })]).unwrap();
+        let got = s.get_block_logs(&[h]).unwrap().remove(&h).unwrap();
+        assert_eq!((got.covered, got.logs.len()), (vec![1, 2, 3], 2));
     }
 
     #[test]

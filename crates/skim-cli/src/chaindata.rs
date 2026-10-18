@@ -150,6 +150,10 @@ pub struct ChainData {
     /// Tests: what connected peers report as the oldest block they serve.
     #[cfg(test)]
     pub test_peers_from: Mutex<Option<u64>>,
+    /// Tests: run once by a block stream at a named point (`before_capture`, `after_capture` of
+    /// its header range, `after_scan` of its logs), e.g. to reorganize the chain mid-request.
+    #[cfg(test)]
+    pub test_hooks: Mutex<HashMap<&'static str, Box<dyn Fn() + Send>>>,
 }
 
 fn topics_def(f: &Filter) -> String {
@@ -267,13 +271,10 @@ pub struct ScanBlock {
     pub logs: Vec<Value>,
 }
 
-/// A log scan: the blocks with matches, the last block scanned `(number, hash)`, the parent hash
-/// of the first block scanned (so a caller can check the range continues its own position), and
-/// candidate blocks whose receipts are no longer served by any peer and aren't stored locally.
+/// A log scan: the blocks with matches, and candidate blocks whose receipts are no longer served
+/// by any peer and aren't stored locally. (Which chain it covers is the caller's captured range.)
 pub struct Scan {
     pub blocks: Vec<ScanBlock>,
-    pub last: (u64, B256),
-    pub first_parent: B256,
     pub expired: Vec<u64>,
 }
 
@@ -316,6 +317,8 @@ impl ChainData {
             inflight: Default::default(),
             #[cfg(test)]
             test_peers_from: Default::default(),
+            #[cfg(test)]
+            test_hooks: Default::default(),
         });
         let me = Arc::downgrade(&cd);
         tokio::spawn(async move {
@@ -330,6 +333,20 @@ impl ChainData {
 
     /// The post-fork header store, if any (tests).
     #[cfg(test)]
+    #[cfg(test)]
+    pub fn run_test_hook(&self, stage: &'static str) {
+        let f = self.test_hooks.lock().remove(stage);
+        if let Some(f) = f {
+            f();
+        }
+    }
+
+    /// Tests: a block's (verified) access list, as gossip would have delivered it.
+    #[cfg(test)]
+    pub fn note_bal(&self, hash: B256, bal: skim_bal::BlockAccessList) {
+        self.bals.lock().put(hash, Arc::new(bal));
+    }
+
     pub fn history_store(&self) -> Option<&crate::history::HeaderStore> {
         self.history.get()
     }
@@ -1113,11 +1130,12 @@ impl ChainData {
     /// change by change with its `block_access_index` (0: system calls before the transactions,
     /// `i + 1`: transaction `i`, the last: after them), not merged into final values. Blocks without
     /// changes to these addresses are left out. BALs come from the gossip cache or eth/71 peers.
-    pub async fn bal_changes(&self, addresses: &[Address], from: u64, to: u64) -> Result<Vec<(u64, B256, Arc<Header>, Vec<Value>)>, DataError> {
+    /// `headers` is a hash-linked range the caller captured, so these changes and anything else
+    /// it reports for the blocks (logs, its cursor) are from the same chain.
+    pub async fn bal_changes(&self, addresses: &[Address], headers: &[(u64, B256, Arc<Header>)]) -> Result<Vec<(u64, B256, Arc<Header>, Vec<Value>)>, DataError> {
         let want: HashSet<Address> = addresses.iter().copied().collect();
         let want = &want;
-        let headers = self.linked_headers(from, to).await?;
-        let fetched: Vec<_> = futures::stream::iter(headers)
+        let fetched: Vec<_> = futures::stream::iter(headers.iter().cloned())
             .map(|(n, bh, h)| async move {
                 let bal = self.block_bal(bh, &h).await?;
                 let mut changes = Vec::new();
@@ -1155,7 +1173,7 @@ impl ChainData {
     }
 
     /// The headers of `[from, to]` on one hash-linked chain (memory, else the post-fork store).
-    async fn linked_headers(&self, from: u64, to: u64) -> Result<Vec<(u64, B256, Arc<Header>)>, DataError> {
+    pub(crate) async fn linked_headers(&self, from: u64, to: u64) -> Result<Vec<(u64, B256, Arc<Header>)>, DataError> {
         self.ensure_headers(from).await?;
         let disk: HashMap<u64, (B256, Arc<Header>)> = {
             let anchor = self.inner.read().headers.first_key_value().map(|(n, (_, hd))| (*n, hd.parent_hash));
@@ -1207,60 +1225,43 @@ impl ChainData {
     /// hash-linked to it). With `at`, the single block must be that block. Shared by
     /// `eth_getLogs` and block streams.
     pub async fn scan(&self, filters: &[Filter], from: u64, to: u64, at: Option<B256>, persist: bool) -> Result<Scan, DataError> {
-        self.ensure_headers(from).await?;
+        let headers = self.linked_headers(from, to).await?;
+        if let Some(want) = at
+            && headers.iter().any(|(_, bh, _)| *bh != want)
+        {
+            return Err(DataError::Unavailable(format!("block {want} is no longer on the chain")));
+        }
+        self.scan_headers(filters, &headers, persist).await
+    }
+
+    /// [`Self::scan`] over a range of headers the caller captured (hash-linked, ascending), so
+    /// that other data for the same blocks (e.g. BAL changes in a stream) comes from the very
+    /// same chain. Stored matches are used whenever they cover the filters; `persist` also
+    /// stores what this scan fetched (block streams; `eth_getLogs` only reads).
+    pub async fn scan_headers(&self, filters: &[Filter], headers: &[(u64, B256, Arc<Header>)], persist: bool) -> Result<Scan, DataError> {
+        if headers.is_empty() {
+            return Err(DataError::Invalid("empty range".into()));
+        }
         // Receipts older than every connected peer serves (history expiry): checked per block
         // below, after what's stored locally is taken from disk.
         let peers_from = match self.peers_serve_from() {
             (Some(p), n) if n > 0 => p,
             _ => 0,
         };
-        // Below the in-memory window, headers come from the post-fork store: only those hash-linked
-        // to the oldest in-memory (canonical) header, read in one transaction.
-        let disk: HashMap<u64, (B256, Arc<Header>)> = {
-            let anchor = self.inner.read().headers.first_key_value().map(|(n, (_, hd))| (*n, hd.parent_hash));
-            match (self.history.get(), anchor) {
-                (Some(s), Some((mem_low, parent))) if from < mem_low => s
-                    .linked_range(from, to.min(mem_low - 1), mem_low, parent)
-                    .map_err(|e| DataError::Unavailable(e.to_string()))?
-                    .ok_or_else(|| DataError::Unavailable(format!("headers below {mem_low} changed (reorg); retry")))?
-                    .into_iter()
-                    .map(|(hash, h)| (h.number, (hash, Arc::new(h))))
-                    .collect(),
-                _ => HashMap::new(),
-            }
-        };
-        let (candidates, scanned, last, first_parent) = {
+        let (candidates, scanned) = {
             let g = self.inner.read();
             let mut c = Vec::new();
-            let mut scanned = 0u64;
-            let mut last = None;
-            let mut first_parent = None;
-            let mut prev: Option<B256> = None;
-            for n in from..=to {
-                let Some((bh, h)) = g.headers.get(&n).cloned().or_else(|| disk.get(&n).cloned()) else {
-                    return Err(DataError::Unavailable(format!("no header for block {n}")));
-                };
-                if at.is_some_and(|want| want != bh) {
-                    return Err(DataError::Unavailable(format!("block {} is no longer on the chain", at.unwrap())));
-                }
-                // One chain across the range (a reorg between reads would break the links).
-                if prev.is_some_and(|p| p != h.parent_hash) {
-                    return Err(DataError::Unavailable(format!("chain changed at block {n} during the scan; retry")));
-                }
-                prev = Some(bh);
-                last = Some((n, bh));
-                first_parent.get_or_insert(h.parent_hash);
-                scanned += 1;
-                let touched = g.touched.get(&n).filter(|(th, _)| *th == bh).map(|(_, t)| t.clone());
+            for (n, bh, h) in headers {
+                let touched = g.touched.get(n).filter(|(th, _)| th == bh).map(|(_, t)| t.clone());
                 let maybe = filters.iter().any(|f| {
                     f.matches_bloom(h.logs_bloom)
                         && (f.address.is_empty() || touched.as_ref().is_none_or(|t| f.address.iter().any(|a| t.contains(a))))
                 });
                 if maybe {
-                    c.push((n, bh, h));
+                    c.push((*n, *bh, h.clone()));
                 }
             }
-            (c, scanned, last.expect("from <= to"), first_parent.expect("from <= to"))
+            (c, headers.len() as u64)
         };
         let mut expired = Vec::new();
         let t = Instant::now();
@@ -1275,9 +1276,16 @@ impl ChainData {
         // matched: a long scan holds at most one chunk of them in memory.
         let store = self.history.get().filter(|_| persist);
         let atoms = filter_atoms(filters);
-        let want: Vec<u32> = match store {
-            Some(s) => s.atom_ids(&atoms.iter().map(|(h, d, _)| (*h, d.clone())).collect::<Vec<_>>()).map_err(|e| DataError::Unavailable(e.to_string()))?,
-            None => Vec::new(),
+        let atom_keys: Vec<(B256, Vec<u8>)> = atoms.iter().map(|(h, d, _)| (*h, d.clone())).collect();
+        // Where stored matches are read from: the store when this scan persists; otherwise too
+        // (eth_getLogs), if every atom of these filters has been stored for before.
+        let (read, want): (Option<&crate::history::HeaderStore>, Vec<u32>) = match (store, self.history.get()) {
+            (Some(s), _) => (Some(s), s.atom_ids(&atom_keys).map_err(|e| DataError::Unavailable(e.to_string()))?),
+            (None, Some(s)) => match s.known_atom_ids(&atom_keys).ok().flatten() {
+                Some(ids) => (Some(s), ids),
+                None => (None, Vec::new()),
+            },
+            (None, None) => (None, Vec::new()),
         };
         // Atom id -> filter, for the unions (loaded as needed).
         let mut atom_filters: HashMap<u32, Filter> = want.iter().copied().zip(atoms.iter().map(|(_, _, f)| f.clone())).collect();
@@ -1286,7 +1294,7 @@ impl ChainData {
         let chunk_size = *CHUNK.get_or_init(|| std::env::var("SKIM_SCAN_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(SCAN_CHUNK));
         for chunk in candidates.chunks(chunk_size) {
             let hashes: Vec<B256> = chunk.iter().map(|(_, bh, _)| *bh).collect();
-            let mut entries: HashMap<B256, crate::history::BlockEntry> = store.map(|s| s.get_block_logs(&hashes).unwrap_or_default()).unwrap_or_default();
+            let mut entries: HashMap<B256, crate::history::BlockEntry> = read.map(|s| s.get_block_logs(&hashes).unwrap_or_default()).unwrap_or_default();
             let covers = |e: &crate::history::BlockEntry| want.iter().all(|w| e.covered.contains(w));
             let mut need: Vec<(u64, B256, Arc<Header>)> = chunk.iter().filter(|(_, bh, _)| !entries.get(bh).is_some_and(covers)).cloned().collect();
             // Blocks another scan is fetching: wait for it, then read what it stored.
@@ -1420,7 +1428,7 @@ impl ChainData {
             }
         }
         tracing::debug!(scanned, candidates = candidates.len(), logs = count, ms = t.elapsed().as_millis() as u64, "log scan");
-        Ok(Scan { blocks, last, first_parent, expired })
+        Ok(Scan { blocks, expired })
     }
 
     /// Block range of a filter, with tags resolved against `head`.
