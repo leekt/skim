@@ -43,6 +43,9 @@ const WRITE_BOUND: TableDefinition<&[u8; K], ()> = TableDefinition::new("write_b
 /// value there also held just before it. A plain base is a post-state: the base block itself
 /// may have changed the key, so extending backwards needs that block's BAL.
 const PRE_CLEAN: TableDefinition<&[u8; K], ()> = TableDefinition::new("pre_clean");
+/// Keys no longer archived: the last block their coverage reaches. Reads above it are not
+/// covered (later writes were not recorded); re-archiving starts coverage afresh.
+const COVERAGE_END: TableDefinition<&[u8; K], u64> = TableDefinition::new("coverage_end");
 /// Segments: first block -> last block (inclusive) of each run of consecutive processed blocks.
 const SEGMENTS: TableDefinition<u64, u64> = TableDefinition::new("segments");
 
@@ -152,6 +155,7 @@ impl Archive {
         tx.open_table(SEGMENTS)?;
         tx.open_table(WRITE_BOUND)?;
         tx.open_table(PRE_CLEAN)?;
+        tx.open_table(COVERAGE_END)?;
         tx.commit()?;
         Ok(Self {
             db,
@@ -178,8 +182,16 @@ impl Archive {
         let tx = self.db.begin_write()?;
         {
             let mut t = tx.open_table(ARCHIVED)?;
+            let mut end = tx.open_table(COVERAGE_END)?;
+            let mut cov = tx.open_table(COVERAGE)?;
             for k in keys {
-                t.insert(&encode_key(k), ())?;
+                let ek = encode_key(k);
+                t.insert(&ek, ())?;
+                // Archived again after its coverage ended: the blocks since were not recorded,
+                // so coverage restarts from the next write rather than bridging that gap.
+                if end.remove(&ek)?.is_some() {
+                    cov.remove(&ek)?;
+                }
             }
         }
         tx.commit()?;
@@ -279,9 +291,13 @@ impl Archive {
         let tx = self.db.begin_read()?;
         let t = tx.open_table(COVERAGE)?;
         let wb = tx.open_table(WRITE_BOUND)?;
+        let ended = tx.open_table(COVERAGE_END)?;
         let mut out = Vec::new();
         for e in t.iter()? {
             let (k, c) = e?;
+            if ended.get(k.value())?.is_some() {
+                continue; // no longer archived: its history isn't extended any more
+            }
             let extendable = wb.get(k.value())?.is_none();
             if let Some(key) = decode_key(k.value()) {
                 out.push((key, c.value(), extendable));
@@ -341,10 +357,14 @@ impl Archive {
         let covs: Vec<(StateKey, u64, bool)> = {
             let cov = tx.open_table(COVERAGE)?;
             let wb = tx.open_table(WRITE_BOUND)?;
+            let ended = tx.open_table(COVERAGE_END)?;
             let mut out = Vec::new();
             for e in cov.iter()? {
                 let (k, c) = e?;
                 let ek = *k.value();
+                if ended.get(&ek)?.is_some() {
+                    continue;
+                }
                 if let Some(key) = decode_key(&ek) {
                     out.push((key, c.value(), wb.get(&ek)?.is_none()));
                 }
@@ -474,10 +494,17 @@ impl Archive {
         // The blocks carry the writes of the keys archived when the scan started. A key archived
         // since and covered from before the end of the gap would get no versions for it: retry
         // with a fresh scope instead of merging.
+        // Keys whose coverage ended are outside the scan too: their coverage must stop before
+        // the gap (its blocks carry none of their writes).
+        Self::clamp_ended(&tx, first.number)?;
         {
             let cov = tx.open_table(COVERAGE)?;
+            let ended = tx.open_table(COVERAGE_END)?;
             for e in cov.iter()? {
                 let (k, c) = e?;
+                if ended.get(k.value())?.is_some() {
+                    continue;
+                }
                 if c.value() <= last.number && decode_key(k.value()).is_some_and(|key| !scope.contains(&key)) {
                     return Err(ArchiveError::GapMismatch("archived key set changed during the scan; retry".into()));
                 }
@@ -513,6 +540,7 @@ impl Archive {
                 seg.insert(s, lo - 1)?;
             }
         }
+        Self::clamp_ended(&tx, lo)?;
         {
             let mut journal = tx.open_table(JOURNAL)?;
             let mut versions = tx.open_table(VERSIONS)?;
@@ -557,6 +585,52 @@ impl Archive {
         Ok(())
     }
 
+    /// Stops archiving `key`: its history stays readable up to `last` (the last block whose
+    /// writes were recorded for it), and reads above that are not covered. With `last` before
+    /// the coverage start (or `None`), nothing remains covered.
+    pub fn end_coverage(&self, key: &StateKey, last: Option<u64>) -> Result<(), ArchiveError> {
+        let ek = encode_key(key);
+        let tx = self.db.begin_write()?;
+        {
+            tx.open_table(ARCHIVED)?.remove(&ek)?;
+            let mut cov = tx.open_table(COVERAGE)?;
+            let start = cov.get(&ek)?.map(|g| g.value());
+            match (start, last) {
+                (Some(c), Some(l)) if l >= c => {
+                    tx.open_table(COVERAGE_END)?.insert(&ek, l)?;
+                }
+                _ => {
+                    cov.remove(&ek)?;
+                    tx.open_table(COVERAGE_END)?.remove(&ek)?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Ended coverage must never reach blocks whose writes weren't recorded for the key: lowers
+    /// every end at or above `first` to `first - 1` (dropping coverage that would be empty).
+    fn clamp_ended(tx: &redb::WriteTransaction, first: u64) -> Result<(), ArchiveError> {
+        let mut end = tx.open_table(COVERAGE_END)?;
+        let mut cov = tx.open_table(COVERAGE)?;
+        let hit: Vec<([u8; K], u64)> =
+            end.iter()?.filter_map(|e| e.ok()).filter(|(_, l)| l.value() >= first).map(|(k, l)| (*k.value(), l.value())).collect();
+        for (ek, _) in hit {
+            let c = cov.get(&ek)?.map(|g| g.value());
+            match (c, first.checked_sub(1)) {
+                (Some(c), Some(l)) if l >= c => {
+                    end.insert(&ek, l)?;
+                }
+                _ => {
+                    end.remove(&ek)?;
+                    cov.remove(&ek)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A key's value became known at block `block` with hash `hash` (e.g. a verified SNAP base),
     /// plus its writes in later blocks `(number, hash, value)`. Every block must be the one the
     /// archive holds at that height (checked in the committing transaction): a value from another
@@ -589,8 +663,10 @@ impl Archive {
                 Self::journal_add(&tx, *n, &ek)?;
             }
             let mut cov = tx.open_table(COVERAGE)?;
+            // Coverage that had ended restarts here: the blocks between were not recorded.
+            let restart = tx.open_table(COVERAGE_END)?.remove(&ek)?.is_some();
             let cur = cov.get(&ek)?.map(|g| g.value());
-            if cur.is_none_or(|c| block < c) {
+            if restart || cur.is_none_or(|c| block < c) {
                 cov.insert(&ek, block)?;
                 tx.open_table(WRITE_BOUND)?.remove(&ek)?;
                 tx.open_table(PRE_CLEAN)?.remove(&ek)?;
@@ -654,6 +730,8 @@ impl Archive {
     /// `n`. Coverage that started in a forgotten block is withdrawn.
     pub fn truncate_above(&self, n: u64) -> Result<(), ArchiveError> {
         let tx = self.db.begin_write()?;
+        // The blocks above `n` get replaced, and an ended key's writes in them won't be recorded.
+        Self::clamp_ended(&tx, n + 1)?;
         {
             let mut journal = tx.open_table(JOURNAL)?;
             let mut versions = tx.open_table(VERSIONS)?;
@@ -723,6 +801,9 @@ impl Archive {
             return Ok(ArchiveRead::OtherFork);
         }
         let from = tx.open_table(COVERAGE)?.get(&ek)?.map(|g| g.value());
+        if tx.open_table(COVERAGE_END)?.get(&ek)?.is_some_and(|l| number > l.value()) {
+            return Ok(ArchiveRead::NotCovered { from });
+        }
         let in_segment = {
             let seg = tx.open_table(SEGMENTS)?;
             let r = seg.range(..=number)?.next_back().transpose()?;
@@ -1096,5 +1177,77 @@ mod tests {
         h.join().unwrap();
         assert_ne!(a.get_at(&slot(9), 104, b(104)).unwrap(), ArchiveRead::Value(U256::from(40)), "fork A's value under B104's hash");
         assert_eq!(a.hash(104).unwrap(), Some(b(104)));
+    }
+
+    #[test]
+    fn ended_coverage_answers_up_to_its_end_and_restarts_when_archived_again() {
+        let d = tempfile::tempdir().unwrap();
+        let a = Archive::open(d.path().join("a.redb")).unwrap();
+        blk(&a, 100, &[]);
+        a.write_base(&slot(1), 100, B256::with_last_byte(100), U256::from(10), &[]).unwrap();
+        blk(&a, 101, &[(slot(1), 11)]);
+        a.end_coverage(&slot(1), Some(101)).unwrap();
+        assert!(!a.archived_keys().unwrap().contains(&slot(1)));
+        assert!(a.coverages().unwrap().is_empty(), "an ended key is not reported as archived");
+        // Block 102 changed the key, but it is no longer archived: nothing records that.
+        blk(&a, 102, &[]);
+        assert_eq!(val(&a, slot(1), 100), Some(10));
+        assert_eq!(val(&a, slot(1), 101), Some(11));
+        assert_eq!(val(&a, slot(1), 102), None, "past the end: refused, not the stale 11");
+        // Archived again from a base at 103: coverage restarts there, the gap is never bridged.
+        blk(&a, 103, &[]);
+        a.write_base(&slot(1), 103, B256::with_last_byte(103), U256::from(30), &[]).unwrap();
+        assert_eq!(val(&a, slot(1), 101), None);
+        assert_eq!(val(&a, slot(1), 102), None);
+        assert_eq!(val(&a, slot(1), 103), Some(30));
+        // Or archived again with coverage from its next write.
+        a.end_coverage(&slot(1), Some(103)).unwrap();
+        a.add_keys(&[slot(1)]).unwrap();
+        blk(&a, 104, &[]);
+        assert_eq!(val(&a, slot(1), 104), None);
+        blk(&a, 105, &[(slot(1), 50)]);
+        assert_eq!(val(&a, slot(1), 105), Some(50));
+    }
+
+    #[test]
+    fn a_reorg_below_an_ended_coverage_lowers_its_end() {
+        let d = tempfile::tempdir().unwrap();
+        let a = Archive::open(d.path().join("a.redb")).unwrap();
+        blk(&a, 100, &[]);
+        a.write_base(&slot(1), 100, B256::with_last_byte(100), U256::from(10), &[]).unwrap();
+        blk(&a, 101, &[]);
+        blk(&a, 102, &[(slot(1), 12)]);
+        a.end_coverage(&slot(1), Some(102)).unwrap();
+        // Reorg to 100; the new 101..102 aren't recorded for the key (it isn't archived).
+        a.truncate_above(100).unwrap();
+        blk(&a, 101, &[]);
+        blk(&a, 102, &[]);
+        assert_eq!(val(&a, slot(1), 100), Some(10));
+        assert_eq!(val(&a, slot(1), 101), None, "the new fork's 101 is past the lowered end");
+        assert_eq!(val(&a, slot(1), 102), None);
+    }
+
+    #[test]
+    fn a_gap_fill_succeeds_with_ended_keys_and_stops_their_coverage_before_it() {
+        let d = tempfile::tempdir().unwrap();
+        let a = Archive::open(d.path().join("a.redb")).unwrap();
+        blk(&a, 10, &[]);
+        a.write_base(&slot(1), 10, B256::with_last_byte(10), U256::from(5), &[]).unwrap();
+        a.write_base(&slot(2), 10, B256::with_last_byte(10), U256::from(6), &[]).unwrap();
+        blk(&a, 11, &[]);
+        let h15 = alloy_rlp::encode(alloy_consensus::Header { number: 15, parent_hash: B256::with_last_byte(14), ..Default::default() });
+        a.write_block(&ArchiveBlock { number: 15, hash: B256::with_last_byte(15), parent_hash: B256::with_last_byte(14), header_rlp: &h15, writes: &[] })
+            .unwrap();
+        // slot(2) stops being archived with its end claimed at 15, across the 12..=14 gap.
+        a.end_coverage(&slot(2), Some(15)).unwrap();
+        let gap = [
+            ArchiveBlock { number: 12, hash: B256::with_last_byte(12), parent_hash: B256::with_last_byte(11), header_rlp: &[0xc0], writes: &[] },
+            ArchiveBlock { number: 13, hash: B256::with_last_byte(13), parent_hash: B256::with_last_byte(12), header_rlp: &[0xc0], writes: &[] },
+            ArchiveBlock { number: 14, hash: B256::with_last_byte(14), parent_hash: B256::with_last_byte(13), header_rlp: &[0xc0], writes: &[] },
+        ];
+        a.fill_gap(&gap, &a.archived_keys().unwrap()).expect("an ended key doesn't block the fill");
+        assert_eq!(val(&a, slot(1), 13), Some(5));
+        assert_eq!(val(&a, slot(2), 11), Some(6));
+        assert_eq!(val(&a, slot(2), 13), None, "the gap carried none of its writes");
     }
 }

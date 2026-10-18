@@ -58,7 +58,7 @@ With no cap, memory grows with the contract: about 100 bytes per slot, so a cont
 - **Startup:** declared keys over the limit fail at startup.
 - **Learned keys:** a simulation's learned keys are subscribed only while there is room. The rest stay on-demand, with a TTL, and the subscription reports `truncated: true`.
 - **Background prefetch:** the V3 predictor's subscribed keys count toward the same limit.
-- **Dropped keys:** keys a call stops reading are unsubscribed. Archived ones are the exception, because their history must stay continuous.
+- **Dropped keys:** keys a call stops reading are unsubscribed. Archived ones are released only after no subscription has needed them for 64 blocks (so a key read now and then doesn't flap). Their archived history stays readable up to the release, and reads after it are refused. If a call reads the key again, its history starts afresh; the gap is never bridged. The same applies to archived keys of a subscription removed from the config.
 - **Bytecode:** code is dropped when no tracked account points at it any more.
 
 ### Choosing between slots and calls

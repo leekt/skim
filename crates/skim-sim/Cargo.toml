@@ -29,4 +29,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 serde_yaml_ng.workspace = true
+tempfile = "3"
 skim-el.workspace = true

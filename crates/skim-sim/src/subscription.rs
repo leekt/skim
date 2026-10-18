@@ -11,7 +11,7 @@
 //! **Ready** means the head's BAL is applied and every required key of the subscription is known
 //! at the head. Readiness is reported per subscription and never assumed.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use alloy_primitives::{Address, Bytes, U256};
 use parking_lot::RwLock;
@@ -119,6 +119,9 @@ pub struct Status {
     pub block: Option<u64>,
     pub required_keys: usize,
     pub missing_keys: usize,
+    /// Up to [`MISSING_SHOWN`] of the missing keys (and bytecode), so a subscription that stays
+    /// not ready says what it waits for.
+    pub missing: Vec<String>,
     pub truncated: bool,
     /// Every call of the subscription ran without error and without unresolved misses at `block`.
     pub calls_ok: bool,
@@ -170,7 +173,27 @@ pub struct Subscriptions {
     /// `storage: all` downloads to retry later: (block to retry at, attempts so far). Set when
     /// peers only gave unverified oversized answers, or the budget refused the install.
     retry_at: RwLock<BTreeMap<String, (u64, u32)>>,
+    /// Archived keys no subscription requires, with the block that was first seen.
+    unneeded_since: RwLock<HashMap<StateKey, u64>>,
 }
+
+/// Missing keys named in a subscription's status (the count is always complete).
+pub const MISSING_SHOWN: usize = 8;
+
+fn key_name(k: &StateKey) -> String {
+    match k {
+        StateKey::Balance(a) => format!("balance {a}"),
+        StateKey::Nonce(a) => format!("nonce {a}"),
+        StateKey::CodeHash(a) => format!("code hash {a}"),
+        StateKey::Storage(a, s) => format!("storage {a} {s:#x}"),
+    }
+}
+
+/// Archived keys nothing has required for this many blocks are released (their archive
+/// coverage ends). The wait keeps a key a call reads only now and then from flapping, which
+/// would restart its archive history each time; and it lets a call's first runs after a
+/// restart re-learn its keys before anything is released.
+pub const RELEASE_ARCHIVED_AFTER: u64 = 64;
 
 /// Backoff for `storage: all` retries: 32 blocks, doubling, at most ~7 hours of blocks.
 fn retry_after(attempts: u32) -> u64 {
@@ -248,6 +271,7 @@ impl Subscriptions {
             status: RwLock::new(status),
             too_large: Default::default(),
             retry_at: Default::default(),
+            unneeded_since: Default::default(),
         })
     }
 
@@ -388,6 +412,28 @@ impl Subscriptions {
         }
     }
 
+    fn release_unneeded_archived(&self, store: &skim_state::Store, head: u64) {
+        let needed: HashSet<StateKey> =
+            self.declared.values().chain(self.required.read().values()).flat_map(|k| k.iter().copied()).collect();
+        let archived: HashSet<StateKey> = store.archived_keys().into_iter().collect();
+        let mut since = self.unneeded_since.write();
+        since.retain(|k, _| !needed.contains(k) && archived.contains(k));
+        let mut release = Vec::new();
+        for k in archived.into_iter().filter(|k| !needed.contains(k)) {
+            let first = *since.entry(k).or_insert(head);
+            if head.saturating_sub(first) >= RELEASE_ARCHIVED_AFTER {
+                release.push(k);
+            }
+        }
+        if !release.is_empty() {
+            let n = store.release_archived(&release);
+            for k in &release {
+                since.remove(k);
+            }
+            tracing::info!(released = n, block = head, "archived keys no subscription needs any more: coverage ended, slots freed");
+        }
+    }
+
     async fn maintain_inner(&self, sim: &Simulator, head: &BlockRef) {
         sim.store.set_max_subscribed(self.max_keys);
         // Without a SNAP peer nothing can be fetched: don't wait for one (that wait is for
@@ -492,6 +538,11 @@ impl Subscriptions {
             }
         }
 
+        // 2a. Archived keys nothing requires any more (a call stopped reading them, a removed
+        //     subscription, or keys reloaded from the archive after a restart) are released
+        //     after RELEASE_ARCHIVED_AFTER blocks, so they stop holding subscribed slots.
+        self.release_unneeded_archived(&sim.store, head.number);
+
         // 2b. Bytecode of subscribed accounts: a code hash alone can't run a call. Fetch what is
         //     missing (calls fetch their own as they run; declared `account: true` keys don't).
         if let Ok(snap) = sim.store.snapshot(head) {
@@ -512,12 +563,19 @@ impl Subscriptions {
         for spec in &self.specs {
             let keys = req.get(&spec.name).cloned().unwrap_or_default();
             let keys_vec: Vec<StateKey> = keys.iter().copied().collect();
-            let missing = keys.iter().filter(|k| !matches!(snap.get(k), Ok(StateValue::Known(_)))).count() + missing_code(sim, &snap, &keys_vec).len();
+            let mut sorted: Vec<&StateKey> = keys.iter().filter(|k| !matches!(snap.get(k), Ok(StateValue::Known(_)))).collect();
+            sorted.sort();
+            let codes = missing_code(sim, &snap, &keys_vec);
+            let missing = sorted.len() + codes.len();
+            let shown: Vec<String> =
+                sorted.iter().map(|k| key_name(k)).chain(codes.iter().map(|h| format!("code {h}"))).take(MISSING_SHOWN).collect();
             let s = st.entry(spec.name.clone()).or_default();
             s.name = spec.name.clone();
             s.block = Some(head.number);
             s.required_keys = keys.len();
             s.missing_keys = missing;
+            let missing_changed = s.missing != shown;
+            s.missing = shown;
             let mut calls_ok = spec.calls.is_empty() || s.calls_ok;
             if spec.storage_all() {
                 // The whole storage must be known at (or before) this block.
@@ -527,7 +585,12 @@ impl Subscriptions {
                     s.error = None;
                 }
             }
-            s.ready = is_ready(head_ok, missing, calls_ok, s.truncated);
+            let ready = is_ready(head_ok, missing, calls_ok, s.truncated);
+            if head_ok && (ready != s.ready || (!ready && missing_changed)) {
+                tracing::info!(subscription = %spec.name, ready, missing, truncated = s.truncated, calls_ok, waiting_for = ?s.missing,
+                    "subscription readiness changed");
+            }
+            s.ready = ready;
         }
     }
 }
@@ -589,6 +652,37 @@ mod tests {
             assert_eq!((z.keys, z.versions, z.watched_addresses, z.complete_slots), (0, 0, 0, 0), "complete={complete}: {z:?}");
             assert!(subs.status.read().get("pool").and_then(|s| s.error.clone()).is_some(), "the failure is reported");
         }
+    }
+
+    #[test]
+    fn archived_keys_nothing_needs_are_released_after_a_while_and_free_their_slots() {
+        // The fourth soak: an archived call's access set drifted, released nothing, and the
+        // subscribed set grew to the limit, so the call's new keys were refused for good.
+        let a = Address::repeat_byte(0xc0);
+        let spec: SubscriptionSpec =
+            serde_yaml_ng::from_str(&format!("name: pool\naddress: \"{a}\"\nstorage: [\"0x1\"]\nretention: {{ mode: archive }}\n")).unwrap();
+        let subs = Subscriptions::new(vec![spec], 2).unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let store = skim_state::Store::with_archive(256, skim_state::archive::Archive::open(d.path().join("a.redb")).unwrap()).unwrap();
+        store.set_max_subscribed(2);
+        let h = |n: u64| alloy_primitives::B256::from(U256::from(n));
+        let blk = |n: u64| BlockRef { number: n, hash: h(n), parent_hash: h(n - 1), state_root: alloy_primitives::B256::ZERO, timestamp: n * 12 };
+        let (declared, old, new) = (StateKey::Storage(a, U256::from(1)), StateKey::Storage(a, U256::from(2)), StateKey::Storage(a, U256::from(3)));
+        store.apply_block(blk(1), Default::default()).unwrap();
+        assert!(store.archive_key_checked(declared));
+        assert!(store.archive_key_checked(old), "a key the call used to read");
+        assert!(!store.archive_key_checked(new), "the limit is full");
+        for n in 2..=(1 + RELEASE_ARCHIVED_AFTER) {
+            store.apply_block(blk(n), Default::default()).unwrap();
+            subs.release_unneeded_archived(&store, n);
+        }
+        assert!(store.archived_keys().contains(&old), "kept while within the wait");
+        store.apply_block(blk(2 + RELEASE_ARCHIVED_AFTER), Default::default()).unwrap();
+        subs.release_unneeded_archived(&store, 2 + RELEASE_ARCHIVED_AFTER);
+        let mut kept = store.archived_keys();
+        kept.sort();
+        assert_eq!(kept, vec![declared], "the declared key stays, the unused one is released");
+        assert!(store.archive_key_checked(new), "its slot is free again");
     }
 
     #[test]

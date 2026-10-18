@@ -28,6 +28,7 @@ A historical `eth_call` runs entirely on archived keys, with that block's header
 ## How it works
 - **Writes:** each block's BAL already lists every write with its new value, so skim stores a version **only when a key changes**. A key that never changes costs one entry.
 - **Coverage:** a key is covered from the block it became known (subscribe time) onwards, within *segments* of consecutively processed blocks.
+- **Released keys:** a key no subscription needs for 64 blocks stops being archived. It stays covered up to the release block only, and archiving it again starts new coverage.
 - **Restarts:** after a restart, the gap is healed in the background from eth/71 BALs. Peers retain BALs for about 2 weeks.
 - **Reorgs:** the archive is truncated exactly by a per-block journal.
 

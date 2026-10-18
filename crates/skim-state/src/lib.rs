@@ -487,6 +487,37 @@ impl Store {
         true
     }
 
+    /// Archived keys (the ones currently archived, not those whose coverage ended).
+    pub fn archived_keys(&self) -> Vec<StateKey> {
+        self.inner.read().archived.iter().copied().collect()
+    }
+
+    /// Stops archiving `keys` and frees their subscribed slots: their archive history stays
+    /// readable up to the current head, reads above that are refused, and archiving one again
+    /// later starts its coverage afresh. Returns how many were released.
+    pub fn release_archived(&self, keys: &[StateKey]) -> usize {
+        // Archive and memory change under one lock, as everywhere else.
+        let mut st = self.inner.write();
+        let head = st.head().map(|h| h.number);
+        let mut n = 0;
+        for k in keys {
+            if !st.archived.remove(k) {
+                continue;
+            }
+            if let Some(ar) = &self.archive {
+                let r = ar.end_coverage(k, head);
+                self.archive_try(r);
+            }
+            st.watched_keys.remove(k);
+            st.temp.remove(k);
+            if !st.tracked_by_address(k) {
+                st.versions.remove(k);
+            }
+            n += 1;
+        }
+        n
+    }
+
     /// Stops keeping `k` current (unless covered by a watched address) and drops its versions.
     pub fn unwatch_key(&self, k: &StateKey) {
         let mut st = self.inner.write();
