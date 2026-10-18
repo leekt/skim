@@ -52,9 +52,6 @@ Items are removed from this file when they're done, and the commit that closes o
 16. **Unsupported routes:** permissions, resolver and registry views, diagnostics, Basenames.
 17. **ENSv2 migration history** (`migrated_at`, `is_migrated`) isn't indexed.
 
-## Operations
-18. **A1 at 2 OCPU / 12 GB:** resize to the free-tier maximum (4 / 24) when capacity allows.
-19. **draftroom-box** still holds the old deployment's files.
-20. **Deployment isn't in the repo:** systemd units, tunnel config and the steps used for the A1.
-21. **The local bigname comparison stack** (stopped containers, Postgres volume) is still on the
-    development machine; the side-by-side needs an archive RPC.
+## Deployment
+18. **No deployment example in the repo:** a reference setup for skim + smallname (service units,
+    a reverse proxy or tunnel in front of smallname only, skim's RPC kept private).
