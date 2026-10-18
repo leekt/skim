@@ -112,7 +112,15 @@ pub struct Simulator {
     /// Miss rounds an interactive call may take (`on_demand.max_fetch_rounds`): each round
     /// fetches the state the previous run stopped at, so deep call chains need more.
     pub max_rounds: std::sync::atomic::AtomicUsize,
+    /// An extra source of ancestor headers, asked before the eth peers (tests: a peer that
+    /// serves headers but not SNAP, without a network). `None` in production.
+    header_source: RwLock<Option<HeaderSource>>,
 }
+
+/// Headers falling from a block hash: `(from_hash, count)` -> headers, newest first (as eth
+/// `GetBlockHeaders` with `reverse` answers). The caller checks they link by hash.
+pub type HeaderSource =
+    Arc<dyn Fn(B256, u64) -> futures::future::BoxFuture<'static, Option<Vec<Header>>> + Send + Sync>;
 
 impl Simulator {
     pub fn new(store: Arc<Store>, sched: Scheduler<ElTransport>, predictor: predictor::Predictor) -> Arc<Self> {
@@ -127,7 +135,14 @@ impl Simulator {
             max_rounds: std::sync::atomic::AtomicUsize::new(8),
             state_wait: RwLock::new(std::time::Duration::from_secs(60)),
             cpu: tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(2, |n| n.get())),
+            header_source: RwLock::new(None),
         })
+    }
+
+    /// Installs an extra ancestor-header source, asked before the eth peers (see
+    /// [`HeaderSource`]).
+    pub fn set_header_source(&self, source: HeaderSource) {
+        *self.header_source.write() = Some(source);
     }
 
     /// Keeps the on-demand keys a request used current for another TTL (no effect on
@@ -357,8 +372,19 @@ impl Simulator {
                 return;
             }
             let want = oldest - lowest + 1;
-            let peers: Vec<_> = net.peers().into_iter().filter(|(_, p)| p.eth_version >= 69).map(|(id, _)| id).take(4).collect();
             let mut progressed = false;
+            let source = self.header_source.read().clone();
+            if let Some(src) = source
+                && let Some(hs) = src(hash, want).await
+            {
+                let chain: Vec<(u64, B256, B256)> = hs.iter().map(|h| (h.number, h.hash_slow(), h.parent_hash)).collect();
+                progressed = self.store.insert_ancestor_hashes(&chain) > 0;
+            }
+            let peers: Vec<_> = if progressed {
+                Vec::new()
+            } else {
+                net.peers().into_iter().filter(|(_, p)| p.eth_version >= 69).map(|(id, _)| id).take(4).collect()
+            };
             for p in peers {
                 let (Ok(hs), _) = net.headers_falling(p, hash.into(), want).await else { continue };
                 let chain: Vec<(u64, B256, B256)> = hs.iter().map(|h| (h.number, h.hash_slow(), h.parent_hash)).collect();
