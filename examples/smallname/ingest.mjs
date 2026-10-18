@@ -371,6 +371,14 @@ export class Ingest {
       case "ResolverUpdated":
         ev("resolver", this.v2Node(addr, args.tokenId), args.resolver);
         break;
+      case "TokenResource": {
+        // The resource id EAC role grants for this token use (permissions by name).
+        const n = this.v2Node(addr, args.tokenId);
+        this.s.run("INSERT OR REPLACE INTO v2_resources (registry, resource, node, block, log_index) VALUES (?, ?, ?, ?, ?)",
+          addr, BigInt(args.resource).toString(), n, l.block, l.logIndex);
+        ev("permission", n);
+        break;
+      }
       case "TokenRegenerated": {
         // Same label, new version: the token id's high bits don't change.
         ev("token", this.v2Node(addr, args.newTokenId));

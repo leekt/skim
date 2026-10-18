@@ -37,6 +37,10 @@ pub struct Chain {
     pub on_header: Box<dyn Fn(&Header) + Send + Sync>,
     /// How far back to look for a common ancestor.
     pub lookback: u64,
+    /// Consensus peers: the missing blocks' payload envelopes (with their BALs) when no EL peer
+    /// serves them. A missed gossip payload must not stall the follower until an eth/71 peer
+    /// shows up (measured: 5 minutes with only crawlers connected on the EL side).
+    pub cl: Option<skim_cl::ClNode>,
 }
 
 impl Chain {
@@ -138,7 +142,55 @@ impl Chain {
             }
             return Ok((ancestor, replay.len() as u64));
         }
+        // No EL peer could: the same blocks from consensus peers (payload envelopes carry the
+        // header fields and the BAL, each envelope checked against its block hash).
+        if let Some(cl) = &self.cl {
+            match self.reconcile_via_cl(cl, b, head.number).await {
+                Ok(r) => return Ok(r),
+                Err(e) => tracing::debug!(number = b.number, "gap fill via consensus peers: {e}"),
+            }
+        }
         Err(Reconcile::Defer("no EL peer served a linked header chain + BALs yet".into()))
+    }
+
+    /// Fills `b`'s missing ancestors from consensus peers: walks payload envelopes back from
+    /// `b`'s slot until the collected blocks link (by hash) from a block the store holds to `b`'s
+    /// parent, then rolls back to that block and applies them in order.
+    async fn reconcile_via_cl(&self, cl: &skim_cl::ClNode, b: &BlockRef, head: u64) -> anyhow::Result<(u64, u64)> {
+        let slot = b.timestamp.saturating_sub(skim_cl::node::SEPOLIA_GENESIS_TIME) / 12;
+        let mut got: std::collections::BTreeMap<u64, (Header, BlockWrites)> = Default::default();
+        let mut found: Option<u64> = None;
+        let mut trace = crate::persist::CatchupTrace::default();
+        let expected = b.number.saturating_sub(head).max(1);
+        crate::persist::walk_envelopes(cl, slot.saturating_sub(1), self.lookback * 2 + 8, expected, &mut trace, |h, w| {
+            if h.number < b.number {
+                got.insert(h.number, (h, w));
+            }
+            // Linked from a stored block up to b's parent?
+            let mut want = b.parent_hash;
+            for n in (0..b.number).rev() {
+                let Some((hd, _)) = got.get(&n) else { return false };
+                if hd.hash_slow() != want {
+                    return false;
+                }
+                if self.store.block(n - 1).is_some_and(|p| p.hash == hd.parent_hash) {
+                    found = Some(n - 1);
+                    return true;
+                }
+                want = hd.parent_hash;
+            }
+            false
+        })
+        .await?;
+        let ancestor = found.ok_or_else(|| anyhow::anyhow!("envelopes didn't link to a stored block"))?;
+        self.store.rollback_to(ancestor);
+        let mut n_applied = 0;
+        for (_, (h, w)) in got.range(ancestor + 1..b.number) {
+            self.apply(h, Arc::new(w.clone())).map_err(|e| anyhow::anyhow!("replay failed at {}: {e}", h.number))?;
+            n_applied += 1;
+        }
+        tracing::info!(from = ancestor + 1, to = b.number - 1, "gap filled from consensus peers");
+        Ok((ancestor, n_applied))
     }
 }
 

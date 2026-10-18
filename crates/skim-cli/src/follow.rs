@@ -416,6 +416,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         net: ctx.net.clone(),
         on_header: Box::new(|_| {}),
         lookback: 32,
+        cl: None,
     };
 
     // 0 = not started, 1 = running, 2 = done. Blocks are applied from the first envelope on, so

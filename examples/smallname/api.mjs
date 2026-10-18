@@ -590,16 +590,24 @@ export function serve(store, { skim, port, host }) {
    * (TokenResource), which aren't indexed: those return 422.
    */
   function permissions(q, cursor) {
-    if (q.get("name") || q.get("registration_id")) throw unsupported("name and registration_id anchors are not supported by smallname", "resource_ids_not_indexed");
+    if (q.get("registration_id")) throw unsupported("registration_id anchors are not supported by smallname", "registration_ids_not_indexed");
     const conds = ["kind = 'EACRolesChanged'"];
     const args = [];
+    if (q.get("name")) {
+      // A name's grants: the resource ids its registry tokens were assigned (TokenResource).
+      const node = namehash(parseName(q.get("name")));
+      const res = store.all("SELECT DISTINCT registry, resource FROM v2_resources WHERE node = ?", node);
+      if (!res.length) return { data: [], page: page(cursor, null, pageSize(q)), meta: { index: indexMeta(null), ...partialMeta() } };
+      conds.push(`(${res.map(() => "(address = ? AND json_extract(data, '$.resource') = ?)").join(" OR ")})`);
+      for (const r of res) args.push(r.registry, r.resource);
+    }
     if (q.get("address")) conds.push("actor = ?") && args.push(parseAddress(q.get("address")).toLowerCase());
     if (q.get("registry")) {
       const [c, ad] = q.get("registry").split(":");
       conds.push("address = ?") && args.push(parseContract(c, ad));
     }
     if (q.get("contract_address")) conds.push("address = ?") && args.push(parseAddress(q.get("contract_address")).toLowerCase());
-    if (args.length === 0) throw bad("at least one of address, registry or contract_address is required");
+    if (args.length === 0) throw bad("at least one of name, address, registry or contract_address is required");
     const size = pageSize(q);
     const scope = `perm:${args.join(",")}`;
     const after = cursor ? dec(cursor, scope).o : 0;

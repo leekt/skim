@@ -404,6 +404,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             store2.note_header(h.hash_slow(), alloy_rlp::encode(h));
         }),
         lookback: 32,
+        cl: Some(cl.clone()),
     };
     tracing::info!("following Sepolia from CL gossip; RPC answers once the first block is applied");
 

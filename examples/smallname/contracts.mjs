@@ -87,6 +87,7 @@ export const EVENTS = {
   SubregistryUpdated: parseAbiItem("event SubregistryUpdated(uint256 indexed tokenId, address indexed subregistry, address indexed sender)"),
   ResolverUpdated: parseAbiItem("event ResolverUpdated(uint256 indexed tokenId, address indexed resolver, address indexed sender)"),
   TokenRegenerated: parseAbiItem("event TokenRegenerated(uint256 indexed oldTokenId, uint256 indexed newTokenId)"),
+  TokenResource: parseAbiItem("event TokenResource(uint256 indexed tokenId, uint256 indexed resource)"),
   ParentUpdated: parseAbiItem("event ParentUpdated(address indexed parent, string label, address indexed sender)"),
   EACRolesChanged: parseAbiItem("event EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)"),
   // ENSv2 registrar / renewal bridge (history and preimages; registry events carry authority)
@@ -104,7 +105,7 @@ export const EVENTS = {
 /** ENSv2 events taken from any emitter (registries and resolvers announce themselves). */
 export const V2_DISCOVERY_EVENTS = [
   "RegistryCreated", "LabelRegistered", "LabelReserved", "LabelUnregistered", "ExpiryUpdated", "SubregistryUpdated",
-  "ResolverUpdated", "TokenRegenerated", "ParentUpdated", "ResolverCreated", "Linked", "AddressUpdated",
+  "ResolverUpdated", "TokenRegenerated", "TokenResource", "ParentUpdated", "ResolverCreated", "Linked", "AddressUpdated",
   "ContenthashUpdated", "TextUpdated", "NameUpdated",
 ];
 

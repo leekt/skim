@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS registries (address TEXT PRIMARY KEY, parent_node TEX
 CREATE TABLE IF NOT EXISTS v2_tokens (registry TEXT NOT NULL, label_id TEXT NOT NULL, labelhash TEXT NOT NULL, node TEXT, block INTEGER NOT NULL,
   PRIMARY KEY (registry, label_id));
 CREATE TABLE IF NOT EXISTS v2_resolvers (address TEXT PRIMARY KEY, block INTEGER NOT NULL);
+-- ENSv2 permission resources: which resource id a registry token's roles are granted on.
+CREATE TABLE IF NOT EXISTS v2_resources (registry TEXT NOT NULL, resource TEXT NOT NULL, node TEXT, block INTEGER NOT NULL, log_index INTEGER NOT NULL,
+  PRIMARY KEY (registry, resource, block, log_index));
+CREATE INDEX IF NOT EXISTS v2_resources_node ON v2_resources (node);
 -- Completed ENSv1 -> ENSv2 migrations: the ENSv1 token sent to the Graveyard and the ENSv2
 -- registration in the same transaction (bigname's rule). History only; authority is read live.
 CREATE TABLE IF NOT EXISTS migrations (node TEXT NOT NULL, block INTEGER NOT NULL, ts INTEGER, tx TEXT,
@@ -47,7 +51,7 @@ CREATE TABLE IF NOT EXISTS v2_links (resolver TEXT NOT NULL, record_id TEXT NOT 
   PRIMARY KEY (resolver, node, block, log_index));
 `;
 
-const REORG_TABLES = ["blocks", "events", "names", "rel", "expiry", "record_keys", "versions", "registries", "v2_tokens", "v2_resolvers", "v2_links", "migrations"];
+const REORG_TABLES = ["blocks", "events", "names", "rel", "expiry", "record_keys", "versions", "registries", "v2_tokens", "v2_resolvers", "v2_links", "v2_resources", "migrations"];
 
 export class Store {
   constructor(path) {
