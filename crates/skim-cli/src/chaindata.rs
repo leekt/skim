@@ -150,28 +150,62 @@ pub struct ChainData {
     pub test_peers_from: Mutex<Option<u64>>,
 }
 
-/// A filter set's identity for stored matches: the same filters (in any order) give the same
-/// fingerprint.
-pub(crate) fn filters_fingerprint(filters: &[Filter]) -> B256 {
-    let mut parts: Vec<String> = filters
+fn topics_def(f: &Filter) -> String {
+    f.topics
         .iter()
-        .map(|f| {
-            let mut a: Vec<String> = f.address.iter().map(|x| x.to_string().to_lowercase()).collect();
-            a.sort();
-            let t: Vec<String> = f
-                .topics
-                .iter()
-                .map(|set| {
-                    let mut v: Vec<String> = set.iter().map(|x| x.to_string()).collect();
-                    v.sort();
-                    v.join(",")
-                })
-                .collect();
-            format!("{}/{}", a.join(","), t.join(";"))
+        .map(|set| {
+            let mut v: Vec<String> = set.iter().map(|x| x.to_string()).collect();
+            v.sort();
+            v.join(",")
         })
-        .collect();
-    parts.sort();
-    keccak256(parts.join("|"))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Filters split into atoms: one address with its filter's topic constraints, or (a filter with
+/// no address) the topic constraints alone. Each: identity hash, definition, and the atom filter.
+pub(crate) fn filter_atoms(filters: &[Filter]) -> Vec<(B256, Vec<u8>, Filter)> {
+    let mut out: Vec<(B256, Vec<u8>, Filter)> = Vec::new();
+    for f in filters {
+        let t = topics_def(f);
+        let mut push = |addr: Option<Address>| {
+            let def = format!("{}|{t}", addr.map_or("*".to_string(), |a| a.to_string().to_lowercase()));
+            let h = keccak256(def.as_bytes());
+            if out.iter().all(|(x, _, _)| *x != h) {
+                let mut g = Filter::new();
+                g.topics = f.topics.clone();
+                if let Some(a) = addr {
+                    g = g.address(a);
+                }
+                out.push((h, def.into_bytes(), g));
+            }
+        };
+        if f.address.is_empty() {
+            push(None);
+        } else {
+            for a in f.address.iter() {
+                push(Some(*a));
+            }
+        }
+    }
+    out
+}
+
+/// The atom filter a stored definition describes.
+fn atom_from_def(def: &[u8]) -> Option<Filter> {
+    let s = std::str::from_utf8(def).ok()?;
+    let (addr, topics) = s.split_once('|')?;
+    let mut f = Filter::new();
+    if addr != "*" {
+        f = f.address(addr.parse::<Address>().ok()?);
+    }
+    for (i, part) in topics.split(';').enumerate().take(4) {
+        let set: Vec<B256> = part.split(',').filter(|x| !x.is_empty()).map(|x| x.parse().ok()).collect::<Option<_>>()?;
+        if !set.is_empty() {
+            f.topics[i] = set.into();
+        }
+    }
+    Some(f)
 }
 
 /// CPU-heavy verification (receipt roots: a trie over every receipt) runs off the async
@@ -290,6 +324,12 @@ impl ChainData {
             }
         });
         cd
+    }
+
+    /// The post-fork header store, if any (tests).
+    #[cfg(test)]
+    pub fn history_store(&self) -> Option<&crate::history::HeaderStore> {
+        self.history.get()
     }
 
     /// Keeps post-Amsterdam headers in `store` from now on (and serves logs from them).
@@ -517,7 +557,7 @@ impl ChainData {
 
     /// Makes headers down to `number` available: in memory for recent blocks; below that, on
     /// disk (post-Amsterdam history), walking back by hash from the lowest linked header.
-    async fn ensure_headers(&self, number: u64) -> Result<(), DataError> {
+    pub(crate) async fn ensure_headers(&self, number: u64) -> Result<(), DataError> {
         let Some(store) = self.history.get() else { return self.ensure_headers_mem(number).await };
         if let Ok(Some(floor)) = store.floor()
             && number < floor
@@ -1197,40 +1237,44 @@ impl ChainData {
         let matches = |l: &alloy_primitives::Log| filters.iter().any(|f| f.matches(l));
         let mut blocks = Vec::new();
         let mut count = 0usize;
-        // Per chunk of candidates. For a module's stream (`persist`) with `--history local`, the
-        // matches already stored for this filter set are read from disk; the rest come from
-        // verified receipts, fetched in batches, and their matches (possibly none) are stored, so
-        // the same blocks are never fetched again for these filters. Receipts are dropped once
-        // their matches are extracted: a long scan holds at most one chunk of them in memory.
-        let fp = persist.then(|| filters_fingerprint(filters));
-        let store = self.history.get().filter(|_| fp.is_some());
+        // Per chunk of candidates. For a module's stream (`persist`) with `--history local`, each
+        // block's stored entry answers if its receipts were already checked against every atom of
+        // these filters; otherwise the receipts are fetched once and checked against the union of
+        // what was covered before and these atoms, and the merged entry is stored. So a module's
+        // filters can grow without losing what earlier scans stored. Receipts are dropped once
+        // matched: a long scan holds at most one chunk of them in memory.
+        let store = self.history.get().filter(|_| persist);
+        let atoms = filter_atoms(filters);
+        let want: Vec<u32> = match store {
+            Some(s) => s.atom_ids(&atoms.iter().map(|(h, d, _)| (*h, d.clone())).collect::<Vec<_>>()).map_err(|e| DataError::Unavailable(e.to_string()))?,
+            None => Vec::new(),
+        };
+        // Atom id -> filter, for the unions (loaded as needed).
+        let mut atom_filters: HashMap<u32, Filter> = want.iter().copied().zip(atoms.iter().map(|(_, _, f)| f.clone())).collect();
         // SKIM_SCAN_CHUNK overrides the chunk size (measurement only).
         static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let chunk_size = *CHUNK.get_or_init(|| std::env::var("SKIM_SCAN_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(SCAN_CHUNK));
         for chunk in candidates.chunks(chunk_size) {
             let hashes: Vec<B256> = chunk.iter().map(|(_, bh, _)| *bh).collect();
-            let mut known: HashMap<B256, Vec<crate::history::MatchedLog>> = match (store, &fp) {
-                (Some(s), Some(fp)) => s.get_matched(fp, &hashes).unwrap_or_default(),
-                _ => HashMap::new(),
-            };
-            let mut need: Vec<(u64, B256, Arc<Header>)> = chunk.iter().filter(|(_, bh, _)| !known.contains_key(bh)).cloned().collect();
-            // Blocks another scan with the same filters is fetching: wait for it, then read back.
+            let mut entries: HashMap<B256, crate::history::BlockEntry> = store.map(|s| s.get_block_logs(&hashes).unwrap_or_default()).unwrap_or_default();
+            let covers = |e: &crate::history::BlockEntry| want.iter().all(|w| e.covered.contains(w));
+            let mut need: Vec<(u64, B256, Arc<Header>)> = chunk.iter().filter(|(_, bh, _)| !entries.get(bh).is_some_and(covers)).cloned().collect();
+            // Blocks another scan is fetching: wait for it, then read what it stored.
             let mut mine = InflightGuard { map: &self.inflight, hashes: Vec::new() };
-            if let (Some(s), Some(fp)) = (store, &fp) {
+            if let Some(s) = store {
                 let mut waits = Vec::new();
                 {
                     let mut f = self.inflight.lock();
                     for b in std::mem::take(&mut need) {
-                        let key = keccak256([fp.as_slice(), b.1.as_slice()].concat());
-                        match f.get(&key) {
+                        match f.get(&b.1) {
                             Some(n) => waits.push((b, n.clone())),
                             None => {
                                 // A closed semaphore is the "done" signal: acquiring it then
                                 // returns at once, even for a scan that starts waiting late.
-                                f.insert(key, Arc::new(tokio::sync::Semaphore::new(0)));
+                                f.insert(b.1, Arc::new(tokio::sync::Semaphore::new(0)));
                                 // Owned by the guard from here: released even if this scan is
                                 // cancelled while waiting for others below.
-                                mine.hashes.push(key);
+                                mine.hashes.push(b.1);
                                 need.push(b);
                             }
                         }
@@ -1238,17 +1282,21 @@ impl ChainData {
                 }
                 for (b, n) in waits {
                     let _ = tokio::time::timeout(Duration::from_secs(60), n.acquire()).await;
-                    match s.get_matched(fp, &[b.1]).ok().and_then(|mut m| m.remove(&b.1)) {
-                        Some(l) => {
-                            known.insert(b.1, l);
+                    match s.get_block_logs(&[b.1]).ok().and_then(|mut m| m.remove(&b.1)) {
+                        Some(e) if covers(&e) => {
+                            entries.insert(b.1, e);
+                        }
+                        Some(e) => {
+                            entries.insert(b.1, e);
+                            need.push(b);
                         }
                         None => need.push(b), // that fetch failed: fetch it here
                     }
                 }
             }
             let _done = mine;
-            // Older than any connected peer serves, and not stored: a stream reports these as a
-            // gap; eth_getLogs refuses (what's stored was used above either way).
+            // Older than any connected peer serves, and not covered locally: a stream reports these
+            // as a gap; eth_getLogs refuses (what's stored was used above either way).
             if need.iter().any(|(n, _, _)| *n < peers_from) {
                 if !persist {
                     return Err(DataError::Unavailable(format!("block {} is older than connected peers serve (earliest {peers_from}); receipts before it have expired", need[0].0)));
@@ -1256,24 +1304,47 @@ impl ChainData {
                 expired.extend(need.iter().filter(|(n, _, _)| *n < peers_from).map(|(n, _, _)| *n));
                 need.retain(|(n, _, _)| *n >= peers_from);
             }
+            // What each fetched block is checked against: these atoms plus what it covered before.
+            let mut unions: HashMap<B256, Vec<u32>> = HashMap::new();
+            if let Some(s) = store {
+                let mut extra: Vec<u32> = Vec::new();
+                for (_, bh, _) in &need {
+                    let mut u: Vec<u32> = entries.get(bh).map(|e| e.covered.clone()).unwrap_or_default();
+                    u.extend(&want);
+                    u.sort_unstable();
+                    u.dedup();
+                    extra.extend(u.iter().filter(|id| !atom_filters.contains_key(id)));
+                    unions.insert(*bh, u);
+                }
+                extra.sort_unstable();
+                extra.dedup();
+                for (id, def) in s.atom_defs(&extra).unwrap_or_default() {
+                    if let Some(f) = atom_from_def(&def) {
+                        atom_filters.insert(id, f);
+                    }
+                }
+            }
             let batch = if need.len() > 4 {
                 self.receipts_many(&need.iter().map(|(_, bh, h)| (*bh, h.clone())).collect::<Vec<_>>()).await
             } else {
                 HashMap::new()
             };
-            let batch = &batch;
+            let (batch, unions, atom_filters) = (&batch, &unions, &atom_filters);
             let fetched: Vec<_> = futures::stream::iter(need.iter().cloned())
                 .map(|(n, bh, h)| async move {
                     let r = match batch.get(&bh) {
                         Some(r) => r.clone(),
                         None => self.block_receipts(bh, &h).await?,
                     };
-                    // Matching logs with their positions; the receipts themselves are dropped here.
+                    // Logs matching the union (for storage) or, without a store, the query; the
+                    // receipts themselves are dropped here.
+                    let union: Vec<&Filter> = unions.get(&bh).map(|u| u.iter().filter_map(|id| atom_filters.get(id)).collect()).unwrap_or_default();
+                    let keep = |l: &alloy_primitives::Log| if union.is_empty() { matches(l) } else { union.iter().any(|f| f.matches(l)) };
                     let mut found = Vec::new();
                     let mut li = 0u32;
                     for (ti, rc) in r.iter().enumerate() {
                         for l in &rc.logs {
-                            if matches(l) {
+                            if keep(l) {
                                 found.push((ti as u32, li, l.clone()));
                             }
                             li += 1;
@@ -1292,19 +1363,28 @@ impl ChainData {
                 .await;
             let mut to_store: Vec<B256> = Vec::new();
             for res in fetched {
-                let (bh, l) = res?;
-                known.insert(bh, l);
+                let (bh, logs) = res?;
+                let covered = unions.get(&bh).cloned().unwrap_or_default();
+                entries.insert(bh, crate::history::BlockEntry { covered, logs });
                 to_store.push(bh);
             }
             for (n, bh, h) in chunk {
-                let Some(m) = known.get(bh).filter(|m| !m.is_empty()) else { continue };
-                let logs: Vec<Value> = m.iter().map(|x| Self::log_json(&x.log, *bh, *n, h.timestamp, x.tx_hash, x.tx_index, x.log_index as u64)).collect();
+                let Some(e) = entries.get(bh) else { continue };
+                let logs: Vec<Value> = e
+                    .logs
+                    .iter()
+                    .filter(|x| matches(&x.log))
+                    .map(|x| Self::log_json(&x.log, *bh, *n, h.timestamp, x.tx_hash, x.tx_index, x.log_index as u64))
+                    .collect();
+                if logs.is_empty() {
+                    continue;
+                }
                 count += logs.len();
                 blocks.push(ScanBlock { number: *n, hash: *bh, parent_hash: h.parent_hash, timestamp: h.timestamp, logs });
             }
-            if let (Some(s), Some(fp)) = (store, &fp) {
-                let entries: Vec<(B256, &[crate::history::MatchedLog])> = to_store.iter().filter_map(|h| known.get(h).map(|l| (*h, l.as_slice()))).collect();
-                if let Err(e) = s.put_matched(fp, &entries) {
+            if let Some(s) = store {
+                let stored: Vec<(B256, &crate::history::BlockEntry)> = to_store.iter().filter_map(|h| entries.get(h).map(|e| (*h, e))).collect();
+                if let Err(e) = s.put_block_logs(&stored) {
                     tracing::warn!("{e}");
                 }
             }

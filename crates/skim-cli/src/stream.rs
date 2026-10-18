@@ -102,6 +102,16 @@ pub async fn next(
             }
         })
     };
+    // Make the headers the check needs available first: after a skim restart, the blocks between
+    // what's on disk and the new in-memory window must be walked back before any hash can be
+    // compared. A hash skim still can't establish is a retry, never "not on the chain".
+    if let Some(c) = req.cursor {
+        let lowest = req.recent.iter().map(|b| b.number).chain([c.number]).min().unwrap_or(c.number);
+        chain.ensure_headers(lowest).await?;
+        if chain.canonical_hash(c.number).is_none() {
+            return Err(DataError::Unavailable(format!("block {} isn't known to skim yet; retry", c.number)));
+        }
+    }
     let (mut pos, mut anchor) = locate(&mut events)?;
 
     // Before the fork (or, head-only, below the in-memory window) skim has no headers at all:
@@ -231,6 +241,14 @@ mod tests {
             receipts_root: B256::repeat_byte(1), // not empty: receipts come from the seeded cache
             timestamp: n * 12,
             extra_data: vec![tag].into(),
+            // A post-fork header (the history store only keeps those).
+            base_fee_per_gas: Some(7),
+            withdrawals_root: Some(B256::ZERO),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(B256::ZERO),
+            requests_hash: Some(B256::ZERO),
+            block_access_list_hash: Some(B256::ZERO),
             ..Default::default()
         };
         let receipts = vec![Receipt { success: true, cumulative_gas_used: 21_000, logs: vec![log], ..Default::default() }];
@@ -348,8 +366,7 @@ mod tests {
         cd.set_history(crate::history::HeaderStore::open(dir.path().join("h.redb")).unwrap());
         let h = extend(&cd, 100, 101, B256::repeat_byte(0x99), 0xa);
         let filters = vec![Filter::new().address(EMITTER)];
-        let fp = crate::chaindata::filters_fingerprint(&filters);
-        let key = |b: B256| alloy_primitives::keccak256([fp.as_slice(), b.as_slice()].concat());
+        let key = |b: B256| b;
         cd.inflight.lock().insert(key(h[0]), Arc::new(tokio::sync::Semaphore::new(0))); // "another scan" holds X
         let cd2 = cd.clone();
         let task = tokio::spawn(async move { cd2.scan(&filters, 100, 101, None, true).await.map(|_| ()) });
@@ -359,6 +376,50 @@ mod tests {
         let _ = task.await;
         assert!(!cd.inflight.lock().contains_key(&key(h[1])), "Y's reservation outlived the cancelled scan");
         assert!(cd.inflight.lock().contains_key(&key(h[0])), "X still belongs to the other scan");
+    }
+
+    #[tokio::test]
+    async fn after_a_skim_restart_an_unknown_cursor_is_a_retry_not_a_rewind() {
+        // Found in deployment: the previous run stored headers up to A110; skim restarted and its
+        // in-memory headers start at A113, so 111-112 are on neither. The module's cursor (A110)
+        // can't be compared until they're walked: a retry, never "not on the chain". Once they
+        // are there, the module continues without a rewind.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.redb");
+        let mut all = Vec::new();
+        let mut parent = B256::repeat_byte(0x99);
+        for n in 100..=120 {
+            let (h, receipts, tx) = block(n, parent, 0xa);
+            parent = h.hash_slow();
+            all.push((h, receipts, tx));
+        }
+        {
+            let cd = ChainData::offline(2048);
+            cd.set_history(crate::history::HeaderStore::open(&path).unwrap());
+            for (h, _, _) in &all[..=10] {
+                cd.note_header(h); // 100..=110 written as tips
+            }
+        }
+        let cd = ChainData::offline(2048);
+        cd.set_history(crate::history::HeaderStore::open(&path).unwrap());
+        for (h, receipts, tx) in &all[13..] {
+            cd.note_header(h);
+            cd.note_receipts(h.number, h.hash_slow(), receipts.clone(), vec![*tx]);
+        }
+        let hash = |n: u64| all[(n - 100) as usize].0.hash_slow();
+        let req_at_110 = || req(Some(id(110, hash(110))), vec![id(109, hash(109))], None);
+        let r = next(&cd, || Some(120), tokio::sync::broadcast::channel(1).1, None, req_at_110()).await;
+        let e = format!("{:?}", r.expect_err("111-112 can't be walked offline"));
+        assert!(!e.contains("not on the chain"), "{e}");
+        // Peers serve 111-112 (here: written straight to the store).
+        let run: Vec<(B256, &Header)> = all[11..13].iter().map(|(h, _, _)| (h.hash_slow(), h)).collect();
+        cd.history_store().unwrap().put_run(&run).unwrap();
+        for (h, receipts, tx) in &all[11..13] {
+            cd.note_receipts(h.number, h.hash_slow(), receipts.clone(), vec![*tx]);
+        }
+        let r = next(&cd, || Some(120), tokio::sync::broadcast::channel(1).1, None, req_at_110()).await.unwrap();
+        assert!(r["events"].as_array().unwrap().iter().all(|e| e["type"] != "rewind"), "{r}");
+        assert_eq!(applied(&r).first().map(|x| x.0), Some(111), "{r}");
     }
 
     #[tokio::test]
