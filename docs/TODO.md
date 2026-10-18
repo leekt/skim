@@ -23,8 +23,3 @@ Items are removed from this file when they're done, and the commit that closes o
     and `skim_status.peer_requests`: headers, bodies, receipts, block access lists, SNAP account /
     storage / code). Done when request coalescing and completion-order fetching each have a
     measured before/after on a fixed workload.
-
-## smallname
-16. **Unsupported routes:** permissions by `registration_id`, resolver `links` / `roles`,
-    diagnostics, Basenames (another chain). (Permissions by `name` work since `TokenResource` is
-    indexed; existing indexes need a re-index for older resource ids.)

@@ -525,6 +525,31 @@ export function serve(store, { skim, port, host }) {
     };
   }
 
+  /**
+   * GET /v1/resolvers/{chain}/{address}/links: an ENSv2 record-id resolver's links (`Linked`):
+   * which record id each node uses, the latest per node.
+   */
+  function resolverLinks(q, a, cursor) {
+    const size = pageSize(q);
+    const scope = `links:${a}`;
+    const after = cursor ? dec(cursor, scope).k : "";
+    const rows = store.all(
+      `WITH l AS (SELECT node, record_id, block, row_number() OVER (PARTITION BY node ORDER BY block DESC, log_index DESC) AS rn FROM v2_links WHERE resolver = ?)
+       SELECT node, record_id, block FROM l WHERE rn = 1 AND node > ? ORDER BY node LIMIT ?`, a, after, size + 1);
+    const more = rows.length > size;
+    const data = rows.slice(0, size).map((r) => ({
+      node: r.node, name: nameOf(r.node), record_id: BigInt("0x" + r.record_id).toString(), updated_block: r.block,
+    }));
+    return { data, page: page(cursor, more ? enc({ s: scope, k: rows[size - 1].node }) : null, size), meta: { index: indexMeta(null), ...partialMeta() } };
+  }
+
+  /** GET /v1/resolvers/{chain}/{address}/roles: EAC role grants on this resolver (latest per resource and account). */
+  function resolverRoles(q, a, cursor) {
+    const u = new URLSearchParams(q);
+    u.set("contract_address", a);
+    return permissions(u, cursor);
+  }
+
   /** GET /v1/resolvers/{chain}/{address}/records?name=: what this resolver holds for a name. */
   async function resolverNameRecords(rd, q, a) {
     if (!q.get("name")) throw bad("name is required");
@@ -682,7 +707,9 @@ export function serve(store, { skim, port, host }) {
     if ((m = p.match(/^\/v1\/registries\/([^/]+)\/([^/]+)$/))) return registryOverview(await Reader.atHead(skim), parseContract(m[1], m[2]));
     if ((m = p.match(/^\/v1\/registries\/([^/]+)\/([^/]+)\/labels$/))) return registryLabels(await Reader.atHead(skim), q, parseContract(m[1], m[2]), cursor);
     if (p === "/v1/permissions") return permissions(q, cursor);
-    if (/^\/v1\/(resolvers\/[^/]+\/[^/]+\/(links|roles)|diagnostics)/.test(p)) throw unsupported("not implemented by smallname", "not_supported_by_smallname");
+    if ((m = p.match(/^\/v1\/resolvers\/([^/]+)\/([^/]+)\/links$/))) return resolverLinks(q, parseContract(m[1], m[2]), cursor);
+    if ((m = p.match(/^\/v1\/resolvers\/([^/]+)\/([^/]+)\/roles$/))) return resolverRoles(q, parseContract(m[1], m[2]), cursor);
+    if (/^\/v1\/diagnostics/.test(p)) throw unsupported("diagnostics are bigname's internals; smallname has none", "not_supported_by_smallname");
     throw new ApiError(404, "not_found", `no route ${p}`);
   }
 

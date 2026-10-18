@@ -84,15 +84,16 @@ A name created before the index starts still resolves and has a full profile; th
 | `GET /v1/resolvers/{chain_id}/{address}/records?name=` (`keys`) | live, direct calls to that resolver (not the Universal Resolver); known keys from the index |
 | `GET /v1/registries/{chain_id}/{address}` | an ENSv2 registry's place in the tree (`confirmed`, `mounted` or `unmounted`) and label count: index |
 | `GET /v1/registries/{chain_id}/{address}/labels` (`owner`, `exclude_owner`) | index → live (`getState`, `ownerOf`) |
-| `GET /v1/permissions` (`address`, `registry=chain:addr`, `contract_address`) | index: the latest `EACRolesChanged` bitmap per (contract, resource, account); revoked grants (zero) left out |
+| `GET /v1/resolvers/{chain_id}/{address}/links` | index: an ENSv2 record-id resolver's `Linked` record per node (latest) |
+| `GET /v1/resolvers/{chain_id}/{address}/roles` | index: EAC role grants on that resolver (as `/v1/permissions`) |
+| `GET /v1/permissions` (`name`, `address`, `registry=chain:addr`, `contract_address`) | index: the latest `EACRolesChanged` bitmap per (contract, resource, account); revoked grants (zero) left out. By `name`: the resource ids its registry tokens were assigned (`TokenResource`) |
 | `GET /v1/status`, `GET /v1/namespaces/ens` | index position, finalized block, skim head |
 
 - **Response shapes:** these follow bigname's: `{data, page, meta}`, opaque cursors, Unix-second strings, `{error: {code, message, details}}`.
-- **Not implemented** (`422 unsupported`):
-  - permissions anchored by `name` or `registration_id` (ENSv2 resource ids come from `TokenResource`, which isn't indexed)
-  - resolver `links` and `roles` views
-  - diagnostics
-  - Basenames (`*.base.eth`, another chain)
+- **Out of scope** (`422 unsupported`, on purpose):
+  - `registration_id` anchors: smallname has no registration-identity model (bigname mints one per anchor change); names are its identity
+  - diagnostics: bigname's views of its own pipeline (coverage, manifests); smallname has no such pipeline
+  - Basenames (`*.base.eth`): another chain, which skim doesn't follow
 - **Simplified shapes:** permission rows are `{contract, resource, account, roles, updated_block, updated_at}`, without bigname's lineage and effective-grant expansion.
 - **Migration history:** `is_migrated` and `migrated_at` are set on ENSv2 names, from a completed ENSv1 → ENSv2 migration: the ENSv1 token sent to the Graveyard and the ENSv2 registration in the same transaction, as bigname defines it. `registered_at` skips the migration's registration, so it keeps meaning the original registration (null when that predates the index).
 - **Primary names:** answered `verified` only. The `indexed` answer is `unsupported`, because smallname doesn't keep a stored claim.
