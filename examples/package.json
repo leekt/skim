@@ -9,7 +9,8 @@
     "send": "node send-transaction/send.mjs",
     "ws": "node websocket/watch.mjs",
     "ens": "node bigname/ens.mjs",
-    "smallname": "node --experimental-sqlite --no-warnings smallname/smallname.mjs"
+    "smallname": "node --experimental-sqlite --no-warnings smallname/smallname.mjs",
+    "smallname-test": "node --experimental-sqlite --no-warnings smallname/test.mjs"
   },
   "dependencies": {
     "viem": "2.57.1"

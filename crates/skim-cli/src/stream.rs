@@ -80,31 +80,39 @@ pub async fn next(
     let mut events = Vec::new();
     let Some(mut tip) = head() else { return Err(DataError::Unavailable("not following the chain yet".into())) };
 
-    // Where the module is, and whether that's still on the chain.
-    let mut pos: u64 = match req.cursor {
-        None => req.from_block.unwrap_or(tip).saturating_sub(1),
-        Some(c) if chain.canonical_hash(c.number) == Some(c.hash) => c.number,
-        Some(c) => {
-            let ancestor = req.recent.iter().filter(|b| b.number < c.number).find(|b| chain.canonical_hash(b.number) == Some(b.hash));
-            let Some(a) = ancestor else {
-                return Err(DataError::Unavailable(format!(
-                    "cursor {} ({}) is not on the chain and none of the {} recent blocks is: send more of them, or reset the module",
-                    c.number,
-                    c.hash,
-                    req.recent.len()
-                )));
-            };
-            events.push(json!({"type": "rewind", "to": {"number": a.number, "hash": a.hash}}));
-            a.number
-        }
+    // Where the module is (`pos`) and the hash it applied there (`anchor`), checked against the
+    // chain: a cursor that isn't canonical any more rewinds to the newest canonical `recent` block.
+    let start_tip = tip;
+    let locate = |events: &mut Vec<Value>| -> Result<(u64, Option<B256>), DataError> {
+        Ok(match req.cursor {
+            None => (req.from_block.unwrap_or(start_tip).saturating_sub(1), None),
+            Some(c) if chain.canonical_hash(c.number) == Some(c.hash) => (c.number, Some(c.hash)),
+            Some(c) => {
+                let ancestor = req.recent.iter().filter(|b| b.number < c.number).find(|b| chain.canonical_hash(b.number) == Some(b.hash));
+                let Some(a) = ancestor else {
+                    return Err(DataError::Unavailable(format!(
+                        "cursor {} ({}) is not on the chain and none of the {} recent blocks is: send more of them, or reset the module",
+                        c.number,
+                        c.hash,
+                        req.recent.len()
+                    )));
+                };
+                events.push(json!({"type": "rewind", "to": {"number": a.number, "hash": a.hash}}));
+                (a.number, Some(a.hash))
+            }
+        })
     };
+    let (mut pos, mut anchor) = locate(&mut events)?;
 
-    // Blocks skim can't serve logs for: say so, then continue after them.
+    // Before the fork (or, head-only, below the in-memory window) skim has no headers at all:
+    // a gap, then continue after it. Blocks within that range whose receipts peers have expired
+    // are handled per block by the scan (stored matches are still served).
     let history = chain.history_json();
-    let logs_from = history["logs_from"].as_u64().unwrap_or(0).max(history["fork_floor"].as_u64().unwrap_or(0));
+    let logs_from = history["fork_floor"].as_u64().or_else(|| (history["mode"] == "off").then(|| history["memory_headers_from"].as_u64()).flatten()).unwrap_or(0);
     if pos + 1 < logs_from {
-        events.push(json!({"type": "gap", "from": pos + 1, "to": logs_from - 1, "reason": "logs not available (before the fork, or expired on every connected peer)"}));
+        events.push(json!({"type": "gap", "from": pos + 1, "to": logs_from - 1, "reason": "no headers: before the fork, or outside the in-memory window with --history off"}));
         pos = logs_from - 1;
+        anchor = chain.canonical_hash(pos);
     }
 
     // At the head: wait for the next block (woken by the new-head notification, not polling).
@@ -119,13 +127,30 @@ pub async fn next(
             }
             tip = head().unwrap_or(tip);
         }
+        // The chain may have reorganized while waiting, possibly at the same height: re-check the
+        // module's position before answering, and rewind if it isn't canonical any more.
+        if anchor.is_some_and(|h| chain.canonical_hash(pos) != Some(h)) {
+            if events.is_empty() && req.cursor.is_some_and(|c| c.number == pos) {
+                (pos, anchor) = locate(&mut events)?;
+            } else {
+                return Err(DataError::Unavailable("the chain reorganized during the request; retry".into()));
+            }
+        }
     }
-    // The new position: the last block scanned, else where the rewind/gap left the module.
+    // The new position: the last block scanned. With nothing to scan, the module's own position
+    // (never another block's hash at that height).
     let cursor = if pos < tip {
         let to = tip.min(pos + req.max_blocks.unwrap_or(chain.max_log_range).clamp(1, chain.max_log_range));
         let scan = if req.filters.is_empty() { None } else { Some(chain.scan(&req.filters, pos + 1, to, None, true).await?) };
         let bal = if bal_addresses.is_empty() { Vec::new() } else { chain.bal_changes(&bal_addresses, pos + 1, to).await? };
-        // One `apply` per block with logs, state changes, or both, in block order.
+        // The range must continue the module's position, by hash.
+        if let (Some(a), Some(sc)) = (anchor, &scan)
+            && sc.first_parent != a
+        {
+            return Err(DataError::Unavailable("the chain reorganized during the request; retry".into()));
+        }
+        // One `apply` per block with logs, state changes, or both, in block order; candidate
+        // blocks whose receipts expired on every peer (and aren't stored) as gaps between them.
         let mut by_block: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
         if let Some(scan) = &scan {
             for b in &scan.blocks {
@@ -135,6 +160,22 @@ pub async fn next(
                     "logs": b.logs,
                 }));
             }
+            let mut run: Option<(u64, u64)> = None;
+            let flush = |run: &mut Option<(u64, u64)>, by_block: &mut std::collections::BTreeMap<u64, Value>| {
+                if let Some((a, b)) = run.take() {
+                    by_block.insert(a, json!({"type": "gap", "from": a, "to": b, "reason": "receipts expired on every connected peer and not stored locally"}));
+                }
+            };
+            for &n in &scan.expired {
+                match run {
+                    Some((a, b)) if by_block.range(b + 1..n).next().is_none() => run = Some((a, n)),
+                    _ => {
+                        flush(&mut run, &mut by_block);
+                        run = Some((n, n));
+                    }
+                }
+            }
+            flush(&mut run, &mut by_block);
         }
         for (n, bh, h, changes) in bal {
             let e = by_block.entry(n).or_insert_with(|| json!({
@@ -152,7 +193,7 @@ pub async fn next(
         pos = last.0;
         Some(json!({"number": last.0, "hash": last.1}))
     } else {
-        chain.canonical_hash(pos).map(|h| json!({"number": pos, "hash": h}))
+        anchor.map(|h| json!({"number": pos, "hash": h})).or_else(|| chain.canonical_hash(pos).map(|h| json!({"number": pos, "hash": h})))
     };
     Ok(json!({
         "events": events,
@@ -170,6 +211,7 @@ pub async fn next(
 mod tests {
     use super::*;
     use crate::chaindata::ChainData;
+    use std::sync::Arc;
     use alloy_consensus::Header;
     use alloy_primitives::{Address, Bloom, Bytes, Log};
     use skim_el::Receipt;
@@ -231,6 +273,92 @@ mod tests {
                 (n, h, tags.collect())
             })
             .collect()
+    }
+
+    fn head_ref(n: u64, hash: B256) -> skim_state::BlockRef {
+        skim_state::BlockRef { number: n, hash, parent_hash: B256::ZERO, state_root: B256::ZERO, timestamp: n * 12 }
+    }
+
+    #[tokio::test]
+    async fn a_reorg_at_the_same_height_during_a_head_wait_rewinds_instead_of_moving_the_cursor() {
+        // Review: cursor A105 at the head, waiting; A105 is replaced by B105 (same height).
+        // The answer must rewind (to A104, still canonical) and deliver B105, never just hand back
+        // B105 as the cursor with nothing undone.
+        let cd = ChainData::offline(2048);
+        let a = extend(&cd, 100, 105, B256::repeat_byte(0x99), 0xa);
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        let tip = Arc::new(std::sync::atomic::AtomicU64::new(105));
+        let (cd2, tip2) = (cd.clone(), tip.clone());
+        let mut r = req(Some(id(105, a[5])), vec![id(104, a[4]), id(103, a[3])], None);
+        r.wait_ms = Some(3000);
+        let task = tokio::spawn(async move { next(&cd2, move || Some(tip2.load(std::sync::atomic::Ordering::SeqCst)), rx, None, r).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let b = extend(&cd, 105, 105, a[4], 0xb);
+        tx.send(crate::rpc::WsEvent::NewHead(head_ref(105, b[0]))).unwrap();
+        let r = task.await.unwrap().unwrap();
+        let ev = r["events"].as_array().unwrap();
+        assert_eq!(ev[0]["type"], "rewind", "{r}");
+        assert_eq!(ev[0]["to"]["number"], 104);
+        assert!(applied(&r).iter().all(|(_, h, t)| *h == b[0] && t == &vec![0xb]), "{r}");
+        assert_eq!(r["cursor"]["hash"].as_str().unwrap().parse::<B256>().unwrap(), b[0]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_answer_keeps_the_modules_own_cursor() {
+        // Nothing new within the wait: the cursor comes back as the module sent it.
+        let cd = ChainData::offline(2048);
+        let a = extend(&cd, 100, 105, B256::repeat_byte(0x99), 0xa);
+        let mut r = req(Some(id(105, a[5])), vec![], None);
+        r.wait_ms = Some(50);
+        let r = next(&cd, || Some(105), tokio::sync::broadcast::channel(1).1, None, r).await.unwrap();
+        assert!(r["events"].as_array().unwrap().is_empty());
+        assert_eq!(r["cursor"]["hash"].as_str().unwrap().parse::<B256>().unwrap(), a[5]);
+    }
+
+    #[tokio::test]
+    async fn stored_matches_are_served_after_peers_expire_them() {
+        // Review: block 120's matches are on disk; every peer's earliest becomes 200. A stream
+        // still gets 120 (no network, no gap). Without the store, the same block is a gap.
+        let dir = tempfile::tempdir().unwrap();
+        let cd = ChainData::offline(2048);
+        cd.set_history(crate::history::HeaderStore::open(dir.path().join("h.redb")).unwrap());
+        extend(&cd, 118, 122, B256::repeat_byte(0x99), 0xa);
+        let first = next(&cd, || Some(122), tokio::sync::broadcast::channel(1).1, None, req(None, vec![], Some(118))).await.unwrap();
+        assert_eq!(applied(&first).len(), 5);
+        *cd.test_peers_from.lock() = Some(200);
+        let again = next(&cd, || Some(122), tokio::sync::broadcast::channel(1).1, None, req(None, vec![], Some(118))).await.unwrap();
+        assert_eq!(applied(&again).len(), 5, "{again}");
+        assert!(again["events"].as_array().unwrap().iter().all(|e| e["type"] != "gap"), "{again}");
+
+        let bare = ChainData::offline(2048);
+        extend(&bare, 118, 122, B256::repeat_byte(0x99), 0xa);
+        *bare.test_peers_from.lock() = Some(200);
+        let r = next(&bare, || Some(122), tokio::sync::broadcast::channel(1).1, None, req(None, vec![], Some(118))).await.unwrap();
+        assert!(applied(&r).is_empty());
+        let gaps: Vec<_> = r["events"].as_array().unwrap().iter().filter(|e| e["type"] == "gap").collect();
+        assert_eq!((gaps.len(), gaps[0]["from"].as_u64(), gaps[0]["to"].as_u64()), (1, Some(118), Some(122)), "{r}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scan_cancelled_while_waiting_releases_its_own_reservations() {
+        // Review: another scan holds X; scan B wants X and Y, reserves Y, waits for X, and is
+        // cancelled. Y's reservation must not outlive it.
+        let dir = tempfile::tempdir().unwrap();
+        let cd = ChainData::offline(2048);
+        cd.set_history(crate::history::HeaderStore::open(dir.path().join("h.redb")).unwrap());
+        let h = extend(&cd, 100, 101, B256::repeat_byte(0x99), 0xa);
+        let filters = vec![Filter::new().address(EMITTER)];
+        let fp = crate::chaindata::filters_fingerprint(&filters);
+        let key = |b: B256| alloy_primitives::keccak256([fp.as_slice(), b.as_slice()].concat());
+        cd.inflight.lock().insert(key(h[0]), Arc::new(tokio::sync::Semaphore::new(0))); // "another scan" holds X
+        let cd2 = cd.clone();
+        let task = tokio::spawn(async move { cd2.scan(&filters, 100, 101, None, true).await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(cd.inflight.lock().contains_key(&key(h[1])), "B reserved Y while waiting for X");
+        task.abort();
+        let _ = task.await;
+        assert!(!cd.inflight.lock().contains_key(&key(h[1])), "Y's reservation outlived the cancelled scan");
+        assert!(cd.inflight.lock().contains_key(&key(h[0])), "X still belongs to the other scan");
     }
 
     #[tokio::test]

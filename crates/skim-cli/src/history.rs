@@ -240,13 +240,18 @@ impl HeaderStore {
         if blocks.is_empty() {
             return Ok(());
         }
+        // Encode and compress first; the write transaction only stores finished bytes.
+        let mut values = Vec::with_capacity(blocks.len());
+        for (h, logs) in blocks {
+            let raw = encode_matched(logs);
+            let v = if raw.len() > 256 { [&[1u8][..], &zstd::bulk::compress(&raw, 3).map_err(|e| StoreError(e.to_string()))?].concat() } else { [&[0u8][..], &raw].concat() };
+            values.push((matched_key(filters, h), v));
+        }
         let tx = self.db.begin_write()?;
         {
             let mut t = tx.open_table(MATCHED)?;
-            for (h, logs) in blocks {
-                let raw = encode_matched(logs);
-                let v = if raw.len() > 256 { [&[1u8][..], &zstd::bulk::compress(&raw, 3).map_err(|e| StoreError(e.to_string()))?].concat() } else { [&[0u8][..], &raw].concat() };
-                t.insert(&matched_key(filters, h), v.as_slice())?;
+            for (k, v) in &values {
+                t.insert(k, v.as_slice())?;
             }
         }
         tx.commit()?;

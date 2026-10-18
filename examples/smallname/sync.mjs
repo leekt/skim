@@ -100,7 +100,6 @@ export async function follow(store, url, { fromBlock, log = console.log, signal 
       const cursorHash = store.meta("indexed_hash");
       const cursor = cursorNumber && cursorHash ? { number: Number(cursorNumber), hash: cursorHash } : null;
       const recent = store.all("SELECT number, hash FROM blocks ORDER BY number DESC LIMIT 128");
-      const first = !cursorNumber;
       const start = cursor ? undefined : Number(store.meta("next_from") || Math.max(fromBlock ?? 0, AMSTERDAM_BLOCK));
       const before = discovered(store).length;
       const r = await rpc(url, "skim_streamNext", [{
@@ -112,40 +111,7 @@ export async function follow(store, url, { fromBlock, log = console.log, signal 
         maxBlocks: 2048,
         waitMs: 10_000,
       }], { timeout: 900_000 });
-      let applied = 0;
-      store.tx(() => {
-        for (const e of r.events) {
-          if (e.type === "rewind") {
-            log(`reorg: rewinding to ${e.to.number}`);
-            store.rollback(e.to.number);
-            store.meta("indexed_hash", e.to.hash);
-          } else if (e.type === "gap") {
-            log(`gap ${e.from}..${e.to}: ${e.reason}`);
-            if (first) store.meta("started_at_block", e.to + 1); // history starts after it
-            else store.meta("gaps", JSON.stringify([...JSON.parse(store.meta("gaps") || "[]"), [e.from, e.to]])); // a hole
-          } else if (e.type === "apply") {
-            const b = e.block;
-            const ts = Number(b.timestamp);
-            applied += applyAll(store, ingest, e.logs.map(parseLog), () => ts);
-            store.run("INSERT OR REPLACE INTO blocks (number, hash, parent, ts) VALUES (?, ?, ?, ?)", b.number, b.hash, b.parentHash, ts);
-          }
-        }
-        if (first && !store.meta("started_at_block")) store.meta("started_at_block", start);
-        // New ENSv2 contracts were announced in this batch: re-read it with them in the filter
-        // (keep the old cursor; re-applying is idempotent).
-        if (discovered(store).length > before) {
-          if (!cursor) store.meta("next_from", start); // first batch: from the start again
-          return;
-        }
-        if (r.cursor) {
-          store.run("INSERT OR REPLACE INTO blocks (number, hash, parent, ts) VALUES (?, ?, NULL, NULL)", r.cursor.number, r.cursor.hash);
-          store.meta("indexed_block", r.cursor.number);
-          store.meta("indexed_hash", r.cursor.hash);
-          store.meta("next_from", "");
-        } else {
-          store.meta("next_from", r.nextFrom);
-        }
-      });
+      const applied = applyResponse(store, ingest, r, { cursor, start, before, log });
       if (applied || r.events.length) log(`${r.cursor?.number ?? r.nextFrom - 1}: ${applied} ENS events (head ${r.head}${r.finalized ? `, finalized ${r.finalized.number}` : ""})`);
       if (r.finalized) store.meta("finalized_block", r.finalized.number);
       const fin = store.meta("finalized_block");
@@ -155,6 +121,51 @@ export async function follow(store, url, { fromBlock, log = console.log, signal 
       await sleep(5000);
     }
   }
+}
+
+/**
+ * Applies one stream response in a single SQLite transaction: rewinds, gaps, the blocks' events
+ * and the new cursor commit together or not at all. Returns how many ENS events were indexed.
+ */
+export function applyResponse(store, ingest, r, { cursor, start, before = discovered(store).length, log = () => {} }) {
+  const first = !cursor;
+  let applied = 0;
+  store.tx(() => {
+    for (const e of r.events) {
+      if (e.type === "rewind") {
+        log(`reorg: rewinding to ${e.to.number}`);
+        // Same transaction as the rest of this response: the rewind, the new fork's events
+        // and the cursor commit together, or not at all.
+        store.rollbackInTx(e.to.number);
+        store.meta("indexed_hash", e.to.hash);
+      } else if (e.type === "gap") {
+        log(`gap ${e.from}..${e.to}: ${e.reason}`);
+        if (first) store.meta("started_at_block", e.to + 1); // history starts after it
+        else store.meta("gaps", JSON.stringify([...JSON.parse(store.meta("gaps") || "[]"), [e.from, e.to]])); // a hole
+      } else if (e.type === "apply") {
+        const b = e.block;
+        const ts = Number(b.timestamp);
+        applied += applyAll(store, ingest, e.logs.map(parseLog), () => ts);
+        store.run("INSERT OR REPLACE INTO blocks (number, hash, parent, ts) VALUES (?, ?, ?, ?)", b.number, b.hash, b.parentHash, ts);
+      }
+    }
+    if (first && !store.meta("started_at_block")) store.meta("started_at_block", start);
+    // New ENSv2 contracts were announced in this batch: re-read it with them in the filter
+    // (keep the old cursor; re-applying is idempotent).
+    if (discovered(store).length > before) {
+      if (!cursor) store.meta("next_from", start); // first batch: from the start again
+      return;
+    }
+    if (r.cursor) {
+      store.run("INSERT OR REPLACE INTO blocks (number, hash, parent, ts) VALUES (?, ?, NULL, NULL)", r.cursor.number, r.cursor.hash);
+      store.meta("indexed_block", r.cursor.number);
+      store.meta("indexed_hash", r.cursor.hash);
+      store.meta("next_from", "");
+    } else {
+      store.meta("next_from", r.nextFrom);
+    }
+  });
+  return applied;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

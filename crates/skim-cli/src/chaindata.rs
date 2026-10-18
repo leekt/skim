@@ -144,12 +144,15 @@ pub struct ChainData {
     history: std::sync::OnceLock<crate::history::HeaderStore>,
     /// Blocks whose receipts a scan is fetching right now: concurrent scans of the same blocks
     /// (several modules, or eth_getLogs) wait for that fetch and read the stored result.
-    inflight: Mutex<HashMap<B256, Arc<tokio::sync::Semaphore>>>,
+    pub(crate) inflight: Mutex<HashMap<B256, Arc<tokio::sync::Semaphore>>>,
+    /// Tests: what connected peers report as the oldest block they serve.
+    #[cfg(test)]
+    pub test_peers_from: Mutex<Option<u64>>,
 }
 
 /// A filter set's identity for stored matches: the same filters (in any order) give the same
 /// fingerprint.
-fn filters_fingerprint(filters: &[Filter]) -> B256 {
+pub(crate) fn filters_fingerprint(filters: &[Filter]) -> B256 {
     let mut parts: Vec<String> = filters
         .iter()
         .map(|f| {
@@ -175,10 +178,21 @@ fn filters_fingerprint(filters: &[Filter]) -> B256 {
 /// runtime, a bounded number at a time, so a long scan's verification can't starve request
 /// handling or the block follower.
 async fn cpu<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    static POOL: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    let pool = POOL.get_or_init(|| tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(2, |n| n.get()).max(1)));
-    let _permit = pool.acquire().await.expect("never closed");
-    tokio::task::spawn_blocking(f).await.expect("verification task panicked")
+    static POOL: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(2, |n| n.get()).max(1))));
+    cpu_on(pool, f).await
+}
+
+async fn cpu_on<T: Send + 'static>(pool: &Arc<tokio::sync::Semaphore>, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let permit = pool.clone().acquire_owned().await.expect("never closed");
+    // The permit lives in the blocking task: if this future is dropped, the work already started
+    // keeps its slot until it finishes, so the cap holds under cancellation.
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .expect("verification task panicked")
 }
 
 /// Receipts checked against the header's `receipts_root` (off the async runtime).
@@ -217,10 +231,14 @@ pub struct ScanBlock {
     pub logs: Vec<Value>,
 }
 
-/// A log scan: the blocks with matches, and the last block scanned `(number, hash)`.
+/// A log scan: the blocks with matches, the last block scanned `(number, hash)`, the parent hash
+/// of the first block scanned (so a caller can check the range continues its own position), and
+/// candidate blocks whose receipts are no longer served by any peer and aren't stored locally.
 pub struct Scan {
     pub blocks: Vec<ScanBlock>,
     pub last: (u64, B256),
+    pub first_parent: B256,
+    pub expired: Vec<u64>,
 }
 
 fn tx_hashes(raw: &[Bytes]) -> Vec<B256> {
@@ -260,6 +278,8 @@ impl ChainData {
             rr: AtomicUsize::new(0),
             history: Default::default(),
             inflight: Default::default(),
+            #[cfg(test)]
+            test_peers_from: Default::default(),
         });
         let me = Arc::downgrade(&cd);
         tokio::spawn(async move {
@@ -455,6 +475,10 @@ impl ChainData {
     /// The oldest block any connected peer serves receipts for (eth/69 `earliest_block`), and how
     /// many peers reported one. Older receipts come only from what skim already holds.
     pub fn peers_serve_from(&self) -> (Option<u64>, usize) {
+        #[cfg(test)]
+        if let Some(p) = *self.test_peers_from.lock() {
+            return (Some(p), 1);
+        }
         let e: Vec<u64> = self
             .net
             .as_ref()
@@ -1098,14 +1122,12 @@ impl ChainData {
     /// `eth_getLogs` and block streams.
     pub async fn scan(&self, filters: &[Filter], from: u64, to: u64, at: Option<B256>, persist: bool) -> Result<Scan, DataError> {
         self.ensure_headers(from).await?;
-        // Receipts older than every connected peer serves (history expiry) can't be fetched;
-        // say so instead of asking each peer for blocks it has dropped.
-        if let (Some(p), n) = self.peers_serve_from()
-            && n > 0
-            && from < p
-        {
-            return Err(DataError::Unavailable(format!("block {from} is older than connected peers serve (earliest {p}); receipts before it have expired")));
-        }
+        // Receipts older than every connected peer serves (history expiry): checked per block
+        // below, after what's stored locally is taken from disk.
+        let peers_from = match self.peers_serve_from() {
+            (Some(p), n) if n > 0 => p,
+            _ => 0,
+        };
         // Below the in-memory window, headers come from the post-fork store: only those hash-linked
         // to the oldest in-memory (canonical) header, read in one transaction.
         let disk: HashMap<u64, (B256, Arc<Header>)> = {
@@ -1121,11 +1143,12 @@ impl ChainData {
                 _ => HashMap::new(),
             }
         };
-        let (candidates, scanned, last) = {
+        let (candidates, scanned, last, first_parent) = {
             let g = self.inner.read();
             let mut c = Vec::new();
             let mut scanned = 0u64;
             let mut last = None;
+            let mut first_parent = None;
             let mut prev: Option<B256> = None;
             for n in from..=to {
                 let Some((bh, h)) = g.headers.get(&n).cloned().or_else(|| disk.get(&n).cloned()) else {
@@ -1140,6 +1163,7 @@ impl ChainData {
                 }
                 prev = Some(bh);
                 last = Some((n, bh));
+                first_parent.get_or_insert(h.parent_hash);
                 scanned += 1;
                 let touched = g.touched.get(&n).filter(|(th, _)| *th == bh).map(|(_, t)| t.clone());
                 let maybe = filters.iter().any(|f| {
@@ -1150,8 +1174,9 @@ impl ChainData {
                     c.push((n, bh, h));
                 }
             }
-            (c, scanned, last.expect("from <= to"))
+            (c, scanned, last.expect("from <= to"), first_parent.expect("from <= to"))
         };
+        let mut expired = Vec::new();
         let t = Instant::now();
         let matches = |l: &alloy_primitives::Log| filters.iter().any(|f| f.matches(l));
         let mut blocks = Vec::new();
@@ -1163,7 +1188,10 @@ impl ChainData {
         // their matches are extracted: a long scan holds at most one chunk of them in memory.
         let fp = persist.then(|| filters_fingerprint(filters));
         let store = self.history.get().filter(|_| fp.is_some());
-        for chunk in candidates.chunks(SCAN_CHUNK) {
+        // SKIM_SCAN_CHUNK overrides the chunk size (measurement only).
+        static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let chunk_size = *CHUNK.get_or_init(|| std::env::var("SKIM_SCAN_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(SCAN_CHUNK));
+        for chunk in candidates.chunks(chunk_size) {
             let hashes: Vec<B256> = chunk.iter().map(|(_, bh, _)| *bh).collect();
             let mut known: HashMap<B256, Vec<crate::history::MatchedLog>> = match (store, &fp) {
                 (Some(s), Some(fp)) => s.get_matched(fp, &hashes).unwrap_or_default(),
@@ -1171,7 +1199,7 @@ impl ChainData {
             };
             let mut need: Vec<(u64, B256, Arc<Header>)> = chunk.iter().filter(|(_, bh, _)| !known.contains_key(bh)).cloned().collect();
             // Blocks another scan with the same filters is fetching: wait for it, then read back.
-            let mut mine = Vec::new();
+            let mut mine = InflightGuard { map: &self.inflight, hashes: Vec::new() };
             if let (Some(s), Some(fp)) = (store, &fp) {
                 let mut waits = Vec::new();
                 {
@@ -1184,7 +1212,9 @@ impl ChainData {
                                 // A closed semaphore is the "done" signal: acquiring it then
                                 // returns at once, even for a scan that starts waiting late.
                                 f.insert(key, Arc::new(tokio::sync::Semaphore::new(0)));
-                                mine.push(key);
+                                // Owned by the guard from here: released even if this scan is
+                                // cancelled while waiting for others below.
+                                mine.hashes.push(key);
                                 need.push(b);
                             }
                         }
@@ -1200,7 +1230,16 @@ impl ChainData {
                     }
                 }
             }
-            let _done = InflightGuard { map: &self.inflight, hashes: mine };
+            let _done = mine;
+            // Older than any connected peer serves, and not stored: a stream reports these as a
+            // gap; eth_getLogs refuses (what's stored was used above either way).
+            if need.iter().any(|(n, _, _)| *n < peers_from) {
+                if !persist {
+                    return Err(DataError::Unavailable(format!("block {} is older than connected peers serve (earliest {peers_from}); receipts before it have expired", need[0].0)));
+                }
+                expired.extend(need.iter().filter(|(n, _, _)| *n < peers_from).map(|(n, _, _)| *n));
+                need.retain(|(n, _, _)| *n >= peers_from);
+            }
             let batch = if need.len() > 4 {
                 self.receipts_many(&need.iter().map(|(_, bh, h)| (*bh, h.clone())).collect::<Vec<_>>()).await
             } else {
@@ -1262,7 +1301,7 @@ impl ChainData {
             }
         }
         tracing::debug!(scanned, candidates = candidates.len(), logs = count, ms = t.elapsed().as_millis() as u64, "log scan");
-        Ok(Scan { blocks, last })
+        Ok(Scan { blocks, last, first_parent, expired })
     }
 
     /// Block range of a filter, with tags resolved against `head`.
@@ -1331,5 +1370,30 @@ impl ChainData {
 
     pub fn number_of(&self, hash: &B256) -> Option<u64> {
         self.inner.read().by_hash.get(hash).copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_wait_keeps_its_cpu_slot_until_the_work_ends() {
+        // Cap 1. The first job runs and blocks; its async waiter is cancelled. A second job must
+        // not start until the first one actually finishes.
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let p1 = pool.clone();
+        let first = tokio::spawn(async move { cpu_on(&p1, move || wait.recv().ok()).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        first.abort();
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (p2, s2) = (pool.clone(), started.clone());
+        let second = tokio::spawn(async move { cpu_on(&p2, move || s2.store(true, std::sync::atomic::Ordering::SeqCst)).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst), "second job started while the first still ran");
+        release.send(()).unwrap();
+        second.await.unwrap();
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

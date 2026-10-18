@@ -119,11 +119,14 @@ export class Store {
 
   /** Forgets everything blocks above `n` produced (a reorg replaced them). */
   rollback(n) {
-    this.tx(() => {
-      for (const t of REORG_TABLES) this.run(`DELETE FROM ${t} WHERE ${t === "blocks" ? "number" : "block"} > ?`, n);
-      this.meta("indexed_block", n);
-      this.meta("indexed_hash", this.get("SELECT hash FROM blocks WHERE number = ?", n)?.hash ?? "");
-    });
+    this.tx(() => this.rollbackInTx(n));
+  }
+
+  /** `rollback`, inside a transaction the caller already holds (SQLite doesn't nest them). */
+  rollbackInTx(n) {
+    for (const t of REORG_TABLES) this.run(`DELETE FROM ${t} WHERE ${t === "blocks" ? "number" : "block"} > ?`, n);
+    this.meta("indexed_block", n);
+    this.meta("indexed_hash", this.get("SELECT hash FROM blocks WHERE number = ?", n)?.hash ?? "");
   }
 
   /**

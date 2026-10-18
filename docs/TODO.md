@@ -24,6 +24,14 @@ Items are removed from this file when they're done, and the commit that closes o
     storage / code). Done when request coalescing and completion-order fetching each have a
     measured before/after on a fixed workload.
 
+## Streams and modules
+19. **Stored matches are per exact filter set.** smallname's filter set grows whenever an ENSv2
+    registry or resolver is discovered, so a re-index (a new index, same filters later) mostly
+    misses what an earlier run stored. Done: coverage that survives filter growth (e.g. per
+    address and per topic).
+20. **The CL gap-fill fallback has no test** (`ClNode` has no network-free seam).
+
 ## smallname
-16. **Unsupported routes:** permissions by `name` / `registration_id` (needs `TokenResource`
-    resource ids indexed), resolver `links` / `roles`, diagnostics, Basenames (another chain).
+16. **Unsupported routes:** permissions by `registration_id`, resolver `links` / `roles`,
+    diagnostics, Basenames (another chain). (Permissions by `name` work since `TokenResource` is
+    indexed; existing indexes need a re-index for older resource ids.)
