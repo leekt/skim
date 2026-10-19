@@ -9,6 +9,18 @@ use revm::{
 };
 
 pub const SEPOLIA_CHAIN_ID: u64 = 11155111;
+
+static CHAIN_ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Sets the chain id this process serves (once, at startup; later calls are ignored).
+pub fn set_chain_id(id: u64) {
+    let _ = CHAIN_ID.set(id);
+}
+
+/// The chain id this process serves: what [`set_chain_id`] set, else Sepolia's.
+pub fn chain_id() -> u64 {
+    *CHAIN_ID.get_or_init(|| SEPOLIA_CHAIN_ID)
+}
 pub const SPEC: SpecId = SpecId::AMSTERDAM;
 
 /// Block context for executing *in* block `h` (post-state of its parent) or, for `eth_call` at
@@ -31,7 +43,7 @@ pub fn block_env(h: &Header) -> BlockEnv {
 /// per-block coinbase is never loaded).
 pub fn call_cfg() -> CfgEnv {
     let mut cfg = CfgEnv::new_with_spec(SPEC);
-    cfg.chain_id = SEPOLIA_CHAIN_ID;
+    cfg.chain_id = chain_id();
     cfg.disable_nonce_check = true;
     cfg.disable_balance_check = true;
     cfg.disable_base_fee = true;
@@ -46,6 +58,6 @@ pub fn call_cfg() -> CfgEnv {
 /// charged (to the block's fee recipient), as a block builder would.
 pub fn validating_cfg() -> CfgEnv {
     let mut cfg = CfgEnv::new_with_spec(SPEC);
-    cfg.chain_id = SEPOLIA_CHAIN_ID;
+    cfg.chain_id = chain_id();
     cfg
 }

@@ -7706,6 +7706,7 @@ name = "skim-el"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
  "futures",
@@ -7719,6 +7720,7 @@ dependencies = [
  "reth-network-peers",
  "reth-storage-api",
  "reth-tasks",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

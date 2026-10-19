@@ -401,7 +401,7 @@ impl Rpc {
             .value(req.value.unwrap_or_default())
             .gas_limit(gas)
             .nonce(req.nonce.unwrap_or_default())
-            .chain_id(Some(skim_sim::env::SEPOLIA_CHAIN_ID));
+            .chain_id(Some(skim_sim::env::chain_id()));
         // Fees: as nodes do for eth_call, 0 unless given (GASPRICE then sees the given price).
         b = match (req.gas_price, req.max_fee_per_gas, req.max_priority_fee_per_gas) {
             (Some(p), _, _) => b.gas_price(p),
@@ -436,8 +436,8 @@ impl Rpc {
         let sim = &self.sim;
         match method {
             "web3_clientVersion" => Ok(json!(CLIENT_VERSION)),
-            "eth_chainId" => Ok(hex_u64(skim_sim::env::SEPOLIA_CHAIN_ID)),
-            "net_version" => Ok(json!(skim_sim::env::SEPOLIA_CHAIN_ID.to_string())),
+            "eth_chainId" => Ok(hex_u64(skim_sim::env::chain_id())),
+            "net_version" => Ok(json!(skim_sim::env::chain_id().to_string())),
             "net_listening" => Ok(json!(true)),
             "eth_syncing" => Ok(json!(latest.is_none())),
             "eth_blockNumber" => Ok(hex_u64(self.resolve_block(None, latest)?.number)),

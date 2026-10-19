@@ -99,6 +99,45 @@ pub use reth_network_peers::TrustedPeer;
 const SEPOLIA_DNS: &str =
     "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.sepolia.ethdisco.net";
 
+/// The execution network to join: its chain spec (genesis and fork schedule) and how to find
+/// peers. Sepolia is built in; any other network comes from its `genesis.json` (with
+/// `amsterdamTime` for Glamsterdam) and bootnode enodes.
+#[derive(Clone)]
+pub struct ElNetwork {
+    pub spec: Arc<ChainSpec>,
+    pub bootnodes: Vec<reth_network_peers::NodeRecord>,
+    /// EIP-1459 DNS discovery tree, if the network publishes one.
+    pub dns: Option<String>,
+}
+
+impl ElNetwork {
+    pub fn sepolia() -> Self {
+        Self { spec: SEPOLIA.clone(), bootnodes: reth_network_peers::sepolia_nodes(), dns: Some(SEPOLIA_DNS.to_string()) }
+    }
+
+    /// `genesis.json` in `dir`, plus `enodes.txt` (one `enode://` per line) if present, plus
+    /// `extra_bootnodes`.
+    pub fn from_dir(dir: &std::path::Path, extra_bootnodes: &[String]) -> Result<Self, Box<dyn std::error::Error>> {
+        let raw = std::fs::read(dir.join("genesis.json")).map_err(|e| format!("{}: {e}", dir.join("genesis.json").display()))?;
+        let genesis: alloy_genesis::Genesis = serde_json::from_slice(&raw)?;
+        if genesis.config.amsterdam_time.is_none() {
+            return Err("genesis.json has no amsterdamTime: skim follows Glamsterdam networks".into());
+        }
+        let mut lines: Vec<String> = std::fs::read_to_string(dir.join("enodes.txt")).map(|t| t.lines().map(|l| l.trim().to_string()).collect()).unwrap_or_default();
+        lines.extend(extra_bootnodes.iter().cloned());
+        let bootnodes = lines
+            .iter()
+            .filter(|l| l.starts_with("enode://"))
+            .map(|l| l.parse::<reth_network_peers::NodeRecord>().map_err(|e| format!("bootnode {l}: {e}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { spec: Arc::new(ChainSpec::from(genesis)), bootnodes, dns: None })
+    }
+
+    pub fn chain_id(&self) -> u64 {
+        self.spec.chain.id()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ReqError {
     #[error("timed out")]
@@ -165,11 +204,22 @@ impl ElNet {
         trusted_only: bool,
         node_key: Option<[u8; 32]>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start(&ElNetwork::sepolia(), listen_port, trusted, trusted_only, node_key).await
+    }
+
+    /// Joins `network` (see [`ElNetwork`]); otherwise as [`Self::start_sepolia_with_key`].
+    pub async fn start(
+        network: &ElNetwork,
+        listen_port: u16,
+        trusted: Vec<TrustedPeer>,
+        trusted_only: bool,
+        node_key: Option<[u8; 32]>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let secret = match node_key {
             Some(k) => reth_network::config::SecretKey::from_byte_array(&k)?,
             None => rng_secret_key(),
         };
-        let spec: Arc<ChainSpec> = SEPOLIA.clone();
+        let spec: Arc<ChainSpec> = network.spec.clone();
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         // Advertise a current fork id (Amsterdam) while claiming no synced chain beyond genesis.
         let head = Head {
@@ -181,14 +231,18 @@ impl ElNet {
         };
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], listen_port));
         let snap1 = snap1::Snap1Peers::default();
-        let config = NetworkConfig::builder(secret, reth_tasks::Runtime::test())
-            .sepolia_boot_nodes()
+        let builder = NetworkConfig::builder(secret, reth_tasks::Runtime::test())
+            .boot_nodes(network.bootnodes.clone())
             .listener_addr(addr)
-            .discovery_addr(addr)
-            .dns_discovery(DnsDiscoveryConfig {
-                bootstrap_dns_networks: Some([SEPOLIA_DNS.parse::<LinkEntry>()?].into()),
+            .discovery_addr(addr);
+        let builder = match &network.dns {
+            Some(tree) => builder.dns_discovery(DnsDiscoveryConfig {
+                bootstrap_dns_networks: Some([tree.parse::<LinkEntry>()?].into()),
                 ..Default::default()
-            })
+            }),
+            None => builder.disable_dns_discovery(),
+        };
+        let config = builder
             .peer_config(
                 PeersConfig::default()
                     .with_trusted_nodes(trusted)

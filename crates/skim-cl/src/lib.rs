@@ -15,4 +15,5 @@ pub mod serve;
 pub mod ssz;
 pub mod verify;
 
+pub use libp2p::Multiaddr;
 pub use node::{ClEvent, ClNode, ClPeer, NodeConfig, NodeStats, SessionEnd};

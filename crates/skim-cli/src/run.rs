@@ -25,6 +25,23 @@ pub struct Args {
     /// JSON-RPC listen address.
     #[arg(long, default_value = "127.0.0.1:8545")]
     rpc: SocketAddr,
+    /// The network: `sepolia` (built in), or a network-config directory, as consensus clients
+    /// use (and ethereum-package / eth-clients publish): `config.yaml` (with its PRESET_BASE),
+    /// `genesis.ssz` or `genesis_validators_root.txt`, `bootstrap_nodes.txt`, plus the execution
+    /// `genesis.json` (with `amsterdamTime`) and optionally `enodes.txt`.
+    #[arg(long, default_value = "sepolia")]
+    network: String,
+    /// Extra EL bootnodes (`enode://…`), for networks without a DNS tree or `enodes.txt`.
+    #[arg(long = "el-bootnode")]
+    el_bootnode: Vec<String>,
+    /// CL peers to dial directly and keep (libp2p multiaddrs ending in `/p2p/<peer id>`), e.g.
+    /// a devnet's beacon nodes through their mapped ports. Repeatable.
+    #[arg(long = "cl-peer")]
+    cl_peer: Vec<skim_cl::Multiaddr>,
+    /// Attach to a skim-hub (shared chain data for several skim instances; a trusted setup).
+    /// Not supported yet: skim refuses to start with it.
+    #[arg(long, value_name = "URL")]
+    hub: Option<String>,
     #[arg(long, default_value_t = 9130)]
     cl_port: u16,
     #[arg(long, default_value_t = 30388)]
@@ -79,9 +96,10 @@ pub struct Args {
     /// Default: the last finalized root this node verified, else `--checkpoint-url`.
     #[arg(long)]
     checkpoint: Option<alloy_primitives::B256>,
-    /// Checkpoint-sync endpoint used when no checkpoint is given or saved.
-    #[arg(long, default_value = "https://checkpoint-sync.sepolia.ethpandaops.io")]
-    checkpoint_url: String,
+    /// Checkpoint-sync endpoint used when no checkpoint is given or saved (Sepolia: ethPandaOps'
+    /// by default; other networks: a beacon node's API, e.g. a devnet's).
+    #[arg(long)]
+    checkpoint_url: Option<String>,
     /// Answer `latest` with the highest block the sync committee has signed off on, instead of
     /// the newest gossiped block (trust-minimized, typically ~1-2 slots behind).
     #[arg(long)]
@@ -228,19 +246,41 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         Some(_) => Some(crate::metrics::install(std::time::Duration::from_secs(args.metrics_idle))?),
         None => None,
     };
+    if let Some(h) = &args.hub {
+        anyhow::bail!("--hub {h}: attaching to a skim-hub isn't supported yet (skim-hub is in development); run without --hub");
+    }
+    // Which network: everything chain-specific (chain id, fork schedule, preset, bootnodes,
+    // genesis) comes from here.
+    let (cl_net, el_net) = if args.network == "sepolia" {
+        let mut el = skim_el::ElNetwork::sepolia();
+        for b in &args.el_bootnode {
+            el.bootnodes.push(b.parse().map_err(|e| anyhow::anyhow!("--el-bootnode {b}: {e}"))?);
+        }
+        (skim_cl::network::ClNetwork::sepolia(), el)
+    } else {
+        let dir = std::path::PathBuf::from(&args.network);
+        anyhow::ensure!(dir.is_dir(), "--network: `sepolia` or a network-config directory ({} isn't one)", dir.display());
+        let cl = skim_cl::network::ClNetwork::from_dir(&dir)?;
+        let el = skim_el::ElNetwork::from_dir(&dir, &args.el_bootnode).map_err(|e| anyhow::anyhow!("{e}"))?;
+        (cl, el)
+    };
+    tracing::info!(network = %cl_net.name, chain_id = el_net.chain_id(), preset = cl_net.preset.name, slot_ms = cl_net.slot_ms,
+        gloas_epoch = cl_net.gloas_fork_epoch, cl_bootnodes = cl_net.bootnodes.len(), el_bootnodes = el_net.bootnodes.len(), "network");
+    skim_sim::env::set_chain_id(el_net.chain_id());
+    skim_cl::network::set_current(cl_net.clone());
+    let checkpoint_url = args.checkpoint_url.clone().or_else(|| (cl_net.name == "sepolia").then(|| "https://checkpoint-sync.sepolia.ethpandaops.io".to_string()));
+    let default_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".skim").join(&cl_net.name);
     let persist = if args.ephemeral {
         None
     } else {
-        let dir = args.data_dir.clone().unwrap_or_else(|| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".skim/sepolia")
-        });
+        let dir = args.data_dir.clone().unwrap_or_else(|| default_dir.clone());
         Some(Arc::new(skim_state::persist::Persist::open(dir.join("restart.redb"))?))
     };
     let node_key = match &persist {
         Some(p) => Some(crate::persist::node_key(p)?),
         None => None,
     };
-    let net = ElNet::start_sepolia_with_key(args.el_port, args.trusted_peer.clone(), false, node_key)
+    let net = ElNet::start(&el_net, args.el_port, args.trusted_peer.clone(), false, node_key)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let saved = match &persist {
@@ -317,7 +357,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     store.set_max_subscribed(cfg.state.limits.max_subscribed_keys.0);
     store.set_max_on_demand(cfg.state.limits.max_on_demand_keys.0);
     tracing::info!(subscriptions = subs.status().len(), declared_keys = subs.total_keys(), "state subscriptions loaded");
-    let mut ncfg = NodeConfig::sepolia(args.cl_port);
+    let mut ncfg = NodeConfig::from_network(&cl_net, args.cl_port);
+    ncfg.explicit_peers.extend(args.cl_peer.iter().cloned());
     ncfg.mesh_n = args.cl_mesh;
     ncfg.target_peers = args.cl_peers;
     ncfg.max_peers = args.cl_peers + args.cl_peers / 4;
@@ -331,13 +372,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
     });
     let light = crate::light::Light::new(cl.clone(), persist.clone());
-    light.start(args.checkpoint, args.checkpoint_url.clone());
+    light.start(args.checkpoint, checkpoint_url);
     let chaindata = crate::chaindata::ChainData::new(net.clone(), args.max_logs_range);
     if args.history == HistoryMode::Local {
         anyhow::ensure!(!args.ephemeral, "--history local needs a data dir (not --ephemeral)");
-        let dir = args.data_dir.clone().unwrap_or_else(|| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".skim/sepolia")
-        });
+        let dir = args.data_dir.clone().unwrap_or_else(|| default_dir.clone());
         match crate::history::HeaderStore::open(dir.join("history.redb")) {
             Ok(s) => chaindata.set_history(s),
             Err(e) => tracing::warn!("post-fork header store unavailable ({e}); logs cover about a day"),
@@ -408,7 +447,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         lookback: 32,
         cl: Some(Arc::new(cl.clone())),
     };
-    tracing::info!("following Sepolia from CL gossip; RPC answers once the first block is applied");
+    tracing::info!(network = %cl_net.name, "following the chain from CL gossip; RPC answers once the first block is applied");
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {

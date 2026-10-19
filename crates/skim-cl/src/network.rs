@@ -191,6 +191,18 @@ impl ClNetwork {
     }
 }
 
+static CURRENT: std::sync::OnceLock<ClNetwork> = std::sync::OnceLock::new();
+
+/// Sets the network this process follows (once, at startup). Later calls are ignored.
+pub fn set_current(n: ClNetwork) {
+    let _ = CURRENT.set(n);
+}
+
+/// The network this process follows: what [`set_current`] set, else Sepolia.
+pub fn current() -> &'static ClNetwork {
+    CURRENT.get_or_init(ClNetwork::sepolia)
+}
+
 fn parse_hex4(v: &str) -> Option<[u8; 4]> {
     let b = alloy_primitives::hex::decode(v.trim().trim_matches('\'').trim_matches('"')).ok()?;
     b.try_into().ok()

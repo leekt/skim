@@ -177,7 +177,7 @@ impl DatabaseRef for SnapDb<'_> {
 fn simulate(snap: &Snapshot, h: &Header, call: &Call) -> (Option<Bytes>, SnapMisses) {
     let db = SnapDb { snap, misses: Default::default() };
     let mut cfg = CfgEnv::new_with_spec(SpecId::AMSTERDAM);
-    cfg.chain_id = 11155111;
+    cfg.chain_id = skim_sim::env::chain_id();
     cfg.disable_nonce_check = true;
     cfg.disable_balance_check = true;
     cfg.disable_base_fee = true;
@@ -191,7 +191,7 @@ fn simulate(snap: &Snapshot, h: &Header, call: &Call) -> (Option<Bytes>, SnapMis
             .kind(revm::primitives::TxKind::Call(call.to))
             .data(call.data.clone())
             .gas_limit(30_000_000)
-            .chain_id(Some(11155111))
+            .chain_id(Some(skim_sim::env::chain_id()))
             .build()
             .unwrap();
         evm.transact(tx).ok().map(|r| r.result.into_output().unwrap_or_default())

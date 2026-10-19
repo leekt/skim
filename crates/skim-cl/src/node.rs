@@ -58,7 +58,11 @@ pub const SEPOLIA_BOOTNODES: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     pub fork_digest: [u8; 4],
+    /// The fork version advertised in the ENR (`ENRForkID.next_fork_version`, no later fork).
+    pub fork_version: [u8; 4],
     pub genesis_time: u64,
+    pub slot_ms: u64,
+    pub slots_per_epoch: u64,
     /// TCP and discv5 UDP port.
     pub port: u16,
     /// QUIC UDP port (0 disables QUIC listening).
@@ -85,15 +89,23 @@ pub struct NodeConfig {
 
 impl NodeConfig {
     pub fn sepolia(port: u16) -> Self {
+        Self::from_network(&crate::network::ClNetwork::sepolia(), port)
+    }
+
+    /// For any network (see [`crate::network::ClNetwork`]).
+    pub fn from_network(n: &crate::network::ClNetwork, port: u16) -> Self {
         Self {
-            fork_digest: SEPOLIA_GLOAS_DIGEST,
-            genesis_time: SEPOLIA_GENESIS_TIME,
+            fork_digest: n.current_fork_digest(),
+            fork_version: n.gloas_fork_version,
+            genesis_time: n.genesis_time,
+            slot_ms: n.slot_ms,
+            slots_per_epoch: n.preset.slots_per_epoch,
             port,
             quic_port: port + 1,
             target_peers: 50,
             max_peers: 70,
             mesh_n: 8,
-            bootnodes: SEPOLIA_BOOTNODES.iter().map(|s| s.to_string()).collect(),
+            bootnodes: n.bootnodes.clone(),
             initial_status: None,
             topics: vec![
                 "beacon_block".into(),
@@ -109,7 +121,7 @@ impl NodeConfig {
 
     pub fn current_slot(&self) -> u64 {
         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
-        now.saturating_sub(self.genesis_time) / SECONDS_PER_SLOT
+        now.saturating_sub(self.genesis_time) * 1000 / self.slot_ms
     }
 }
 
@@ -323,10 +335,10 @@ fn rr(protocols: &[&'static str]) -> request_response::Behaviour<Codec> {
 }
 
 /// The ENR `eth2` value: SSZ `ENRForkID { fork_digest, next_fork_version, next_fork_epoch }`.
-pub fn enr_fork_id(digest: [u8; 4]) -> [u8; 16] {
+pub fn enr_fork_id(digest: [u8; 4], fork_version: [u8; 4]) -> [u8; 16] {
     let mut v = [0u8; 16];
     v[..4].copy_from_slice(&digest);
-    v[4..8].copy_from_slice(&SEPOLIA_GLOAS_VERSION);
+    v[4..8].copy_from_slice(&fork_version);
     v[8..].copy_from_slice(&FAR_FUTURE_EPOCH.to_le_bytes());
     v
 }
@@ -380,7 +392,7 @@ impl ClNode {
         if cfg.quic_port != 0 {
             b.add_value("quic", &cfg.quic_port);
         }
-        b.add_value("eth2", &Bytes::copy_from_slice(&enr_fork_id(cfg.fork_digest)));
+        b.add_value("eth2", &Bytes::copy_from_slice(&enr_fork_id(cfg.fork_digest, cfg.fork_version)));
         b.add_value("attnets", &Bytes::copy_from_slice(&attnets));
         b.add_value("syncnets", &Bytes::copy_from_slice(&[0u8]));
         b.add_value("cgc", &CUSTODY_REQUIREMENT);
@@ -418,7 +430,7 @@ impl ClNode {
             .max_control_messages_sent(500)
             .validate_messages()
             .validation_mode(gossipsub::ValidationMode::Anonymous)
-            .duplicate_cache_time(Duration::from_secs(SLOTS_PER_EPOCH * SECONDS_PER_SLOT * 2))
+            .duplicate_cache_time(Duration::from_millis(cfg.slots_per_epoch * cfg.slot_ms * 2))
             .message_id_fn(gossip::gossipsub_message_id)
             .build()
             .map_err(|e| anyhow::anyhow!("gossipsub config: {e:?}"))?;

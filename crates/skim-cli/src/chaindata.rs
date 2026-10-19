@@ -507,7 +507,7 @@ impl ChainData {
         if tx.is_eip4844() {
             return Err(DataError::Invalid("blob transactions are not supported (no sidecar gossip)".into()));
         }
-        if tx.chain_id().is_some_and(|c| c != skim_sim::env::SEPOLIA_CHAIN_ID) {
+        if tx.chain_id().is_some_and(|c| c != skim_sim::env::chain_id()) {
             return Err(DataError::Invalid(format!("wrong chain id {:?}", tx.chain_id())));
         }
         let from = tx.recover_signer().map_err(|e| DataError::Invalid(format!("invalid signature: {e}")))?;

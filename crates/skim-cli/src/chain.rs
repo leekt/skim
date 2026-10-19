@@ -157,7 +157,7 @@ impl Chain {
     /// `b`'s slot until the collected blocks link (by hash) from a block the store holds to `b`'s
     /// parent, then rolls back to that block and applies them in order.
     async fn reconcile_via_cl(&self, cl: &dyn crate::persist::EnvelopeSource, b: &BlockRef, head: u64) -> anyhow::Result<(u64, u64)> {
-        let slot = b.timestamp.saturating_sub(skim_cl::node::SEPOLIA_GENESIS_TIME) / 12;
+        let slot = skim_cl::network::current().slot_at(b.timestamp);
         let mut got: std::collections::BTreeMap<u64, (Header, BlockWrites)> = Default::default();
         let mut found: Option<u64> = None;
         let mut trace = crate::persist::CatchupTrace::default();

@@ -74,15 +74,20 @@ impl Light {
     }
 
     /// Picks the trusted root and bootstraps in the background, retrying across peers.
-    pub fn start(self: &Arc<Self>, checkpoint: Option<B256>, checkpoint_url: String) {
+    pub fn start(self: &Arc<Self>, checkpoint: Option<B256>, checkpoint_url: Option<String>) {
         let me = self.clone();
         tokio::spawn(async move {
             let saved = me.persist.as_ref().and_then(|p| p.get_meta(FINALIZED_ROOT_META).ok().flatten()).filter(|v| v.len() == 32);
             let (root, from) = match (checkpoint, saved) {
                 (Some(r), _) => (r, "--checkpoint".to_string()),
                 (None, Some(v)) => (B256::from_slice(&v), "finalized root verified in a previous run".to_string()),
-                (None, None) => match fetch_checkpoint(&checkpoint_url).await {
-                    Ok(r) => (r, format!("checkpoint sync URL {checkpoint_url}")),
+                (None, None) => match async {
+                    let url = checkpoint_url.as_deref().ok_or_else(|| anyhow::anyhow!("no --checkpoint or --checkpoint-url for this network"))?;
+                    fetch_checkpoint(url).await.map(|r| (r, url.to_string()))
+                }
+                .await
+                {
+                    Ok((r, url)) => (r, format!("checkpoint sync URL {url}")),
                     Err(e) => {
                         me.status.write().last_error = Some(format!("no checkpoint: {e}"));
                         tracing::warn!("light client: no checkpoint root ({e}); consensus verification is off");
@@ -102,11 +107,11 @@ impl Light {
         }
         for attempt in 0..120 {
             let Some(cl) = &self.cl else { break };
-            match cl.light_client_bootstrap(root.0).await.and_then(|b| light::bootstrap(&b, root).map_err(Into::into)) {
+            match cl.light_client_bootstrap(root.0).await.and_then(|b| light::bootstrap(&b, root, &skim_cl::network::current().light_client()).map_err(Into::into)) {
                 Ok((header, committee)) => {
                     tracing::info!(slot = header.beacon.slot, period = committee.period, "light client: sync committee verified");
                     self.status.write().period = Some(committee.period);
-                    *self.committee.lock() = Some(light::Committees::new(committee));
+                    *self.committee.lock() = Some(light::Committees::new(committee, skim_cl::network::current().light_client()));
                     self.fetch_next_committee();
                     break;
                 }
@@ -125,7 +130,7 @@ impl Light {
     /// A gossiped light-client update. Verified against the committee; results are stored as
     /// execution block hashes and resolved to numbers by [`Self::on_block`].
     pub async fn on_gossip(self: &Arc<Self>, topic: &str, data: &[u8], store: &Store) {
-        let fv = skim_cl::node::SEPOLIA_GLOAS_VERSION;
+        let fv = skim_cl::network::current().gloas_fork_version;
         tracing::debug!(topic, len = data.len(), "light client update received");
         let res = {
             let c = self.committee.lock();
@@ -173,9 +178,10 @@ impl Light {
         }
         let me = self.clone();
         tokio::spawn(async move {
-            let fv = skim_cl::node::SEPOLIA_GLOAS_VERSION;
+            let fv = skim_cl::network::current().gloas_fork_version;
             for attempt in 0..120 {
-                let live = skim_cl::NodeConfig::sepolia(0).current_slot() / light::SLOTS_PER_PERIOD;
+                let net = skim_cl::network::current();
+                let live = skim_cl::NodeConfig::from_network(net, 0).current_slot() / net.preset.slots_per_period();
                 let Some((period, has_next)) = me.committee.lock().as_ref().map(|c| (c.current.period, c.next.is_some())) else { break };
                 if period >= live && has_next {
                     break;

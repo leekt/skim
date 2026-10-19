@@ -359,7 +359,7 @@ pub async fn walk_envelopes(
 }
 
 async fn fetch_via_cl(cl: &skim_cl::ClNode, saved: &Saved, head: &BlockRef) -> anyhow::Result<Vec<(alloy_consensus::Header, BlockWrites)>> {
-    let head_slot = head.timestamp.saturating_sub(skim_cl::node::SEPOLIA_GENESIS_TIME) / 12;
+    let head_slot = skim_cl::network::current().slot_at(head.timestamp);
     let lowest_needed = saved.number + 1;
     let mut got: std::collections::BTreeMap<u64, (alloy_consensus::Header, BlockWrites)> = Default::default();
     let mut trace = CatchupTrace::default();
@@ -389,7 +389,7 @@ pub async fn seed_recent_bals(store: Arc<Store>, cl: &(impl EnvelopeSource + ?Si
     if low >= first.number {
         return;
     }
-    let head_slot = first.timestamp.saturating_sub(skim_cl::node::SEPOLIA_GENESIS_TIME) / 12;
+    let head_slot = skim_cl::network::current().slot_at(first.timestamp);
     let mut got: std::collections::BTreeMap<u64, (alloy_consensus::Header, BlockWrites)> = Default::default();
     let mut trace = CatchupTrace::default();
     let want = first.number - low;

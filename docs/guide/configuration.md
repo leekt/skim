@@ -69,6 +69,10 @@ With no cap, memory grows with the contract: about 100 bytes per slot, so a cont
 | Flag | Default | Meaning |
 |---|---|---|
 | `--config <path>` | none | the YAML above |
+| `--network <sepolia\|dir>` | `sepolia` | the chain to follow: `sepolia` (built in), or a network-config directory as consensus clients use (`config.yaml` with its `PRESET_BASE` (`mainnet` or `minimal`), `genesis.ssz` or `genesis_validators_root.txt`, `bootstrap_nodes.txt`) plus the execution `genesis.json` (with `amsterdamTime`) and optionally `enodes.txt`. Chain id, fork schedule, preset, slot duration and bootnodes all come from it; the data dir defaults to `~/.skim/<network>` |
+| `--el-bootnode <enode>` | none | extra EL bootnodes, for networks without a DNS tree or `enodes.txt` (repeatable) |
+| `--cl-peer <multiaddr>` | none | CL peers to dial directly and keep (`/ip4/…/tcp/…/p2p/<peer id>`), e.g. a devnet's beacon nodes (repeatable) |
+| `--hub <url>` | none | attach to a skim-hub: **not supported yet**, skim refuses to start with it |
 | `--rpc <addr>` | `127.0.0.1:8545` | JSON-RPC listen address (HTTP; single and batch requests) |
 | `--cl-port <port>` | `9130` | consensus-layer libp2p TCP + discv5 UDP; QUIC on port+1 |
 | `--el-port <port>` | `30388` | execution-layer RLPx TCP + discovery UDP |
@@ -82,7 +86,7 @@ With no cap, memory grows with the contract: about 100 bytes per slot, so a cont
 | `--trusted-peer <enode>` | none | EL peer to keep connected, e.g. your own node (answers are still proof-checked); repeatable |
 | `--cl-mesh <n>` / `--cl-peers <n>` | `8` / `50` | consensus gossip mesh degree and peer target |
 | `--checkpoint <root>` | none | trusted beacon block root for the light client (default: last finalized root verified in a previous run, else `--checkpoint-url`) |
-| `--checkpoint-url <url>` | ethpandaops Sepolia | checkpoint-sync endpoint for the light client's starting root |
+| `--checkpoint-url <url>` | ethpandaops (Sepolia); none otherwise | checkpoint-sync endpoint (or a beacon node's API) for the light client's starting root. Without it or `--checkpoint`, a non-Sepolia network runs with consensus verification off |
 | `--require-verified` | off | `latest` = highest block the sync committee signed off on (~1–2 slots behind) |
 | `--metrics <addr>` | off | serve Prometheus metrics at `http://<addr>/metrics` (see [metrics/](../../metrics)) |
 | `--metrics-addresses <n>` | `50` | most-called addresses exported with per-address series; `0` exports none |
