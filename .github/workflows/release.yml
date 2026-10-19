@@ -35,7 +35,9 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
-          key: ${{ matrix.target }}
+          # The runner image is part of the key: C dependencies compiled against a newer glibc
+          # (cached from ubuntu-24.04) don't link on ubuntu-22.04 (__isoc23_* symbols).
+          key: ${{ matrix.os }}-${{ matrix.target }}
       - name: Build
         run: cargo build --release --locked -p skim-cli --target ${{ matrix.target }}
       - name: Package
