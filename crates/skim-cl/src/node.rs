@@ -347,6 +347,22 @@ fn rr(protocols: &[&'static str]) -> request_response::Behaviour<Codec> {
     )
 }
 
+/// The Status skim sends: the best head and checkpoint it has learned (or zeros), always with the
+/// digest in force now. A status learned before a fork carries the old digest; sending it made
+/// peers drop skim as irrelevant when they re-checked Status after the fork.
+pub fn status_to_send(learned: Option<Status>, digest: [u8; 4]) -> Status {
+    let mut s = learned.unwrap_or(Status {
+        fork_digest: digest,
+        finalized_root: B256::ZERO,
+        finalized_epoch: 0,
+        head_root: B256::ZERO,
+        head_slot: 0,
+        earliest_available_slot: Some(0),
+    });
+    s.fork_digest = digest;
+    s
+}
+
 /// How long topic subscriptions overlap around a fork-digest change, before and after (epochs).
 pub const FORK_TOPIC_OVERLAP_EPOCHS: u64 = 2;
 
@@ -647,14 +663,7 @@ struct Runner {
 
 impl Runner {
     fn our_status(&self) -> Status {
-        self.best.or(self.cfg.initial_status).unwrap_or(Status {
-            fork_digest: self.cfg.fork_digest,
-            finalized_root: B256::ZERO,
-            finalized_epoch: 0,
-            head_root: B256::ZERO,
-            head_slot: 0,
-            earliest_available_slot: Some(0),
-        })
+        status_to_send(self.best.or(self.cfg.initial_status), self.cfg.fork_digest)
     }
 
     /// Adopts a peer's status as ours if it is on our fork and has the best plausible head.
@@ -1306,5 +1315,14 @@ mod tests {
         // After: keep the old topics until two epochs past the fork, then leave them.
         assert_eq!(digest_plan(&sched, b, 13, Some((a, 14))), DigestPlan::default());
         assert_eq!(digest_plan(&sched, b, 14, Some((a, 14))), DigestPlan { unsubscribe: Some(a), ..Default::default() });
+    }
+
+    #[test]
+    fn our_status_carries_the_digest_in_force_after_a_fork() {
+        let learned = Status { fork_digest: [0, 0, 0, 0xa], finalized_root: B256::repeat_byte(1), finalized_epoch: 10, head_root: B256::repeat_byte(2), head_slot: 95, earliest_available_slot: Some(95) };
+        let s = status_to_send(Some(learned), [0, 0, 0, 0xb]);
+        assert_eq!(s.fork_digest, [0, 0, 0, 0xb], "a status learned before the fork must not advertise the old digest");
+        assert_eq!((s.head_slot, s.finalized_epoch), (95, 10));
+        assert_eq!(status_to_send(None, [0, 0, 0, 0xb]).fork_digest, [0, 0, 0, 0xb]);
     }
 }
