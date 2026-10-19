@@ -148,12 +148,18 @@ flowchart LR
 ## Quick start
 
 ```bash
-git clone https://github.com/leekt/skim && cd skim
-cargo build --release                     # Rust 1.97 (pinned in rust-toolchain.toml)
-./target/release/skim run --config examples/uniswap-v3/skim.yaml
+curl -fsSL https://raw.githubusercontent.com/leekt/skim/main/install.sh | sh   # Linux, macOS
+skim                                      # a Sepolia node, no config: JSON-RPC on 127.0.0.1:8545
+skim status                               # how it's doing, with hints
 ```
 
-Or with Docker (`docker build -t skim .`; the image's default command is `run --rpc 0.0.0.0:8545 --data-dir /data`). Tagged releases publish Linux and macOS binaries and an image at `ghcr.io/leekt/skim`.
+No addresses need pinning to start: every state read is fetched on demand, verified, and kept current while it's used. A config that subscribes your app's hot state is a latency optimization:
+
+```bash
+skim --config examples/uniswap-v3/skim.yaml
+```
+
+From source: `git clone https://github.com/leekt/skim && cd skim && cargo build --release` (Rust 1.97, pinned in `rust-toolchain.toml`); see [installation](docs/guide/install.md). Or with Docker (`docker build -t skim .`; the image's default command is `run --rpc 0.0.0.0:8545 --data-dir /data`). Tagged releases publish Linux and macOS binaries and an image at `ghcr.io/leekt/skim`.
 
 Wait for `state ready` in the log (logged for each applied block; `skim_subscriptionStatus` says when your subscriptions are ready). Then point any Ethereum tooling at `http://127.0.0.1:8545`:
 

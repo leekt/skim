@@ -10,7 +10,7 @@ skim serves standard Ethereum JSON-RPC over HTTP and WebSocket on the same addre
 | `eth_call` | Local revm. Unknown state is fetched (verified) first. Honours `gasPrice` / `maxFeePerGas` / `maxPriorityFeePerGas` (0 if omitted, as nodes do), `accessList`, `authorizationList` (EIP-7702) and **state overrides** (`balance`, `nonce`, `code`, `state`, `stateDiff`). Blob fields are rejected (`-32602`), never ignored. |
 | `eth_simulateV1` | Sequences of calls across simulated blocks (each call sees earlier calls' writes), with per-block `blockOverrides` (number, time, gas limit, fee recipient, base fee, prevrandao) and `stateOverrides`. Per call: `status`, `returnData`, `gasUsed`, `logs`, `error`. `validation: true` checks nonces, balances and EIP-1559 base fees (simulated blocks get proper base fees) with the spec's error codes (e.g. `-38012`). `traceTransfers`: on Glamsterdam, ETH transfers already emit native EIP-7708 logs, so these are what you get. |
 | `debug_traceCall` | geth tracers: default (struct logs), `callTracer`, `prestateTracer`, `4byteTracer`, `muxTracer`, `noopTracer`, with `stateOverrides` and `blockOverrides`. Not yet: `flatCallTracer`, JS tracers. |
-| `debug_traceTransaction`, `debug_traceBlockByNumber`, `debug_traceBlockByHash` | Replays mined transactions with the same tracers. Each runs on its exact pre-state: the parent block's state plus the block's access-list changes before it (no earlier transaction is re-executed). Every replay must reproduce the transaction's receipt (status and gas, verified against `receiptsRoot`), or the trace is refused. For blocks inside `--window`. `debug_traceTransaction` finds the transaction with the same lookup as `eth_getTransactionByHash`; an unindexed one gets `-32002` ("transaction not found in recent blocks"). |
+| `debug_traceTransaction`, `debug_traceBlockByNumber`, `debug_traceBlockByHash` | Replays mined transactions with the same tracers. Each runs on its exact pre-state: the parent block's state plus the block's access-list changes before it (no earlier transaction is re-executed). Every replay must reproduce the transaction's receipt (status and gas, verified against `receiptsRoot`), or the trace is refused. For blocks inside `--window`. `debug_traceTransaction` finds the transaction with the same lookup as `eth_getTransactionByHash`; an unindexed one gets `-32002` (reason `not_indexed`). |
 | `eth_createAccessList` | geth's algorithm (iterate until the list is stable; gas is measured with the final list). |
 | `eth_getProof` | EIP-1186 proofs assembled from SNAP answers and verified against the block's state root before they're returned. Only for recent blocks, because peers serve only recent state roots. |
 | `eth_feeHistory` | Base fees (including the next block's) and gas-used ratios from headers; reward percentiles with geth's algorithm, from verified bodies and receipts. Blob fee fields are omitted; the CL blob schedule used for gossip fork digests does not add these RPC fields. |
@@ -58,13 +58,35 @@ viem's `watch*` helpers use these automatically with `webSocket(...)`.
 ## Errors
 | Code | When |
 |---|---|
-| `-32002` | Resource unavailable: no peer could serve the state, receipts or headers right now, or the block is outside the window and not archived. **skim never substitutes a guess**, so retrying later is safe. |
+| `-32002` | Resource unavailable: no peer could serve the state, receipts or headers right now, or the block is outside the window and not archived. **skim never substitutes a guess.** `error.data` says why and whether retrying can help: `{"reason": …, "retry": true/false}` (below). |
 | `-32004` | Explicit unsupported methods: `eth_sendTransaction` (skim holds no keys; sign in your client), `eth_newFilter`, `eth_getFilterChanges`, and `eth_subscribe` over HTTP. WebSocket subscriptions are supported; other unknown methods return `-32601`. |
 | `-32005` | `eth_getLogs` range larger than `--max-logs-range`. |
 | `-32004` | History below the discovered Glamsterdam fork floor. Missing state outside retained/archived coverage instead returns `-32002`. |
 | `-32000` | Transaction rejected (`nonce too low`, `insufficient funds…`, invalid signature, wrong chain id), or EVM halt. |
 | `3` | Execution reverted. `data` carries the revert bytes, so viem/ethers decode custom errors as usual. |
 | `-32602` / `-32601` | Bad params / unknown method. |
+
+### Why `-32002`: `error.data.reason`
+Stable identifiers, so an app can decide what to do without parsing messages:
+
+| `reason` | `retry` | Meaning |
+|---|---|---|
+| `starting` | yes | skim hasn't applied its first block yet |
+| `no_state_peers` | yes | no SNAP peer connected yet (the first minutes after a cold start); retry in a few seconds |
+| `state_incomplete` | yes | a call's state needed more fetch rounds than allowed (`on_demand.max_fetch_rounds`) |
+| `not_served` | yes | peers didn't serve a header, body, receipts or BAL just now |
+| `chain_changed` | yes | a reorg happened during the request; ask again |
+| `reorged` | yes | the requested block left the chain; ask at a current block |
+| `not_verified` | yes | `safe`/`finalized` (or `--require-verified`): no verified block yet |
+| `no_header` | yes | the block's header isn't held yet |
+| `outside_window` | no | the block is older than `--window` and not archived |
+| `outside_retention` | no | older than every connected peer still serves (expired receipts, or a state root peers no longer keep) |
+| `not_archived` | no | an archive read outside the key's covered range |
+| `not_indexed` | no | a transaction not in the index (`--tx-index`) |
+| `not_held` / `key_limit` | no | warm-only mode without the state; the subscribed-key limit refused it |
+| `unavailable` | yes | anything else |
+
+`eth_accounts` and `eth_requestAccounts` return `[]`: skim holds no keys. Browser pages can call skim directly: responses carry `Access-Control-Allow-Origin` per `--cors` (default `*`).
 
 ## Not yet
 `flatCallTracer`, JS tracers, `newPendingTransactions`, blob fee fields in `eth_feeHistory`, tracing transactions older than `--window`.

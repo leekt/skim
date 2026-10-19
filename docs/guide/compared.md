@@ -19,6 +19,19 @@ What sets skim apart is not that it applies BALs without re-executing blocks: fu
 | Missing data | executes the block instead | fetches it, or refuses the request |
 | Purpose | a lagging full node catching up | a small, current, app-specific state for local execution |
 
+**Partial-state clients are being explored elsewhere too.** Geth has an open proposal for a partial-state mode ([PR 33764](https://github.com/ethereum/go-ethereum/pull/33764), not merged as of 2026-10). Its node keeps every account, but the storage and code of only a configured set of contracts, updates them from BALs, and recomputes the account-trie root to check the state root. Untracked contracts' state gets an explicit error, not zero. The PR puts it at ~59 GiB with no contracts tracked, against ~640 GiB full. One of its stated motivations is VOPS (below).
+
+| | Geth partial state (proposal) | skim |
+|---|---|---|
+| Accounts held | all | only the ones used |
+| Storage and code | configured contracts | used or subscribed slots and code |
+| Updates | BALs | BALs |
+| State-root check | recomputes the account-trie root | none: BAL commitment, Merkle proofs for fetched values |
+| State it doesn't hold | an error | fetched from peers over SNAP, with proofs |
+| Minimum size | ~59 GiB (its estimate) | app-sized (measured in [hardware](hardware.md)) |
+
+**VOPS** ([Validity-Only Partial Statelessness](https://ethresear.ch/t/a-pragmatic-path-towards-validity-only-partial-statelessness-vops/22236)) is an architecture proposal, not a client: nodes keep only each EOA's nonce, balance and a code flag (~40 bytes per account), enough to check pending transactions' validity for a censorship-resistant mempool under FOCIL. It doesn't run `eth_call` or keep contract storage. Its native-AA variant, AA-VOPS, keeps only the accounts and slots validation needs, refreshed per block, which is close to skim's model. How skim could grow a validation-state mode: [future considerations](future-considerations.md#a-validation-state-mode-vops-aa-vops).
+
 The verification scopes differ. skim always checks fetched state proofs and block commitments; its default `latest` follows optimistic gossip, while `safe`, `finalized` and `--require-verified` need a bootstrapped light client and usable signed updates. A full or archive node also re-executes every block. See [trust and correctness](trust-and-correctness.md).
 
 **Where the numbers come from:**

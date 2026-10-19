@@ -1,5 +1,16 @@
 # Troubleshooting
 
+**Start with `skim status`.** It asks the running node (`--rpc`, default `http://127.0.0.1:8545`) how it's doing and prints one line per area, with what to do about anything that isn't fine:
+```text
+skim at http://127.0.0.1:8545: skim/0.1.0 (…) (chain 11155111)
+  [ok  ] chain            following: head 11950550, 4 s old
+  [ok  ] execution peers  8 connected, 8 serving state
+  [ok  ] light client     signed head 11950548 (2 behind), finalized not yet
+  [ok  ] state            no subscriptions: everything is read on demand
+  [ok  ] history          head-only; logs from block 11950468 (about the last day)
+```
+It exits 1 if a check fails and 2 if no skim answers, so it works as a health check. Every `-32002` error also says why in `error.data.reason`, and whether retrying can help ([JSON-RPC errors](json-rpc.md#why--32002-errordatareason)).
+
 ### Slow first calls, or `-32002` "no SNAP state peers connected"
 SNAP-serving EL peers have taken **1–4 minutes** to connect on public Sepolia after a cold start. Consensus gossip can make the head state-ready within seconds, but subscriptions can still be missing keys; a ready head does not mean all subscribed state has been fetched.
 

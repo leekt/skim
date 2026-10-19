@@ -34,7 +34,7 @@ read slot x of C at head N
 - A slot is zero **only when proven** (absent account, empty trie, or an exclusion proof). An unproven answer is retried with another peer, never assumed.
 - **Unknown is never zero.** If no peer can serve a value, the request fails with `-32002` instead of returning something wrong.
 
-The fetch scheduler adapts per-peer concurrency (AIMD on latency), hedges slow requests, deduplicates, and keeps a slot free for interactive calls over background work.
+The fetch scheduler adapts per-peer concurrency (AIMD on latency), hedges slow requests, deduplicates, and keeps a slot free for interactive calls over background work. A request is hedged (sent once more, to another peer) when it has run well past the asked peer's own typical latency (its mean plus four deviations, between 150 ms and 1.2 s), and hedges stay under 10% of requests.
 
 ## 3. Subscribed vs on-demand state
 | | Subscribed (in `skim.yaml`) | On demand (everything else) |

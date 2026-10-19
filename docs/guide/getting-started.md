@@ -2,18 +2,24 @@
 
 In about five minutes you'll have skim following Sepolia and answering `eth_call` locally, with your app's state kept ready.
 
-## 1. Build
+## 1. Install
+```bash
+curl -fsSL https://raw.githubusercontent.com/leekt/skim/main/install.sh | sh   # Linux x86_64/aarch64, macOS
+```
+or build it:
 ```bash
 git clone https://github.com/leekt/skim && cd skim
 cargo build --release            # Rust 1.97, pinned by rust-toolchain.toml
 ```
-The binary is `./target/release/skim`. Nothing else is needed: no node, no database server, no API key.
+See [installation](install.md) (checksums, platforms; the script needs a published release). Nothing else is needed: no node, no database server, no API key.
+
+**Zero config:** `skim` alone runs a Sepolia node with JSON-RPC on `127.0.0.1:8545`. Point a wallet, viem, ethers or Foundry at it; every state read is fetched on demand (verified) and kept current while it's used. The rest of this page adds a config that pins your app's hot state, which lowers latency; it's an optimization, not a requirement. `skim status` tells you how a running node is doing.
 
 The examples below use Sepolia. `skim run --network /path/to/network` also accepts custom Glamsterdam networks with the `mainnet` or `minimal` consensus preset; see [network configuration](configuration.md#networks) and the [devnet walkthrough](../../devnet/README.md). Example contract addresses are specific to Sepolia.
 
 ## 2. Run
 ```bash
-./target/release/skim run --config skim.example.yaml
+skim --config skim.example.yaml        # or plain `skim` for no pinned state
 ```
 
 | Port | Protocol | What |

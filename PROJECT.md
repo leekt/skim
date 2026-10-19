@@ -120,7 +120,7 @@ A read first uses held versions, verified complete storage or a contiguous recen
 
 ### 6.3.1 State provider pool (pinned SNAP peers)
 
-The scheduler uses connected SNAP-capable peers, scoring placement by latency and load with adaptive per-peer limits. It deduplicates jobs, batches code requests, hedges slow work and separates interactive/background priorities. `--trusted-peer` keeps selected EL peers connected; public discovery remains enabled in `skim run`. Pinning does not exempt proofs or guarantee availability. Saved-peer ranking favors useful stable peers at restart.
+The scheduler uses connected SNAP-capable peers, scoring placement by latency and load with adaptive per-peer limits. It deduplicates jobs, batches code requests, hedges slow work (after the asked peer's own latency: mean plus four deviations, clamped to 150 ms..1.2 s, within a 10% hedge budget) and separates interactive/background priorities. `--trusted-peer` keeps selected EL peers connected; public discovery remains enabled in `skim run`. Pinning does not exempt proofs or guarantee availability. Saved-peer ranking favors useful stable peers at restart.
 
 EL session defaults are 40 outbound and 15 inbound; CL peer target and mesh default to 50 and 8. These are separate from the scheduler's adaptive request concurrency.
 

@@ -2,17 +2,19 @@
 
 ## Guide
 
-1. [skim compared](guide/compared.md): skim, Helios, a full node and an archive node; costs, resources and guarantees
+1. [skim compared](guide/compared.md): skim, Helios, a full node and an archive node, BAL catch-up in full nodes, Geth's partial-state proposal and VOPS; costs, resources and guarantees
 2. [What to set up for your app](guide/use-cases.md): choose subscriptions, on-demand reads, history and simulations for your workload
-3. [Getting started](guide/getting-started.md): build, run, first call, subscriptions
-4. [How skim works](guide/how-it-works.md): BALs, verified fetches, subscriptions, prediction
-5. [Configuration reference](guide/configuration.md): `skim.yaml`, `skim run` flags, configured Glamsterdam networks and consensus presets
-6. [JSON-RPC reference](guide/json-rpc.md): methods, block tags, subscriptions, block streams, errors
-7. [Archiving history for your state](guide/archive.md): `retention: archive`, backfill
-8. [Hardware requirements](guide/hardware.md): measured CPU, memory, disk and bandwidth; machine sizing
-9. [Memory and latency](guide/memory-and-latency.md): tuning, per-structure memory counters and the reasons behind defaults
-10. [Trust and correctness](guide/trust-and-correctness.md): what's verified, what isn't
-11. [Troubleshooting](guide/troubleshooting.md)
+3. [Installation](guide/install.md): the install script, release binaries and checksums, building from source
+4. [Getting started](guide/getting-started.md): zero-config start, first call, subscriptions
+5. [How skim works](guide/how-it-works.md): BALs, verified fetches, subscriptions, prediction
+6. [Configuration reference](guide/configuration.md): `skim.yaml`, `skim run` flags, configured Glamsterdam networks and consensus presets
+7. [JSON-RPC reference](guide/json-rpc.md): methods, block tags, subscriptions, block streams, errors and their reasons
+8. [Archiving history for your state](guide/archive.md): `retention: archive`, backfill
+9. [Hardware requirements](guide/hardware.md): measured CPU, memory, disk and bandwidth; machine sizing
+10. [Memory and latency](guide/memory-and-latency.md): tuning, per-structure memory counters and the reasons behind defaults
+11. [Trust and correctness](guide/trust-and-correctness.md): what's verified, what isn't
+12. [Troubleshooting](guide/troubleshooting.md): starting with `skim status`
+13. [Future considerations](guide/future-considerations.md): state-root checks from a minimal witness, a validation-state mode (VOPS, AA-VOPS), embedding, peer privacy, RPC conformance
 
 ## Examples
 

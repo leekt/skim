@@ -88,6 +88,8 @@ The `mainnet` preset names consensus constants; it is not a built-in `--network 
 Consensus bootstrap uses `--checkpoint`, then a saved verified finalized root, then `--checkpoint-url`. Only built-in Sepolia supplies a default checkpoint URL. With no checkpoint source on another network, the node follows gossip optimistically and records the bootstrap error in `skim_status.light_client`; `--require-verified` refuses `latest` until verification succeeds. See the [devnet example](../../devnet/README.md) and [trust guide](trust-and-correctness.md).
 
 ## `skim run` flags
+`skim` with no subcommand (or with only these flags) is `skim run`: with no config at all it follows Sepolia, serves JSON-RPC on `127.0.0.1:8545`, and fetches every state read on demand. `skim status` asks a running node how it's doing (chain, peers, light client, subscriptions) and says what to do about problems.
+
 Only `skim run` follows networks other than Sepolia (`--network`). The other subcommands (`probe-*`, including `probe-retention`, `follow`, `bench-node`) are diagnostics and measurement tools from the experiments and are Sepolia-only.
 
 | Flag | Default | Meaning |
@@ -98,6 +100,7 @@ Only `skim run` follows networks other than Sepolia (`--network`). The other sub
 | `--cl-peer <multiaddr>` | none | CL peers to dial directly and keep (`/ip4/…/tcp/…/p2p/<peer id>`), e.g. a devnet's beacon nodes (repeatable) |
 | `--hub <url>` | none | attach to a skim-hub: **not supported yet**, skim refuses to start with it |
 | `--rpc <addr>` | `127.0.0.1:8545` | JSON-RPC listen address (HTTP and WebSocket; single and batch requests) |
+| `--cors <origin\|*\|none>` | `*` | `Access-Control-Allow-Origin` for browser pages calling skim directly. `*` lets any page in this machine's browser call it; skim holds no keys and listens on localhost by default. Set an origin, or `none`, if the RPC is exposed beyond this machine |
 | `--cl-port <port>` | `9130` | consensus-layer libp2p TCP + discv5 UDP; QUIC on port+1 |
 | `--el-port <port>` | `30388` | execution-layer RLPx TCP + discovery UDP |
 | `--window <blocks>` | `256` | in-memory history for reads at recent blocks and reorgs |
