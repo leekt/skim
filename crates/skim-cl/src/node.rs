@@ -790,6 +790,10 @@ impl Runner {
         }
     }
 
+    fn is_explicit(&self, peer: &PeerId) -> bool {
+        self.cfg.explicit_peers.iter().any(|a| matches!(a.iter().last(), Some(Protocol::P2p(p)) if &p == peer))
+    }
+
     fn dial_explicit(&mut self) {
         for addr in self.cfg.explicit_peers.clone() {
             let Some(Protocol::P2p(peer)) = addr.iter().last() else { continue };
@@ -884,6 +888,9 @@ impl Runner {
                 if num_established != 0 {
                     return;
                 }
+                if self.is_explicit(&peer_id) {
+                    tracing::info!(peer = %peer_id, cause = ?cause.as_ref().map(|c| c.to_string()), "CL explicit peer: connection closed");
+                }
                 if let Some(p) = self.peers.remove(&peer_id) {
                     let _ = self.tx.try_send(ClEvent::PeerDisconnected(SessionEnd {
                         peer: peer_id,
@@ -898,8 +905,13 @@ impl Runner {
                     }));
                 }
             }
-            SwarmEvent::OutgoingConnectionError { .. } => {
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 self.stats.lock().unwrap().dial_failures += 1;
+                // Peers the operator named (`--cl-peer`) get their failures reported: they're
+                // what a private network or a devnet depends on.
+                if peer_id.is_some_and(|p| self.is_explicit(&p)) {
+                    tracing::warn!(peer = ?peer_id, "CL explicit peer: dial failed: {error}");
+                }
             }
             SwarmEvent::Behaviour(b) => self.on_behaviour(b).await,
             _ => {}
