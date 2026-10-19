@@ -67,6 +67,8 @@ pub struct StoreSizes {
     pub code_bytes: usize,
     /// Subscriptions refused because the subscribed-key limit was reached (kept on demand).
     pub admissions_refused: u64,
+    /// Archive base writes (one redb transaction each) since start.
+    pub archive_base_writes: u64,
     /// On-demand keys evicted early because `max_on_demand` was reached.
     pub on_demand_evicted: u64,
     /// Reads of untracked keys answered from a recent BAL write instead of a fetch.
@@ -119,6 +121,9 @@ struct Inner {
     temp: HashMap<StateKey, u64>,
     /// Keys whose every version goes to the on-disk archive.
     archived: HashSet<StateKey>,
+    /// Archived keys whose base (the value they were known at) is in the current archive
+    /// segment, by the block it was written at. Re-subscribing such a key writes nothing.
+    based: HashMap<StateKey, u64>,
     pending_headers: HashMap<B256, Vec<u8>>,
     recent: BTreeMap<u64, Arc<BlockWrites>>,
     code: HashMap<B256, Bytes>,
@@ -277,6 +282,7 @@ pub struct Store {
     /// Hard limit on subscribed keys, enforced where keys are admitted (not just counted).
     max_subscribed: std::sync::atomic::AtomicUsize,
     admissions_refused: std::sync::atomic::AtomicU64,
+    archive_base_writes: std::sync::atomic::AtomicU64,
     /// Hard limit on on-demand (TTL) keys; the soonest-expiring are evicted first.
     max_on_demand: std::sync::atomic::AtomicUsize,
     on_demand_evicted: std::sync::atomic::AtomicU64,
@@ -308,6 +314,7 @@ impl Store {
             archive_errors: Default::default(),
             max_subscribed: std::sync::atomic::AtomicUsize::new(usize::MAX),
             admissions_refused: Default::default(),
+            archive_base_writes: Default::default(),
             max_on_demand: std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_ON_DEMAND),
             on_demand_evicted: Default::default(),
             resolved_from_bal: Default::default(),
@@ -334,6 +341,7 @@ impl Store {
             archive_errors: Default::default(),
             max_subscribed: std::sync::atomic::AtomicUsize::new(usize::MAX),
             admissions_refused: Default::default(),
+            archive_base_writes: Default::default(),
             max_on_demand: std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_ON_DEMAND),
             on_demand_evicted: Default::default(),
             resolved_from_bal: Default::default(),
@@ -436,9 +444,11 @@ impl Store {
         if !st.archived.insert(k) {
             // Already archived (e.g. reloaded after a restart) is not "its value is archived": a
             // value known in memory has to become this segment's base, whether this call seeded
-            // it or something earlier did (an on-demand read warming the key first). Repeating a
-            // base is harmless: it never overwrites a BAL write, and coverage only moves earlier.
-            self.archive_known_versions(&st, &k);
+            // it or something earlier did (an on-demand read warming the key first). Once it is,
+            // re-subscribing (every block, from subscription maintenance) writes nothing.
+            if !st.based.contains_key(&k) {
+                self.archive_known_versions(&mut st, &k);
+            }
             return true;
         }
         let mem = st.archivable_versions(&k, &|n, h| ar.hash(n).ok().flatten() == Some(h));
@@ -446,7 +456,14 @@ impl Store {
             tracing::warn!(?k, "archive: a known value has no archived block to start from; archived from its next write");
         }
         let r = match mem.split_first() {
-            Some(((b0, h0, v0), rest)) => ar.write_base(&k, *b0, *h0, *v0, rest),
+            Some(((b0, h0, v0), rest)) => {
+                self.archive_base_writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let r = ar.write_base(&k, *b0, *h0, *v0, rest);
+                if r.is_ok() {
+                    st.based.insert(k, *b0);
+                }
+                r
+            }
             None => ar.add_keys(&[k]),
         };
         self.archive_try(r);
@@ -457,11 +474,15 @@ impl Store {
     /// Writes `k`'s in-memory versions to the archive as its base (hash-checked against the
     /// archived blocks; a version older than the archive starts at its first block instead).
     /// Callers hold the write lock, so archive and memory change together.
-    fn archive_known_versions(&self, st: &Inner, k: &StateKey) {
+    fn archive_known_versions(&self, st: &mut Inner, k: &StateKey) {
         let Some(ar) = &self.archive else { return };
         let mem = st.archivable_versions(k, &|n, h| ar.hash(n).ok().flatten() == Some(h));
         if let Some(((b0, h0, v0), rest)) = mem.split_first() {
+            self.archive_base_writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let r = ar.write_base(k, *b0, *h0, *v0, rest);
+            if r.is_ok() {
+                st.based.insert(*k, *b0);
+            }
             self.archive_try(r);
         }
     }
@@ -526,6 +547,7 @@ impl Store {
             if !st.archived.remove(k) {
                 continue;
             }
+            st.based.remove(k);
             if let Some(ar) = &self.archive {
                 let r = ar.end_coverage(k, head);
                 self.archive_try(r);
@@ -579,7 +601,7 @@ impl Store {
                     // An archived key's value just became known: archive it now, as the BAL
                     // seeding does, rather than relying on a later subscription to notice.
                     if st.archived.contains(k) {
-                        self.archive_known_versions(&st, k);
+                        self.archive_known_versions(&mut st, k);
                     }
                 }
             }
@@ -751,6 +773,8 @@ impl Store {
         }
         st.chain.retain(|n, _| *n <= number);
         st.hashes.retain(|n, _| *n <= number);
+        // A base written above the fork point was truncated with it.
+        st.based.retain(|_, b| *b <= number);
         // A download taken at a block that's now orphaned is no longer this chain's state.
         st.complete.retain(|_, c| c.block <= number);
         st.recent.retain(|n, _| *n <= number);
@@ -796,7 +820,7 @@ impl Store {
                 // An archived key now known: its archive coverage starts here too (at the first
                 // block the archive holds, if the value predates it), as when it was archived.
                 if st.archived.contains(&k) {
-                    self.archive_known_versions(&st, &k);
+                    self.archive_known_versions(&mut st, &k);
                 }
             }
         }
@@ -869,7 +893,11 @@ impl Store {
             if let (Some(ar), Some((n, v))) = (&self.archive, base) {
                 let later: Vec<(u64, B256, U256)> =
                     later.iter().filter_map(|(m, x)| st.chain.get(m).map(|b| (*m, b.hash, *x))).collect();
+                self.archive_base_writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let r = ar.write_base(&key, n, at.hash, v, &later);
+                if r.is_ok() {
+                    st.based.insert(key, n);
+                }
                 self.archive_try(r);
             }
         }
@@ -889,6 +917,7 @@ impl Store {
             code: st.code.len(),
             code_bytes: st.code.values().map(|c| c.len()).sum(),
             admissions_refused: self.admissions_refused.load(std::sync::atomic::Ordering::Relaxed),
+            archive_base_writes: self.archive_base_writes.load(std::sync::atomic::Ordering::Relaxed),
             resolved_from_bal: self.resolved_from_bal.load(std::sync::atomic::Ordering::Relaxed),
             bal_promotions: self.bal_promotions.load(std::sync::atomic::Ordering::Relaxed),
             on_demand_evicted: self.on_demand_evicted.load(std::sync::atomic::Ordering::Relaxed),

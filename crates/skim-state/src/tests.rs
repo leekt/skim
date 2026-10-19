@@ -848,6 +848,37 @@ fn a_reloaded_archived_key_warmed_by_an_on_demand_read_first_still_gets_a_base()
 }
 
 #[test]
+fn re_subscribing_an_archived_key_whose_base_is_written_writes_nothing() {
+    // Review: subscription maintenance re-registers archive keys every block, and each
+    // registration rewrote the key's base (one redb commit per key) even with nothing new.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("a.redb");
+    {
+        let s = Store::with_archive(8, archive::Archive::open(&path).unwrap()).unwrap();
+        s.apply_block(blk(1, 0), writes(&[(slot(1), 4)])).unwrap();
+        s.archive_key(slot(1));
+        s.apply_block(blk(2, 0), writes(&[])).unwrap();
+    }
+    let s = Store::with_archive(8, archive::Archive::open(&path).unwrap()).unwrap();
+    s.apply_block(blk(20, 0), writes(&[])).unwrap();
+    let run: Vec<_> = (13..=19).map(|n| (blk(n, 0), if n == 17 { writes(&[(slot(1), 6)]) } else { writes(&[]) })).collect();
+    s.seed_recent(&run).unwrap();
+    s.touch_ttl(&[slot(1)], 4);
+    let after_warm = s.sizes().archive_base_writes;
+    assert_eq!(after_warm, 1, "the warm-up wrote the new segment's base");
+    for _ in 0..50 {
+        assert!(s.archive_key_checked(slot(1)));
+    }
+    assert_eq!(s.sizes().archive_base_writes, after_warm, "re-subscribing wrote nothing more");
+    // Released and archived again: a new segment, so one base write again.
+    s.release_archived(&[slot(1)]);
+    assert!(s.archive_key_checked(slot(1)));
+    assert_eq!(s.sizes().archive_base_writes, after_warm + 1);
+    let ar = s.archive().unwrap();
+    assert_eq!(ar.get(&slot(1), 20).unwrap(), archive::ArchiveRead::Value(U256::from(6)));
+}
+
+#[test]
 fn a_reloaded_archived_key_promoted_after_seeding_gets_a_base_in_the_new_segment() {
     // Review (reverse ordering): K was archived in an earlier run. After the restart (block 20)
     // the recent BALs are seeded first, with K = 6 from block 17, and only then does a
