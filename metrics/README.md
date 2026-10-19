@@ -47,7 +47,9 @@
 | JSON-RPC | request rate, P95 latency and outcomes per method, plus a method table |
 | State and addresses | the addresses your calls read (pinned / partly pinned / on demand, keys fetched), call and fetch rates per address, store size, subscription readiness |
 | Serving the network | requests skim answered for other peers, and items sent |
-| Process | CPU, RSS, file descriptors, threads |
+| Process | CPU, RSS, file descriptors, threads, estimated retained data and entries by structure |
+
+The process row's "Retained data by structure (stacked) vs RSS" compares payload estimates with RSS; "Entries by structure" shows occupancy. `skim_status.memory.parts` exposes the same `part`, `entries`, `bytes` and `capacity` records. Some capacities are actual collection capacities, others limits or current counts; peer-buffer bytes are not measured. The gap to RSS also includes database caches, other uninstrumented allocations, allocator overhead and resident code pages. See [memory and latency](../docs/guide/memory-and-latency.md).
 
 ## Alerts
 `provisioning/grafana/alerting/skim-alerts.yaml` provisions four rules. They show in Grafana under **Alerting**; add a contact point there (Slack, email, …) to be notified.
@@ -55,11 +57,13 @@
 | Alert | Fires when |
 |---|---|
 | No SNAP state peers | 0 SNAP peers for 5 min: state skim doesn't hold can't be fetched |
-| Head behind | the head is over 3 slots old for 2 min, or the node stopped reporting |
+| Head behind | the head is over 36 s old for 2 min (3 Sepolia slots), or the node stopped reporting |
 | Subscription not ready | a subscription isn't ready for 5 min |
 | Requests refused | over 10% of requests answered `-32002` for 10 min |
 
 For a ready-to-paste `skim.yaml` block covering the hot addresses that aren't pinned, call `skim_dashboard` (JSON-RPC) and read `.result.suggestion`.
+
+The bundled head-age threshold is fixed at 36 s. Adjust it for a custom network's slot duration; choosing `--network` does not rewrite Grafana's provisioned rules.
 
 ## Metrics
 | Metric | Type | Labels |
@@ -74,6 +78,8 @@ For a ready-to-paste `skim.yaml` block covering the hot addresses that aren't pi
 | `skim_el_session_closes_total` | counter | `reason` (`TooManyPeers` = the peer was full) |
 | `skim_el_first_snap_peer_seconds`, `skim_el_snap_peers_seen`, `skim_el_snap_peers_held` | gauge | |
 | `skim_snap_peers` | gauge | |
+| `skim_memory_bytes`, `skim_memory_entries`, `skim_memory_capacity` | gauge | `part` (instrumented structure; byte estimates are not total heap) |
+| `skim_peer_requests_total` | counter | `kind` (headers, bodies, receipts, BALs, SNAP account/storage/code/other; continuations count again) |
 | `skim_peer_clients` | gauge | `layer`, `client` |
 | `skim_snap_peer_latency_ms`, `skim_snap_peer_inflight` | gauge | `peer`, `client` |
 | `skim_snap_peer_answers_total`, `skim_snap_peer_errors_total` | counter | `peer`, `client` |

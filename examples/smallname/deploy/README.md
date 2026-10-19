@@ -7,11 +7,13 @@ Measured on Sepolia with the ENS config (`examples/bigname/skim.yaml`), `--histo
 
 | | Memory |
 |---|---|
-| skim, following the head | ~110-125 MB RSS |
-| skim, catching up the whole post-fork history | up to ~500 MB while it runs |
+| skim, following the head | Linux aarch64: 179 MB at 26 min in one run, reaching 276 MB over a measured 3 h run |
+| skim, catching up the whole post-fork history | earlier builds reached ~500 MB transiently; the current peak has not been re-measured |
 | smallname (node) | ~90-160 MB |
 
 A 1 GB machine runs it after the first catch-up but swaps during it. 2 GB or more is comfortable.
+
+These are observations from different runs, not memory ceilings. See [hardware requirements](../../../docs/guide/hardware.md) for conditions, the three-hour curve and open attribution work. The service/config below is for Sepolia ENS contracts; custom networks also need their own app contracts and node `--network` configuration.
 
 **Disk:** skim's `history.redb` holds post-fork headers (about 130 MB) plus the stream matches smallname asked for (small). smallname's index is about 20 MB.
 
@@ -20,6 +22,7 @@ A 1 GB machine runs it after the first catch-up but swaps during it. 2 GB or mor
    - skim: a release binary (`skim-main-<target>.tar.gz` from the release workflow; aarch64 and x86_64 Linux) in `/opt/skim`, with `examples/bigname/skim.yaml` as `/opt/skim/skim.yaml`.
    - smallname: `examples/smallname`, `examples/package.json` and `examples/package-lock.json` in `/opt/smallname`, then `npm ci --omit=dev` there.
 2. **Services:** copy [`skim.service`](skim.service) and [`smallname.service`](smallname.service) to `/etc/systemd/system/`, adjust users and paths, then run `systemctl enable --now skim smallname`.
+   - Create the service user and writable data directories first (`/var/lib/skim` and `/var/lib/smallname` in these units); smallname needs Node 22.13+ with `node:sqlite`.
    - smallname starts its index at the fork (or as far back as peers still serve logs), catches up through skim's block stream, then follows the head.
    - Check progress at `curl localhost:8787/v1/status`.
 3. **Public endpoint:** a tunnel ([`cloudflared.yml`](cloudflared.yml)) or any reverse proxy that forwards only `/`, `/v1/*` and `/healthz` to `127.0.0.1:8787`.

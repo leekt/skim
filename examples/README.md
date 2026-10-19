@@ -2,10 +2,14 @@
 
 Runnable apps that use skim as their Ethereum endpoint. The scripts are plain [viem](https://viem.sh): the only skim-specific part is the URL, plus the `skim.yaml` that tells skim what to keep ready.
 
+These configs and scripts use Sepolia addresses and viem's Sepolia chain definition. `skim run` also follows custom Glamsterdam networks, but using these examples there requires replacing contracts and client chain settings; changing `network:` in YAML does not select a chain. See [network configuration](../docs/guide/configuration.md#networks) and the separate [devnet check](../devnet/README.md).
+
 ```bash
 cargo build --release                                   # once, from the repo root
 cd examples && npm install                              # viem 2.57.1, pinned
 ```
+
+Run the commands below from `examples/`. Wait for the relevant `skim_subscriptionStatus` entries to be ready, not just the first `state ready` line: the latter means a block was applied, and subscribed state may still be fetching. Recorded output and timings below are observations from Sepolia runs.
 
 | Example | Shows |
 |---|---|

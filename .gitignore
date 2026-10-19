@@ -9,3 +9,4 @@ fuzz/artifacts/
 fuzz/coverage/
 fuzz/corpus/
 devnet/out/
+/target-fat

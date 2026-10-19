@@ -2,7 +2,9 @@
 
 **bigname, but small.** The same kind of ENS API ([bigname](https://github.com/ensdomains/bigname)'s `/v1` shape, Sepolia), with skim serving current state and a small SQLite index handling discovery and history, instead of a full application-side state projection.
 
-Smaller infrastructure and implementation (about 1,700 lines of JavaScript, one SQLite file, one skim node), but not feature-for-feature parity yet: see [Routes](#routes) and the history limits below.
+The implementation uses plain JavaScript, one SQLite database and one skim node, with a narrower feature set than bigname: see [Routes](#routes) and the history limits below. Its contracts and chain settings are specific to Sepolia, even though the node supports other configured Glamsterdam networks.
+
+Run from `examples/` after `npm ci`. Check `skim_subscriptionStatus` for readiness; the first `state ready` line alone does not mean every ENS dependency is loaded.
 
 ```bash
 ../target/release/skim run --config bigname/skim.yaml --history local   # terminal 1: skim, ENS kept warm, post-fork history on disk
@@ -21,7 +23,7 @@ smallname avoids maintaining a complete current-state projection. Each kind of a
 |---|---|---|
 | **Current values** (owner, manager, expiry, status, resolver, records, primary name) | projected from events | **read live from skim** at one block hash per response (`meta.as_of`), through the registries, NameWrapper and the Universal Resolver |
 | **Lists and history** (subnames, names by address, search, expiry lists, timelines) | PostgreSQL | an SQLite index of events, label preimages, the name tree, and candidates: relationships, expiries and record keys. Every listed name is re-checked live before it's returned |
-| **History** | every block from 0 (`eth_getBlockByNumber` for each block, plus logs) | **from Glamsterdam on**, through skim's `eth_getLogs` |
+| **History** | every block from 0 (`eth_getBlockByNumber` for each block, plus logs) | **from Glamsterdam on**, through skim's `skim_streamNext` with matching log filters |
 | **Chain access** | an archive / log provider | skim only |
 
 **What this guarantees, and what it doesn't:**
@@ -101,7 +103,7 @@ A name created before the index starts still resolves and has a full profile; th
 - **Primary names:** answered `verified` only. The `indexed` answer is `unsupported`, because smallname doesn't keep a stored claim.
 
 ## Finality
-Each stream response carries the block skim's light client verified as finalized. smallname records it (`finalized_block` in `/v1/status` and `meta.index`). It keeps reorg bookkeeping (the block hashes it sends as `recent`) only above it, plus one anchor at or below it.
+Each stream response carries `finalized` when skim's light client has authenticated a finalized execution block on its selected chain; otherwise it is null. smallname records it (`finalized_block` in `/v1/status` and `meta.index`). It keeps reorg bookkeeping (the block hashes it sends as `recent`) only above it, plus one anchor at or below it. Availability depends on bootstrap and signed updates; inspect `skim_status.light_client` ([trust guide](../../docs/guide/trust-and-correctness.md)).
 
 **Irreversible exports:** an app that exports from the index (to another database, a queue, an email) should export only rows at or below `finalized_block`. Rows above it can still be rolled back by a `rewind`. Rows at or below it can't: a finalized block isn't reorged out, which is what the light client verifies. Without a light client (`finalized_block: null`), nothing is final, and such exports should wait.
 
@@ -116,16 +118,16 @@ Service units, a tunnel config and sizes: [`deploy/`](deploy).
 | `sync.mjs` | a consumer of skim's block stream (`skim_streamNext`): applies `apply` / `rewind` / `gap` events with the cursor in the same SQLite transaction |
 | `live.mjs` | live reads at a block hash: name state, records, primary names |
 | `api.mjs` | the `/v1` routes |
-| `store.mjs` | SQLite schema; every row carries its block, so a reorg is one `DELETE … WHERE block > n` per table |
+| `store.mjs` | SQLite schema/migrations and transactional rollback; keeps record-key occurrences so removing a later fork's write preserves earlier inventory |
 | `page.html` | the test page |
 
 Env:
 - `SKIM_RPC` (default `http://localhost:8545`)
 - `DB` (default `smallname.db`)
 - `PORT` (default `8787`); `HOST` to bind one interface (e.g. `127.0.0.1` behind a proxy)
-- `FROM_BLOCK`: start a new index later than the fork
+- `FROM_BLOCK`: start a new index at a chosen block, clamped to the Sepolia Glamsterdam floor; ignored after a saved cursor exists
 
-Node 23+, run with `--experimental-sqlite` (the npm script passes it).
+Node 22.13+; CI uses 22.23.2. Run with `--experimental-sqlite` (the npm script passes it).
 
 ## Latency
 Same machine as skim, after the catch-up. **Cold** is the first request after skim restarted, when skim fetches that state from peers; **warm** is the best of the next two.

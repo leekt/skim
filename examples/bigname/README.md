@@ -4,7 +4,7 @@
 
 | bigname needs | RPC | skim |
 |---|---|---|
-| **Historical intake** from block 0: every ENS event since deployment | `eth_getLogs` over millions of blocks, `eth_getBlockByNumber` | **No.** skim serves logs for the recent window only (receipts from eth/71 peers). Use an archive or log provider for intake |
+| **Historical intake** from block 0: every ENS event since deployment | `eth_getLogs` over millions of blocks, `eth_getBlockByNumber` | **No full-history intake.** `--history local` can serve post-Glamsterdam history while peers or stored coverage supply it; pre-fork history still needs another source |
 | **Live follow** at the head | `eth_getLogs` per block range, `eth_getBlockByHash`, receipts | Yes, for the blocks skim holds |
 | **Verified lookups** (API `?verify`): Universal Resolver `eth_call` pinned to a block hash | `eth_call` with `{ blockHash }` | Yes. This is what `skim.yaml` keeps warm |
 | **Hydration** (phase runner): resolver reads for names the indexer saw change | `eth_call` | Yes |
@@ -12,11 +12,14 @@
 So skim takes the read load (verified lookups and hydration, the calls that scale with traffic) and the reference provider handles the one-time backfill.
 
 **Limits:**
-- Sepolia only, until mainnet ships Glamsterdam (skim needs block access lists).
+- This example's manifests, addresses and viem chain are Sepolia-specific. The node also accepts compatible custom Glamsterdam networks via `--network <dir>`, with app-specific contracts/configuration supplied separately.
 - No Base or other L2s: those bigname sources need their own provider.
 - A name skim hasn't seen takes a few fetch rounds the first time (0.3–1.6 s below), then stays local for `cache_ttl_blocks`.
 
 ## Run
+
+From `examples/`, after installing its dependencies:
+
 ```bash
 ../target/release/skim run --config bigname/skim.yaml          # terminal 1 (wait for "state ready")
 SKIM_RPC=http://localhost:8545 REF_RPC=<another sepolia rpc> npm run ens -- ens.eth nick.eth vitalik.eth

@@ -1,596 +1,229 @@
 # skim
 
-**A P2P-backed Ethereum simulation client.**
-skim follows recent execution state directly from the Ethereum P2P network. It runs EVM simulations locally through a native Rust API and a standard JSON-RPC endpoint. It needs no full node and no RPC provider.
+**A P2P-backed Ethereum state and simulation client for applications.**
 
-| | |
+This document describes the implemented architecture as of 2026-10-19. Operator instructions live in the [guides](docs/README.md); measured runs remain in [experiment logs](docs/README.md#experiment-logs), and unfinished work is listed in [TODO](docs/TODO.md).
+
+| | Current implementation |
 |---|---|
-| Status | Design v0.4, M0 in progress |
-| Target | Ethereum Sepolia, Glamsterdam (active since 2026-10-06 13:53:36 UTC) |
-| Language | Rust |
-| Core dependencies | Reth networking crates (EL P2P), a CL gossip stack (TBD in M0), REVM |
-| Date | 2026-10-14 |
-
----
+| Status | Experimental; BAL follower, verified state, local simulation, selective archive and block streams implemented |
+| Networks | Sepolia built in; other post-Glamsterdam networks through `skim run --network <dir>` |
+| Consensus presets | `mainnet` and `minimal`; preset-sized light-client verification and committee rotation |
+| Language/toolchain | Rust 2024; Rust 1.97.0 pinned in `rust-toolchain.toml` |
+| Core dependencies | reth v2.7.0 networking, libp2p/discv5, revm 43, alloy, redb, axum |
 
 ## 1. Thesis
 
-A full node gives fast local simulation. The cost is executing and storing the whole chain, even when an application only touches a small slice of state.
+An application can keep a small working set current without downloading the whole execution state or re-executing every block. skim applies the absolute post-values in EIP-7928 block access lists (BALs), resolves unknown state over SNAP with verified proofs, and executes calls locally.
 
-skim keeps only the state its users need and stays current by applying EIP-7928 Block Access Lists (BALs) instead of re-executing blocks.
+Warm calls need no network state fetch. Cold calls depend on peer availability and the number of sequential dependencies: a proxy implementation, its code, then storage-derived addresses can require several rounds. A small resource footprint does not guarantee faster cold calls than a hosted node.
 
-**What it is:** local simulation with much lower memory, disk, CPU and operational cost than a full node, for workloads with a bounded, predictable working set.
-
-**What it is not:** a faster alternative to an in-process Reth/REVM setup. Warm simulation speed should be comparable, not better.
-
-### Latency targets by cache state
-
-| State | Target |
-|---|---|
-| **Warm**: every key known locally | Close to a full node's in-process execution; zero network requests |
-| **Partially cold**: a few keys missing, shallow dependency chain | Competitive with a hosted RPC provider (Infura) `eth_call` |
-| **Fully cold**: new contracts, no peers yet, or deep dependency chains | Recover as fast as possible; no performance advantage promised |
-
-Conceptual cold-call model (not measured):
-
-```
-T_skim  ≈ Σ_{i=1..k} T_snap_round(i) + (k+1)·T_revm
-T_infura ≈ T_rpc_rtt + T_server_exec
-```
-
-`k` is the number of **sequential** fetch rounds. Independent misses collapse into one round (§7.2). `k` grows only along data dependencies: an address or slot key derived from a value not yet known. Examples:
-- a proxy's implementation slot leading to that implementation's code
-- an account's code hash leading to its code
-- a pool address read from storage leading to that pool's slots
-
-With `k = 1` and a nearby, responsive SNAP peer, skim can beat a hosted RPC. With `k ≈ 5`, it likely loses. M0 measures where the crossover sits.
-
-**One narrow performance hypothesis, to be measured rather than promised:** under ePBS, a BAL-based client that receives execution-payload gossip might have usable post-state *before* a conventional node finishes executing the block.
-
-### Three properties, kept distinct
-
-- **Provider independence.** At runtime, every byte comes from Ethereum P2P. Reference RPC nodes are allowed only in test and benchmark harnesses.
-- **Lightweight execution.** skim does not store or execute the whole chain.
-- **Interface compatibility.** It offers a native Rust API, plus a JSON-RPC adapter for simulation methods so existing `cast`, viem, ethers and Foundry code works unchanged.
+State, block data and light-client updates use P2P. Consensus bootstrap can obtain its initial trusted root from an HTTP checkpoint endpoint. Reference Ethereum JSON-RPC endpoints are used by diagnostic and differential-test tools, not as a state fallback in `skim run`.
 
 ## 2. Scope
 
-### Target workloads
-- RFQ quote engines, intent solvers, DEX pool simulation, protocol-specific simulators: any repeated simulation over a known set of contracts and slots.
-- Foundry fork mode (`anvil --fork-url`, `forge test --fork-url`) and `cast call` against recent blocks.
-- Resource-constrained deployments that need local EVM execution without full-node infrastructure.
+Implemented workloads include local simulation and tracing, current state reads, signed-transaction broadcast and lookup, verified receipts/logs, WebSocket subscriptions, app block streams and selective state history.
 
-### Simulation only
-skim is a simulation client. It does not:
-- send transactions (`eth_sendRawTransaction`), run a TxPool, or track `pending` state
-- serve receipts, logs or transaction lookups (`eth_getLogs`, `eth_getTransactionReceipt`, `eth_getTransactionByHash`)
-- serve archive queries outside the retention window
-- validate the chain trustlessly (see §10)
-- reconstruct the full state trie or re-execute blocks
+The node does not reconstruct the whole state trie, re-execute every block, hold a general mempool or reconstruct arbitrary pre-Glamsterdam history. Default `latest` follows state-ready gossip optimistically; verified tags and `--require-verified` use the consensus light client (§8).
 
-Simulated logs, which REVM produces for each simulation, *are* returned in simulation results.
-
-### Non-goals for the initial release
-- Beating full nodes on raw warm simulation speed
-- Workloads with unbounded or unpredictable state access
-- Acting as a security-critical wallet backend
+Example contract addresses and public-network measurements use Sepolia. A custom chain needs its own contract configuration and post-Glamsterdam EL/CL peers. `--hub` is reserved for a separate shared-data integration and currently refuses startup.
 
 ## 3. Protocol basis
 
 ### 3.1 EIP-7928: Block-Level Access Lists
-Each account entry carries `storage_changes`, `storage_reads`, `balance_changes`, `nonce_changes` and `code_changes`.
-- Change values are **absolute post-values**, indexed by `block_access_index`:
-  - `0`: pre-execution system calls
-  - `1..n`: transactions
-  - `n+1`: post-execution calls and withdrawals
-- `storage_reads` carries keys only, with no values.
-- The header commits to the BAL as `block_access_list_hash = keccak256(rlp(BAL))`.
-- The BAL is **not** in the block body. It is a field of `ExecutionPayload` (Engine API `ExecutionPayloadV4`).
-- EL nodes must retain BALs for at least the weak-subjectivity period (3533 epochs).
 
-Consequences for skim:
-- An absolute write to a watched key that skim doesn't know yet makes it known immediately, with no SNAP request.
-- Read-only entries never make a key known.
-- A storage write that leaves the value unchanged is recorded as a read.
-- For an account created and destroyed in the same transaction, nonce and code changes are omitted and its storage accesses appear as reads. These must not be treated as persistent writes.
+BAL entries include account changes, storage changes and reads. Changes carry absolute post-values indexed by `block_access_index`: 0 for pre-execution system calls, 1 through n for transactions, and n+1 for post-execution work. Read-only entries carry no values and cannot establish a missing value.
+
+`skim-bal` checks the commitment against the exact raw RLP bytes before decoding. `BlockWrites::from_bal` normalizes final per-key writes; `BlockWrites::before` builds changes preceding a transaction for mined-transaction replay.
 
 ### 3.2 Gloas ePBS execution-payload gossip (preferred fast path)
-- The Gloas P2P spec defines an `execution_payload` gossip topic carrying `SignedExecutionPayloadEnvelope`. Its `ExecutionPayload` includes the full `block_access_list`. EIP-7928's pruning allowance applies to long-term storage, not to live gossip.
-- So one message delivers the block hash, state root, transactions and BAL.
-- **Verifying a gossiped payload** (there is no header on this path):
-  1. Rebuild the execution header from the payload fields, with `block_access_list_hash = keccak256(rlp(BAL))`.
-  2. Check that `keccak256(rlp(header)) == payload.block_hash`.
-  3. Check that `payload.block_hash` equals the bid's `block_hash` committed in the beacon block.
 
-  This ties the BAL to a builder-signed bid inside a proposer-signed block, even before skim verifies any signatures.
-- **Measured (Lighthouse, 1,348 slots):** envelopes arrive P50 764 ms / P95 2.7 s after slot start. That is about 0.9 s earlier than skim's EL path (header poll + eth/71 BAL) and about 0.3–0.5 s before public EL nodes serve the header.
-- **Own listener works (`skim-cl`, `skim probe-cl`, `docs/experiments/m0-spike-a.md`).** It uses libp2p 0.57 + discv5 and a hand-written envelope parser. Over 139 slots:
-  - envelope P50 823 ms / P95 2.7 s (about 0.1–0.2 s behind Lighthouse's post-validation log)
-  - EL header rebuilt from the payload, hash equal to `block_hash` in 139/139
-  - bid link 138/138
-  - about 0.3 ms per envelope
+`skim-cl` receives `SignedExecutionPayloadEnvelope` through `execution_payload` gossip or consensus req/resp. It rebuilds the EL header, checks its block hash and BAL commitment, and checks the payload's link to the beacon block's execution-payload bid. These commitment checks do not themselves validate all proposer or builder signatures.
 
-  Open risks: a small `execution_payload` mesh, no inbound peers (ENR without IP), advertised data-column custody that isn't served, no BLS checks.
-- **ePBS separates three stages:** block commitment, payload reveal and payload status (full or empty). A received payload is only a *candidate* until the chain tracker selects it.
-- Joining CL gossip requires discv5 with eth2 ENRs (correct fork digest), libp2p gossipsub, and Status/Metadata/Ping request-response. A listen-only node may get scored down or dropped. M0 measures this.
+Networking uses discv5 and libp2p gossipsub, QUIC and TCP with yamux, and consensus Status/Metadata/Ping and payload/light-client request protocols. A configured network supplies genesis, preset, slots and fork versions. Blob-parameter fork digests follow `BLOB_SCHEDULE`; gossip topics overlap around transitions. A live transition and remaining TCP-muxer interoperability are still in [TODO](docs/TODO.md).
 
 ### 3.3 eth/71 (EIP-8159): BAL retrieval over EL P2P
-- Messages: `GetBlockAccessLists` (0x12) / `BlockAccessLists` (0x13), by block hash.
-- An unavailable BAL comes back as `0x80`, the RLP empty string. A valid empty BAL is `0xc0`.
-- Unavailable may just mean the peer pruned it, so retry other peers before giving up.
-- Uses: fallback when gossip is missing, catch-up after a disconnect, and reorgs.
+
+Execution peers supply headers, bodies, receipts and `GetBlockAccessLists` by hash. Header links and commitments are verified before use. A valid empty BAL (`0xc0`) differs from unavailable data (`0x80`). EL BAL requests fill gaps, recover reorg branches, heal archived segments and backfill history while peers retain it.
 
 ### 3.4 snap/2 (EIP-8189): state retrieval
-- skim uses messages 0x00–0x05: `GetAccountRange`, `GetStorageRanges`, `GetByteCodes`.
-- snap/2 removes `GetTrieNodes`/`TrieNodes` and adds `GetBlockAccessLists` (0x08) / `BlockAccessLists` (0x09).
-- Peers are *expected* (by serving convention, not a guarantee) to serve roughly the last 128 state roots.
-- Point lookups are narrow range queries over `keccak256(address)` and `keccak256(slot)`. Storage values come RLP-encoded.
-- skim must tell these responses apart:
-  - **present**
-  - **absent**: proven by a proof, or accepted on trust when proof verification is off
-  - **root unavailable**: an empty response *without* a proof
-  - **request failure**
-  - **malformed**
-- Nodes should keep BALs for orphaned blocks too, which helps reorg recovery.
+
+skim supports snap/2 and its own snap/1 client for Geth peers. Account/storage point lookups use hashed address/slot keys; bytecode is checked against its code hash. A present value, proven absence, unavailable root, failed request and malformed answer are distinct outcomes.
+
+Unproven empty answers are unavailable, never zero. A slot is zero only after an absence proof, a proven empty storage trie, or a complete verified trie rebuild. Peers generally serve recent roots; the resolver normally fetches at the parent root and replays verified BAL writes to the target.
 
 ## 4. Architecture
 
+```text
+CL payload gossip / req-resp --> payload verification --> chain placement --> MVCC store
+EL headers + BALs -----------> gap/reorg recovery -----------^
+EL SNAP + proofs -----------> scheduler --> verified bases + BAL replay --> store
+store + headers ------------> revm simulator --> JSON-RPC / Rust library calls
+verified block data --------> skim-chain --> receipts, logs, block streams, peer serving
+CL checkpoint + updates ----> light client --> safe / finalized / require-verified
 ```
-        Rust API (crate `skim`)  ◄── primary interface
-            │           \
-            │        JSON-RPC adapter (localhost:8545, HTTP + WS, batch)
-            │
-   Snapshot / Overlay / Resolver ── REVM workers
-            │
-     Per-key MVCC state store ◄── State synchronizer (single writer)
-            ▲                          ▲            ▲
-            │                    BAL processor   SNAP resolver
-            │                          ▲            ▲
-      Chain tracker ◄──────────────────┤            │
-        ▲        ▲                     │            │
-   CL gossip   EL eth/71 (fallback) ───┘       snap/2 peers
-   (Gloas payload envelopes + BALs)
-```
-
-### Components
 
 | Crate | Responsibility |
 |---|---|
-| `skim-bal` | EIP-7928 types, RLP decode, commitment checks, normalization into per-key writes |
-| `skim-el` | EL devp2p via Reth crates: peers, eth/71 BAL fetch, header fetch, snap/2 client |
-| `skim-cl` | CL gossip listener: discv5/ENR, gossipsub, Gloas SSZ containers, payload-envelope extraction |
-| `skim-chain` | Header/beacon DAG, candidate vs selected head, payload status, finalized checkpoint, 256-hash BLOCKHASH window |
-| `skim-state` | Per-key MVCC store, snapshots, GC, the state synchronizer (single writer) |
-| `skim-snap` | SNAP resolver: dedup, batching, peer scoring, budgets, root selection plus local BAL replay |
-| `skim-sim` | REVM integration: `DatabaseRef` over snapshots, overlays, miss collection, environments |
-| `skim` | Public Rust API (re-exports) |
-| `skim-rpc` | JSON-RPC adapter, built only on the public API |
-| `skim-cli` | `skim` binary: `run`, `status`, `watch`, `call`, `bench`, and M0 probes |
+| `skim-bal` | BAL decoding, raw-byte commitment checks and normalized per-key writes |
+| `skim-cl` | Consensus networking, SSZ, payload checks, network presets/digests and light-client primitives |
+| `skim-el` | reth networking, configurable execution chain, snap/1 and snap/2, block requests, peer bookkeeping and serving |
+| `skim-snap` | Adaptive SNAP scheduler, deduplication, hedging, priorities and Merkle-proof verification |
+| `skim-state` | Per-key MVCC store, recent writes, rollback/GC, complete storage, restart persistence and selective archive |
+| `skim-sim` | revm execution, state resolution, predictions, subscriptions, simulation sequences and tracers |
+| `skim-chain` | Verified chain-data caches, transaction indexing/broadcast, log scans and the post-fork `history` database; `testkit` feature for dependent tests |
+| `skim-cli` | `skim run`, chain placement, JSON-RPC/WebSocket, block streams, light-client orchestration, restore and diagnostic commands |
 
-**Reuse:** `../reth_less` (evmsim) already provides block-pinned snapshots, `Fork` overlays (call, apply, bundle, branch, overrides), discovery runs and replay harnesses on revm 43. That code is RPC-backed. `skim-sim` should reuse or extract its overlay and execution layer over a skim-backed `DatabaseRef`, rather than rewrite it.
+The Rust interfaces are the individual workspace crates. Chain placement lives in `skim-cli/src/chain.rs`; `skim-chain` owns `chaindata.rs` and `history.rs`. The [handoff](docs/HANDOFF.md#the-skim-hub-boundary) describes the shared-library boundary.
 
 ## 5. State model
 
 ### 5.1 Per-key MVCC
-```rust
-enum StateKey {
-    Existence(Address),
-    Balance(Address),
-    Nonce(Address),
-    CodeHash(Address),
-    Storage(Address, U256),
-}
-enum StateValue<T> { Known(T), Unknown }
-struct Version { block: BlockHash, value: StateValue<..> }
-```
-- `Known(0)` and `Unknown` are different. **Unknown is never read as zero or empty.** A simulation that reads an unknown key fails with `StateUnavailable`.
-- Bytecode is content-addressed by code hash and shared everywhere. Code from a BAL is hashed and checked.
-- **Lookup:** the newest version on the target block's ancestry. A value from another branch is never visible.
-- **Base inserts don't reach backwards.** A value fetched at block H is valid for H and its descendants only. A lookup at H-1 still returns `Unknown`.
-- **Rollback** comes free from branch-aware lookup. There is no separate undo journal.
-- **GC:** keep versions above the finalized checkpoint plus anything pinned by live snapshots. Collapse older history into a single base entry per key.
+
+`StateKey` is `Balance(Address)`, `Nonce(Address)`, `CodeHash(Address)` or `Storage(Address, U256)`. Stored versions are ordered `(block number, U256)` values under the canonical block/hash chain. `StateValue::Unknown` is distinct from a known zero.
+
+A base fetched at block H does not establish a value at H-1. In-flight fetches are committed with later indexed BAL writes replayed, so an old answer cannot overwrite a newer write. Reorgs explicitly roll back chain entries and versions above the common ancestor. The archive has a separate per-block rollback journal.
+
+GC expires on-demand keys, retains the configured `--window`, and collapses older versions to one base. Unreferenced code is removed. A 257-entry canonical hash ring supports EVM `BLOCKHASH` independently of a shorter state window.
 
 ### 5.2 Recent BALs indexed by key
-The synchronizer keeps about 128 blocks of decoded BALs in memory, indexed by `StateKey`. This one mechanism covers lazy fills, concurrent fetches and replay:
-- **Committing a value fetched at root P** = insert the base at P, then replay that key's writes from P+1 to head from the index.
-- New BALs that arrive while a fetch is in flight are already in the index, so nothing is lost and no "pending key" registration is needed.
-- A stale SNAP response can never overwrite a BAL-derived version.
+
+The store keeps write-only `BlockWrites` for the last `--window` blocks (default 256). Their sorted key vectors support lookup, promotion of recently written keys and base replay. Reads, touched addresses and new untracked code are stripped from this index. A local recent write is usable only if all intervening blocks are indexed.
+
+This is separate from `skim-chain`'s 32-block decoded-BAL cache and 64-block raw-BAL serving cache. Memory depends on whole-chain writes, even for a tiny app watchlist.
 
 ### 5.3 Snapshot identity and views
-- Snapshots are keyed by execution `block_hash`. The header provides number, parent, state root and environment.
-- A snapshot is an immutable, cheap-to-clone (`Arc`) view pinned to a block hash and a *resolved-state generation*.
-- Lazy fills create a new generation. Running simulations never see values change underneath them.
-- Simulation writes live only in per-execution copy-on-write overlays.
+
+A `Snapshot` holds an `Arc<Store>` and a `BlockRef` (number, hash, parent, state root). Reads check that the block is still canonical. A reorg or expiration can invalidate the view; holding a snapshot does not pin an independent MVCC generation beyond GC. Unknown keys can become known through verified fills at the same block.
+
+Execution writes belong to revm's local state/overrides, not to the followed chain. Archived snapshots read only explicitly covered historical state and do not fetch missing old keys from SNAP.
 
 ### 5.4 Account existence
-Existence is derived only from evidence:
-- A balance change on an account previously known absent means it now exists.
-- A contract creation means it exists and its code and nonce are known.
-- An access with no changes says nothing about existence.
 
-When the evidence is ambiguous, existence stays `Unknown`.
+A BAL access alone proves neither existence nor a value. Proven absent accounts are represented by the appropriate zero balance/nonce and empty-code state. Complete-storage subscriptions verify the whole downloaded storage root before treating unlisted slots as zero.
 
 ## 6. Synchronization
 
 ### 6.1 Bootstrap
-1. Join EL and CL peers and learn the head.
-2. Fetch the last 256 execution headers (BLOCKHASH window).
-3. Start following BALs (§6.2).
-4. Resolve the watchlist through the SNAP resolver (§6.3).
-5. Publish snapshots once the head is followed. "Ready" is tracked per key, not globally.
+
+`skim run` loads the selected CL/EL network, opens restart persistence unless `--ephemeral`, starts both networks, and begins receiving payloads. Subscriptions resolve independently of background snapshot restore. The first applied block triggers recent-BAL seeding (up to 32 blocks), and its parent/ancestor hashes support later `BLOCKHASH` reads.
+
+Restart data defaults to `~/.skim/<network>/restart.redb`. A saved snapshot is a cache: its headers and BALs must link to the current chain before its values are replayed. Unverifiable or over-8,192-block gaps are discarded. CL payload-range requests are tried for catch-up, with EL recovery available as a fallback.
 
 ### 6.2 Following
-For each selected execution block:
-1. Get the payload and BAL from CL gossip. Fall back to eth/71 by hash.
-2. Verify the commitment (§3.2 on the gossip path; header hash on the EL path).
-3. Index the BAL by key (§5.2).
-4. Append versions for tracked keys and initialize unknown tracked keys from absolute writes.
-5. Advance the selected head.
-6. Emit `StateReady { block, changed_keys }`.
 
-**Reorgs:**
-1. Find the common ancestor and switch the selected branch.
-2. Fetch any missing BALs for the new branch, from gossip, eth/71 or snap/2.
-3. Apply them in order and publish.
-
-Rebootstrap is needed only when the BALs for the new branch can't be obtained.
+A verified envelope is decoded into writes and recent chain data. The chain placer accepts a continuation, rolls back a shallow fork, or fills a linked EL path to the new block. Store application produces `StateReady { block, changed_keys }`; RPC head notifications and subscription maintenance follow. Maintenance coalesces heads while a pass is running and then processes the newest one.
 
 ### 6.3 Resolving missing state
-The default path covers both direct lookup and pivot replay:
-1. Pick the newest ancestor root P ≤ target H that some peer will serve. At the very head, peers may not have executed H yet, so P is often H-1.
-2. Fetch the key at `stateRoot(P)`.
-3. Commit the base at P, replay indexed BAL writes from P+1 onward, and publish a new generation.
 
-If no servable root is covered by the BAL index, fail explicitly. Never use a peer's "current" value as if it belonged to H.
-
-Resolver properties:
-- deduplicated per (key, root)
-- batched
-- per-request timeouts, with backoff and peer rotation
-- request budgets per call and globally
-- peer latency and availability tracked
+A read first uses held versions, verified complete storage or a contiguous recent BAL write. Otherwise, the resolver fetches at a usable recent ancestor root, verifies the answer, and replays BALs to the target. Unavailable data is retried within request/round limits, then refused with `-32002`.
 
 ### 6.3.1 State provider pool (pinned SNAP peers)
-State is fetched from a small pool of **pinned peers**, not from whichever peer is available. Public discovery is used only to find candidates and to re-score them periodically.
 
-```
-discovery (discv4/discv5) ──► candidate scoring ──► pinned pool
-                                  (periodic)         ├── primary
-                                                     ├── backup A
-                                                     └── backup B
-cache miss ──► primary ──(slow / root unavailable)──► backup ──► MVCC commit ──► retry sim
-```
+The scheduler uses connected SNAP-capable peers, scoring placement by latency and load with adaptive per-peer limits. It deduplicates jobs, batches code requests, hedges slow work and separates interactive/background priorities. `--trusted-peer` keeps selected EL peers connected; public discovery remains enabled in `skim run`. Pinning does not exempt proofs or guarantee availability. Saved-peer ranking favors useful stable peers at restart.
 
-- **Persistent connections.** Keep 3–5 pinned snap/2 peers connected (reth `trusted_nodes`), so the handshake cost is paid once rather than per request. Pinning applies only to state fetches. BAL and header traffic can still use any peer, unless `connect_trusted_nodes_only` is set for a closed deployment.
-- **Scoring.** Each peer gets a score from:
-  - RTT
-  - SNAP account and storage P50/P95
-  - success rate
-  - root-servable lag: how quickly it serves new roots
-  - session stability
-
-  The best peer is the primary. Scores are exponentially decayed, so a degraded primary is demoted automatically.
-- **Direct lookup at the target root**, with fallback:
-  - If the primary is slow (adaptive hedge timeout, roughly its P95), the request is hedged to a backup.
-  - If the primary hasn't executed H yet (`root unavailable`), the request goes to a backup or falls back to H-1 plus a local BAL(H) replay (§6.3).
-- **Re-scoring.** Discovery keeps running in the background. Every few minutes, candidates are probed with a few cheap requests. A candidate that beats the worst pinned peer replaces it.
-- **Retention (measured, `docs/experiments/m0-scheduler.md`).** With a genesis status, public snap/2 peers evicted us within 22–51 s. Two changes fixed most of it:
-  - **Advertising the real head** (Status + `BlockRangeUpdate`) got about 25× more SNAP service.
-  - **A snap/1 client** reaches Geth peers.
-
-  Together they gave 4 SNAP peers that stayed connected for the whole 17-minute run. Both are always on.
-- **Scheduler (`skim-snap`).** The scheduler owns every request:
-  - per-peer in-flight cap
-  - re-queue on disconnect, timeout or unavailable root
-  - one hedge per job
-  - code batching
-  - `(root, key)` dedup
-
-  Placement by EWMA latency × load drifts toward the fastest peer. In one run, a 71 ms Geth peer served 53% of requests.
-- **Limits.** Pinning a public peer guarantees nothing. It may rate-limit us, disconnect us, or prune state. If the pool can't meet the targets in §1, the next step is to run a dedicated snap/2 peer. The protocol path is the same; only the trust and operating cost change.
+EL session defaults are 40 outbound and 15 inbound; CL peer target and mesh default to 50 and 8. These are separate from the scheduler's adaptive request concurrency.
 
 ### 6.4 Head semantics
-- `latest` is the **state-ready** head, not the first-seen gossip head.
-- `finalized` comes from CL finality information.
-- `safe` maps to `finalized` until there's a better source. This is documented.
+
+- Default `latest`: newest state-ready selected block.
+- `safe`: a sync-committee-supermajority-authenticated execution hash that matches the selected chain.
+- `finalized`: the verified finalized execution hash, also matched by number and hash.
+- `--require-verified`: uses the verified signed block for `latest`; refuses until available.
+- `pending`: latest state, with sent-but-unincluded gap-free nonces added for `eth_getTransactionCount`; no general mempool.
 
 ## 7. Simulation
 
-### 7.1 Native Rust API (primary)
-```rust
-let client = Client::start(Config::sepolia()).await?;
-client.watch(Watch::account(pool).slots([SLOT0, LIQUIDITY])).await?;
+### 7.1 Native Rust API
 
-let mut ready = client.state_ready();                 // Stream<StateReady>
-while let Some(ev) = ready.next().await {
-    if !ev.changed_keys.intersects(&my_keys) { continue; }
-    let snap = client.snapshot(ev.block_hash)?;        // immutable, pins MVCC versions
-    let env  = BlockEnv::next_block(&snap)             // base/blob fee + slot timestamp derived
-        .coinbase(builder);                            // remaining unknowns explicit
+The implemented library entry point is `skim_sim::Simulator`, constructed with a store, scheduler and predictor. Its methods include `call`, `call_retained`, `read`, `code`, `execute` and tracing/multi-call helpers. For example, after configuring a simulator and inserting the header for `block`:
 
-    let quotes = snap.simulate_many(&env, &calls, Mode::WarmOnly);
+```rust,ignore
+use skim_sim::Mode;
 
-    let mut ov = snap.overlay(&env);                   // CoW, single owner
-    ov.apply(&approve)?;
-    let (mut a, mut b) = (ov.fork(), ov.fork());       // O(1) branching
-    let (ra, rb) = (a.simulate(&swap_a)?, b.simulate(&swap_b)?);
-}
-
-match snap.simulate(&env, &tx, Mode::WarmOnly) {
-    Err(SimError::StateUnavailable { keys }) => {
-        client.resolve(snap.block_hash(), &keys, Budget::ms(500)).await?;
-    }
-    r => { r?; }
-}
+let outcome = sim.call(&block, tx_env, Mode::Resolve { max_rounds: 8 }).await?;
+let snapshot = sim.store.snapshot(&block)?;
+let value = snapshot.get(&state_key)?;
 ```
 
-Rules:
-- `simulate*` is synchronous and CPU-only. `resolve`, `watch` and streams are async. EVM work never runs on the Tokio runtime.
-- **Modes:**
-  - `WarmOnly` never touches the network.
-  - `Resolve { budget, deadline }` uses miss collection (§7.2) and is restarted outside the EVM.
-- `SimOutcome` contains:
-  - status and gas
-  - return or revert data
-  - simulated logs
-  - state diff and access set
-  - **the resolved `BlockEnv`**, so every assumption is visible
-- Custom tracing goes through `simulate_with(&env, &tx, &mut impl Inspector)`.
-- `client.learn(&outcome)` adds a run's access set to the watchlist.
+`Mode::WarmOnly` refuses missing state without fetching. `Mode::Resolve { max_rounds }` predicts, resolves and retries. CPU-heavy execution is dispatched through the simulator's bounded blocking-work path; the EVM database itself performs no network I/O. `CallOutcome` records execution result, access set, fetched accounts/storage, resolve rounds and execution time.
 
 ### 7.2 Miss collection and cold-round minimization
-REVM's `Database` is synchronous, so network I/O never happens inside it. A `Resolve`-mode call works like this:
-1. Run a **discovery pass**: an unknown key reads as a placeholder and is recorded. Results from this pass are never returned.
-2. Fetch every predicted key in one parallel round (sources below).
-3. Re-run for real. Repeat up to a bounded number of rounds. Then return a result, or `StateUnavailable { keys }`.
 
-**Prediction sources**, merged into each round:
-- keys recorded by the discovery pass
-- access sets previously recorded for the same call shape (target + selector)
-- a caller-supplied access list (API `hints`, or the `accessList` field in RPC requests)
-- BAL `storage_reads` and writes for the target contracts in recent blocks
-- for proxies (EIP-1967 and similar), the implementation slot together with the implementation's code
+A recording execution detects unknown accounts and slots. Its result is never returned while any dependency is missing. Actual misses and predicted keys share the next fetch wave; execution repeats until complete or its round budget is exhausted.
 
-**Round-level tactics:**
-- In one round, send `GetAccountRange` and `GetStorageRanges` in parallel. Storage requests need only `keccak256(address)` and the root, not the account record.
-- Cached code hashes skip `GetByteCodes`.
-- Hedge slow requests to a second peer after an adaptive timeout, to cut P95.
-- Keep warm connections to the lowest-RTT SNAP peers.
-
-**Divergence control:** placeholder values can steer a discovery pass down paths the real execution never takes (Spike C: a multihop quote requested 807 keys). Each round is capped, and fetching happens in waves that stop early once the access set has converged.
-
-**Width:** a round's keys are spread across the pinned peers, with per-peer in-flight limits. Spike C showed dozens of parallel requests to a single peer get dropped.
-
-**Learned-set hygiene:** a learned access set is a prediction, not a cache. A plain union over inputs over-fetches: one 100-WETH quote put 1,094 tick keys into the shape's set, and every small quote then took about 7.5 s. Each learned set needs:
-- frequency weighting: keys seen in at least x% of recent runs
-- a size cap on the first wave
-- optionally, input bucketing (e.g. by amount magnitude)
-
-Misses beyond the predicted set are fetched in later rounds.
-
-**Measured policy (`docs/experiments/m0-round2.md`):**
-- exact-input set first
-- otherwise core keys (≥ 50% of the shape's last 8 runs, cap 256)
-
-Result: repeated inputs run at k=1, and new inputs of a known shape at k=2.
-
-**Generalized learned patterns (M5, done).** Between exact and shape there is now a pattern tier, keyed by `to + selector + per-argument class`. Addresses and small integers are exact; amounts fall in factor-4 magnitude buckets. Every tier is LRU-bounded, under a global key budget. Measured: neutral on latency (the tail is tick walking, which the V3 predictor handles). See `docs/experiments/m5-predictors-and-chain-data.md`.
-
-**Throughput model:** a wave's speed is about Σ (in-flight_i / RTT_i) over serving peers (measured: 42 keys/s with one ~190 ms peer; 169 keys/s once a ~47 ms peer joined). Per-peer concurrency should adapt (AIMD) so that fast peers carry more of the load.
-
-**Dedicated peer:** serving costs 0.36 ms per lookup (local Nethermind). With a co-located snap peer, even k=8 cold calls finish in under 10 ms, so cold fetch fits on the live path. On public peers, cold fetch remains a k=1 game.
-
-**Sharing:** everything fetched joins the shared MVCC store. A second simulation touching the same contracts runs warm. Values learned from BAL writes are known without any SNAP request.
+Predictions use exact calldata, generalized argument patterns, then frequent keys for a function shape. Learned sets have LRU entry limits and a global key budget. The optional Uniswap V3 predictor computes tick/bitmap reach and refreshes a TTL-bound background window. A prediction affects fetch timing, not correctness.
 
 ### 7.3 Execution environment
-- **Post-state of H, historical context:** H's own environment.
-- **Next block:**
-  - derived: EIP-1559 base fee, blob base fee, and timestamp (`genesis + slot × 12` for the target slot)
-  - supplied by policy or options, never silently guessed: coinbase, prevrandao, gas limit (±1/1024)
-- REVM must run the Glamsterdam execution rules for Sepolia.
+
+Calls use revm's Amsterdam rules and the selected execution chain id. A call at block H uses H's post-state and header environment. `eth_simulateV1` supplies sequential simulated blocks and overrides; `debug_traceCall` also accepts block/state overrides. Mined tracing uses the parent state plus BAL changes before each transaction and checks receipt status/gas before returning a trace.
 
 ### 7.4 JSON-RPC adapter
-Built only on the public API. Runs over HTTP and WebSocket and supports batch requests. Error codes follow EIP-1474: `-32002` resource unavailable, `-32004` method not supported.
 
-| Method | Notes | Priority |
-|---|---|---|
-| `eth_chainId`, `net_version`, `eth_blockNumber`, `eth_syncing`, `web3_clientVersion` | `blockNumber` = state-ready head | P0 |
-| `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`, `eth_getTransactionCount` | `-32002` on unavailable, never a fabricated 0 | P0 |
-| `eth_getBlockByNumber` / `ByHash` | headers; full txs within the gossip retention window | P0 |
-| `eth_call` with state and block overrides | core | P0 |
-| `eth_estimateGas` | binary search on REVM | P0 |
-| `eth_simulateV1` | multi-call/multi-block | P1 |
-| `eth_createAccessList` | access set from REVM | P1 |
-| `debug_traceCall` | REVM inspectors | P1 |
-| `eth_subscribe("newHeads")` | from state-ready events | P1 |
-| `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory` | headers plus gossip payload txs | P2 |
-| `eth_getProof` | only for roots fetched directly with proofs | P2 |
-| `eth_sendRawTransaction`, `eth_getTransactionReceipt`, `eth_getTransactionByHash`, `eth_getLogs` | M5: gossip to EL peers; receipts via `GetReceipts` checked against `receiptsRoot`; logs prefiltered by bloom + BAL addresses | done |
+The adapter is in `skim-cli/src/rpc.rs`, served by axum over HTTP and WebSocket. Batch requests execute with up to eight concurrent handlers, pinning `latest` to one block. [The RPC reference](docs/guide/json-rpc.md) lists all implemented methods and compatibility limits.
 
-Further rules:
-- Block tags `latest` and EIP-1898 `{blockHash}` / `{blockNumber}` are supported. `pending` reads latest state, plus sent-but-unincluded nonces for `eth_getTransactionCount`. `safe`/`finalized` are not tracked yet.
-- Within one batch, `latest` is pinned to a single snapshot.
-- Use `alloy-rpc-types` and `jsonrpsee` so the wire format matches existing clients.
+Supported families include state reads, `eth_call`, gas estimation, `eth_simulateV1`, access lists/proofs, geth tracers, transactions, blocks, fee history and logs. Skim-specific methods are `skim_status`, `skim_dashboard`, `skim_subscriptionStatus`, `skim_archiveCoverage` and `skim_streamNext`.
+
+Unavailable state/data returns `-32002`; explicit unsupported methods return `-32004`, unknown methods `-32601`, invalid parameters `-32602`, and execution reverts code `3`. WebSocket subscriptions support `newHeads`, `logs` and `skim_subscriptions`; HTTP filter creation is unsupported.
 
 ## 7.5 Product model: application-specific state client (M3)
 
-> Not every app needs a full node. Sync only what you need.
+Subscriptions declare accounts, storage slots or calls. They keep required keys current from BAL writes; readiness requires known values and bytecode at the reported block. Call subscriptions use `calls: [{to, data, from?}]`; `on_block: true` publishes fresh results after maintenance. Whole storage uses `storage: all` with a lifetime `max_slots` limit (50,000 by default).
 
-skim keeps two kinds of state with different guarantees.
+On-demand keys stay tracked for `state.on_demand.cache_ttl_blocks` after use (default 4). The store enforces `max_subscribed_keys` (100,000) and `max_on_demand_keys` (200,000); both accept `unlimited`. Excess subscription keys stay on demand and a truncated subscription reports its missing coverage. There is no `skim_promote` RPC or `simulation`/`access.learned` YAML field.
 
-| | **Subscribed state** (state watchlist) | **On-demand state** |
-|---|---|---|
-| What | Accounts / slots / simulations the user declares | Everything else |
-| Initial sync | SNAP prefetch at subscribe time | none |
-| Per block | Kept current from each block's BAL (the full BAL is received; only subscribed keys are applied) | Kept current only while cached (TTL), then dropped |
-| Simulation | No network on the hot path; target: a few ms | SNAP fetch first (hundreds of ms or more) |
-| Cache | Retained; bounded by `limits` | Short-lived (TTL in blocks), bounded LRU |
-| Guarantee | **Ready** = head BAL applied **and** every required key known at the head; otherwise reported as not ready, never guessed | Best effort; never wrong (verified fetches, Unknown is never zero) |
+See [configuration](docs/guide/configuration.md) for actual YAML. Chain selection is the `--network` flag, not a YAML field.
 
-### Configuration (`skim.yaml`)
-```yaml
-network: sepolia
-state:
-  subscriptions:
-    - name: weth
-      address: "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"
-      account: true            # balance, nonce, code
-      storage: ["0x...", "0x..."]
-    - name: small-registry
-      address: "0x..."
-      storage: all             # whole storage trie via SNAP ranges; only within limits
-    - name: uniswap-v3-pool
-      address: "0x..."
-      account: true
-      access: { learned: true, predictor: uniswap-v3 }
-    - name: my-quoter          # simulation subscription
-      simulation:
-        to: "0x..."
-        function: "quoteExactInputSingle(...)"
-        args_template: ...     # optional; else learned from observed calls
-        predictor: learned
-      prefetch: true
-      on_block: false          # true: re-run every block and push results
-  on_demand:
-    enabled: true
-    cache_ttl_blocks: 4
-  limits:
-    max_subscribed_keys: 100000
-```
+## 7.6 M4: selective state archiving
 
-### Rules
-- **No silent promotion.** On-demand keys are tracked only for their TTL and then evicted with their versions. Observed access sets can be promoted to a subscription explicitly (`skim_promote`), or automatically only if the subscription opts in (`access.learned`).
-- **Correct TTL caching.** A value fetched at block H is reused at H+k only because the key stays tracked (BAL writes applied) during its TTL. After that it's refetched.
-- **Readiness is per subscription** and exposed (`skim_subscriptionStatus`, readiness events). A `WarmOnly` call that touches a not-ready subscription returns `-32002` with the missing keys.
-- **Limits are hard.** A subscription that would exceed `max_subscribed_keys` is rejected or truncated, and the condition is reported.
-- The learned access set and protocol predictors (§7.2) become the **auto-configuration layer** for subscriptions, not a separate mode.
+`retention: { mode: archive }` with `--archive <path>` records an initial base and changed versions for subscribed keys in redb. Coverage is per key and linked segment. Historical calls succeed only when every dependency is covered. Unneeded archived keys are released after 64 blocks; old covered history remains, but subsequent blocks are no longer covered until tracking resumes.
 
-## 7.6 M4: selective state archiving (planned)
+Restart gaps and `--archive-backfill N` use verified linked headers/BALs from peers. BALs contain post-values, so backfill cannot infer the value before the earliest recovered write. Unchanged keys can extend back only across a complete verified scan, including their known base boundary. There is no unlimited historical reconstruction guarantee.
 
-> Sync and archive only what you need.
-
-`retention: archive` on a subscription persists every version of its keys instead of collapsing old versions. BALs carry absolute post-values, so storing the initial value plus each changed version is enough to answer any later block:
-
-```text
-(slot X, block 100) -> 10      # SNAP base when subscribed
-(slot X, block 102) -> 20      # BAL write; blocks 101 and 103 store nothing
-```
-
-- **Coverage is explicit.** Each key records the first block where its value is known: the subscription start, or the block a late-discovered slot was fetched. A historical read before that block is `-32002`, never a guess. SNAP cannot reliably serve arbitrary old roots (about 128 recent roots).
-- **Bounded backfill from retained BALs.** eth/71 peers keep BALs for the weak-subjectivity period (~2 weeks). For a key written in that window, its value is known from its earliest retained write onward: a write at W fixes the value on [W, next write). Before the first write, the pre-value isn't in any BAL, so it stays uncovered.
-- **Historical execution context.** A historical `eth_call` needs that block's header, code by hash (immutable, already content-addressed), and BLOCKHASH history. It succeeds only if every key the call reads is covered at that block; otherwise it returns `-32002` listing the uncovered keys.
-- **Separate storage.** The archive is an append-only on-disk index keyed by `(key, block)`, separate from the in-memory MVCC hot set and from the on-demand TTL cache. Archive data is never evicted by default; the cache evicts aggressively.
+`--history local` is a different database: it stores post-fork headers and fetched matching logs/coverage for streams and log queries. It does not archive arbitrary state or retain all historical BALs.
 
 ## 8. Trust model
-**Checked (cheap):**
-- header parent links
-- BAL commitments
-- payload block hash against the bid in the beacon block
-- code hashes
-- version ancestry
-- chain and fork identifiers
 
-**Not checked in the initial release:**
-- PoS fork choice and finality
-- execution correctness
-- full state roots
-- SNAP Merkle proofs (proofs are kept for later verification)
+All state fetches require proofs; code, body, receipt and BAL commitments are checked. Consensus authentication uses a sync-committee light client bootstrapped from a trusted weak-subjectivity checkpoint: explicit root, saved verified finalized root, then a configured HTTP endpoint. Only built-in Sepolia provides a default endpoint.
 
-**Planned optional modes:**
-- **Verified State:** verify single-key SNAP proofs. This is cheap, and it's a candidate to become the default once RPC users connect signing tools.
-- **Verified Consensus:** light-client authentication of selected heads.
+Light-client BLS updates and committee rotations support both presets and have been exercised end to end on the minimal-preset [devnet](devnet/README.md). Public peers may not serve the required data. Until verification succeeds, default gossip following remains available, while verified tags and `--require-verified` refuse unavailable verified blocks. Inspect `skim_status.light_client`.
 
-`web3_clientVersion` and the docs state the unverified status.
+skim does not independently validate every execution transition, proposer/attestation or full consensus fork choice. A state proof authenticates a value to a root; it does not authenticate an optimistic root to consensus. The static `web3_clientVersion` string still includes `unverified state`; use the explicit light-client status for verification state. See [trust and correctness](docs/guide/trust-and-correctness.md).
 
 ## 9. Benchmarks
-The primary baseline is **a local Reth node with in-process REVM**, with its version pinned and BAL-parallel execution on/off recorded. A remote RPC simulator is a secondary baseline.
 
-| Metric | Purpose |
-|---|---|
-| `payload_gossip_lag_ms` | slot start → envelope received |
-| `el_header_poll_lag_ms` | same block via EL polling (comparison) |
-| `state_ready_lag_ms` | payload received → snapshot published |
-| `bal_apply_us` | apply cost per block |
-| `snap_root_servable_lag_ms` | gossip arrival → peers serve that root |
-| `snap_request_p50/p95_ms`, `snap_success_rate` | resolver reliability |
-| `cl_peer_retention` | how long listen-only CL connections survive |
-| `peer_rtt_ms` | raw network distance, to separate it from serving time |
-| `snap_account_p50/p95_ms`, `snap_storage_p50/p95_ms`, `snap_code_p50/p95_ms` | cost of one round, per message type |
-| `sequential_rounds_per_cold_call` (k) | dependency depth of cold calls |
-| `keys_per_round` | how much each round collapses |
-| `simulate_warm_p95_us`, `simulate_partial_cold_p95_ms`, `simulate_full_cold_p95_ms` | the three latency targets (§1) |
-| `infura_eth_call_p50/p95_ms` | hosted-RPC baseline for the same call and block |
-| `cache_hit_rate`, `simulation_restarts` | working-set fit |
-| `rss_bytes`, `disk_bytes`, `cpu_pct`, `net_bytes` | the actual thesis |
+Measurements identify the build, network, hardware, workload and cache state. The [P3 baseline](docs/experiments/p3-full-node-baseline.md) compared skim and Nethermind with Lighthouse at identical block hashes. Warm-throughput and correctness runs are in M5–M7; they are observations rather than universal performance guarantees.
 
-Every comparison uses identical hardware, inputs, fork rules and target block state. Benchmark at least one predictable workload and one unpredictable workload.
+Prometheus exports block arrival/head age, per-method requests/latency, peers and fetch outcomes, subscriptions, serving counters and process resources. `skim_memory_bytes`, `skim_memory_entries` and `skim_memory_capacity` report instrumented retained structures. These are estimates, not a heap profile: peer buffer bytes, some caches, allocator slack and code pages remain uncounted. Some capacity fields are collection capacities; others are configured limits or current counts.
+
+The call cache clears before the next insert after reaching 20,000 entries or an estimated 32 MiB; a large single result can exceed the byte trigger. Block caches are count-bounded (32/64/128 blocks), transaction indexes 2,048 blocks and headers 8,192. Their fill times depend on slot duration, missed slots and historical fetches. Persistence/history/archive page-cache budgets are 8/16/64 MiB respectively.
 
 ## 10. Plan
 
-### M0: network feasibility (go/no-go)
-- **Spike A, CL payload gossip:**
-  - join Sepolia CL gossip
-  - decode `SignedExecutionPayloadEnvelope` and extract and verify the BAL (§3.2)
-  - measure arrival lag versus EL header polling, peer retention, and completeness, including withheld and empty payloads
-- **Spike B, EL eth/71 + snap/2:**
-  - connect to multiple peers and fetch BALs by hash
-  - fetch one account and specific slots at recent roots
-  - measure latency, success rate and disconnects at several request rates
-  - measure `snap_root_servable_lag_ms`
-- **Spike B2, pinned pool:** take the 3–5 best peers from Spike B's per-peer results, pin them, and measure the following over persistent connections:
-  - storage-lookup P50/P95
-  - root-servable lag
-  - disconnect/throttle rate over hours
-- **Spike C, cold-call economics:**
-  - for a fixed set of Sepolia calls, measure the P50/P95 of one SNAP request per message type, and `k` per call. Calls cover a plain ERC-20 read, a proxied token, a Uniswap-style quote, and a multi-hop route.
-  - compare against Infura `eth_call` with the same calldata and block, measured from the same machine
-  - output: the crossover of `k` and round latency at which skim beats a hosted RPC, i.e. whether the design can be *faster* than RPC under some conditions or is only *cheaper*
+M0–M7 delivered network feasibility, BAL following, verified state, the simulator and RPC, subscriptions, archive/backfill, generalized predictions, chain data, serving and regression gates. Experiment names are historical milestone labels, not a list of unimplemented APIs.
 
-**Go if** both paths are reliable enough for continuous partial-state maintenance.
-
-### M1: BAL follower + first interface (core done: `skim follow`, `docs/experiments/m1-follower.md`)
-Result: 100 consecutive blocks followed from CL gossip, 700/700 outputs matching Infura, state ready P50 880 ms after slot start, all 7 watched calls simulated locally in 3.8 ms with no network. First-answer latency **ties** Infura (P50 difference 0; skim first in 50/99 blocks). Every further call is local. Next levers: gossip mesh quality, and the miss path (one miss took 7.4 s).
-
-- Payload/header tracking, BAL decode and verification, gap recovery over eth/71, sequential application.
-- A Rust test that follows, snapshots and reads a slot.
-- A minimal JSON-RPC (`chainId`, `blockNumber`, `getBalance`, `getStorageAt`, `getCode`) so `cast` works against `localhost:8545`.
-- **Differential harness:** the same request goes to a reference node and the JSON responses are compared. This becomes every milestone's regression suite.
-- Target: 100 consecutive Sepolia blocks with no gaps.
-
-### M2: per-key MVCC
-Branch-aware versions, the BAL key index, lazy-fill replay, the single-writer commit path, GC, the `StateReady { changed_keys }` stream, and simulated reorgs.
-
-### M3: SNAP resolver
-Root selection, batching, dedup, budgets, peer scoring, and the absent/unavailable distinction.
-
-### M4: simulation
-- `skim-sim` over MVCC, reusing evmsim's overlay layer.
-- `WarmOnly` and `Resolve` modes with miss collection.
-- Environments and BLOCKHASH.
-- `eth_call` and `eth_estimateGas`, with matching results on selected Sepolia transactions.
-
-### M5: benchmarks
-Measure against a local Reth node, covering both latency and resource cost (§9).
+Further work is tracked in [TODO](docs/TODO.md): live blob-parameter-fork verification, remaining TCP interoperability and long-run memory attribution. `skim run` supports configured networks; `follow`, `probe-*` and the baseline workload remain Sepolia diagnostics. The [handoff](docs/HANDOFF.md) records test commands and the shared-library boundary.
 
 ## 11. Risks
-- **Working-set predictability.** This is the main risk, more than REVM speed. Generic RPC usage makes cold misses common. Whether a cold call beats a hosted RPC depends on `k` and SNAP round latency (§1), which Spike C measures.
-- **Peer behavior.** SNAP throttling, and CL scoring of listen-only nodes.
-- **ePBS gossip.** Real arrival lag and completeness are unproven. Reth may adopt BAL-parallel execution and shrink the hypothesized window.
-- **Concurrency.** Lazy fills, BALs and reorgs all mutate state. The single-writer commit path is the mitigation.
-- **Trust.** Unverified state can produce wrong results, which limits who should use the initial release.
-- **Protocol churn.** Reth crate APIs, eth/71, snap/2, Gloas types and REVM Amsterdam support are all moving. Pin revisions and keep live Sepolia interop tests.
+
+- **Availability:** peers can prune state/BALs/receipts, disconnect or withhold data. Proofs protect integrity, not service.
+- **Cold dependency depth:** unfamiliar calls can require several fetch rounds and wait for usable peers.
+- **Consensus bootstrap:** a trusted root and peers serving usable light-client data are required for authenticated heads.
+- **Reorgs and concurrency:** shared state, caches, restores and streams must remain on one hash-linked chain; regression tests cover the known races.
+- **Memory:** count/byte-triggered caches do not define a total RSS cap. Three-hour production observations still leave uncounted growth; the slowest caches take hours to fill.
+- **Protocol changes:** new fork schemas or unsupported consensus presets need code support; a configured blob schedule alone does not implement arbitrary future forks.
 
 ## 12. Prior art
-- **Portal Network (Trin, etc.):** P2P-served JSON-RPC over a separate DHT. Its state network was the hardest part. skim instead uses existing SNAP peers plus BALs.
-- **Helios:** a verifying light client that still depends on an untrusted RPC for data.
-- **evmsim (`../reth_less`):** an RPC-backed local simulation cache. skim's simulation layer builds on it.
+
+Helios authenticates state from RPC providers; full nodes execute and store the whole current chain state; archive nodes additionally retain arbitrary historical state. skim uses Ethereum peers, a selective working set and BAL replay. See the [comparison guide](docs/guide/compared.md) for operating tradeoffs and measurement sources.
 
 ## References
-- EIP-7928 Block-Level Access Lists: https://eips.ethereum.org/EIPS/eip-7928
-- EIP-8159 eth/71 BAL exchange: https://eips.ethereum.org/EIPS/eip-8159
-- EIP-8189 snap/2: https://eips.ethereum.org/EIPS/eip-8189
-- EIP-7732 ePBS: https://eips.ethereum.org/EIPS/eip-7732
-- EIP-1474 JSON-RPC error codes: https://eips.ethereum.org/EIPS/eip-1474
-- Gloas consensus specs (beacon chain, p2p): https://github.com/ethereum/consensus-specs
-- devp2p eth/snap: https://github.com/ethereum/devp2p
-- Reth: https://github.com/paradigmxyz/reth · REVM: https://github.com/bluealloy/revm
+
+- [EIP-7928: Block-Level Access Lists](https://eips.ethereum.org/EIPS/eip-7928)
+- [EIP-8159: eth/71 BAL exchange](https://eips.ethereum.org/EIPS/eip-8159)
+- [EIP-8189: snap/2](https://eips.ethereum.org/EIPS/eip-8189)
+- [EIP-7732: ePBS](https://eips.ethereum.org/EIPS/eip-7732)
+- [EIP-1474: JSON-RPC error codes](https://eips.ethereum.org/EIPS/eip-1474)
+- [Consensus specs](https://github.com/ethereum/consensus-specs)
+- [devp2p](https://github.com/ethereum/devp2p)
+- [reth](https://github.com/paradigmxyz/reth) and [revm](https://github.com/bluealloy/revm)

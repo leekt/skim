@@ -16,9 +16,11 @@ bytes to each parser and fail on any panic, sanitizer error, or memory blow-up.
 ```bash
 cargo install cargo-fuzz
 cd fuzz
-cargo +nightly fuzz run -O envelope -- -max_total_time=300 -rss_limit_mb=4096   # seeds: seeds/envelope
-cargo +nightly fuzz run -O snap_proof regressions/snap_proof/*                   # past crashes
+cargo +nightly fuzz run -O envelope seeds/envelope -- -max_total_time=300 -rss_limit_mb=4096
+cargo +nightly fuzz run -O snap_proof regressions/snap_proof/* -- -runs=0        # replay past crashes
 ```
+
+The seven targets match the binaries in `fuzz/Cargo.toml`; fuzzing is a separate nightly workspace. CI replays checked-in regression inputs with `-runs=0`. The ordinary Rust workspace tests use the pinned toolchain and `cargo test --workspace --profile ci --locked`.
 
 **First run (5 min per target):**
 - 1–44 M inputs per target.
