@@ -29,7 +29,6 @@ mod run;
 mod serving;
 mod stats;
 mod stream;
-mod web_dashboard;
 
 use clap::{Parser, Subcommand};
 

@@ -1,0 +1,24 @@
+# Server-only: everything on loopback (the host firewall allows only SSH; the Cloudflare tunnel
+# reaches Grafana at 127.0.0.1:3001). Prometheus scrapes skim at 127.0.0.1:9465.
+services:
+  prometheus:
+    network_mode: host
+    ports: !reset []
+    extra_hosts: !reset []
+    environment:
+      SKIM_METRICS_TARGETS: 127.0.0.1:9465
+    command:
+      - |
+        targets=$$(echo "$${SKIM_METRICS_TARGETS}" | sed 's/[^,][^,]*/"&"/g')
+        sed -e "s|__TARGETS__|$${targets}|" -e "s|__INTERVAL__|$${SCRAPE_INTERVAL}|" /etc/prometheus/prometheus.tmpl.yaml > /prometheus/prometheus.yaml
+        exec /bin/prometheus --config.file=/prometheus/prometheus.yaml --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=$${PROMETHEUS_RETENTION} --web.listen-address=127.0.0.1:9091
+  grafana:
+    network_mode: host
+    ports: !reset []
+    environment:
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SERVER_HTTP_PORT: "3001"
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3001/}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./datasource-local.yaml:/etc/grafana/provisioning/datasources/prometheus.yaml:ro

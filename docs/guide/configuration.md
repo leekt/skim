@@ -84,7 +84,6 @@ With no cap, memory grows with the contract: about 100 bytes per slot, so a cont
 | `--checkpoint <root>` | none | trusted beacon block root for the light client (default: last finalized root verified in a previous run, else `--checkpoint-url`) |
 | `--checkpoint-url <url>` | ethpandaops Sepolia | checkpoint-sync endpoint for the light client's starting root |
 | `--require-verified` | off | `latest` = highest block the sync committee signed off on (~1–2 slots behind) |
-| `--dashboard <addr>` | off | read-only web dashboard at `http://<addr>/`: node, subscription and peer state, no JSON-RPC (safe on a public host) |
 | `--metrics <addr>` | off | serve Prometheus metrics at `http://<addr>/metrics` (see [metrics/](../../metrics)) |
 | `--metrics-addresses <n>` | `50` | most-called addresses exported with per-address series; `0` exports none |
 | `--metrics-idle <s>` | `300` | drop series that stopped updating (peers that left, addresses that fell out of the top) |

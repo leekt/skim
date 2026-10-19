@@ -23,6 +23,9 @@ A 1 GB machine runs it after the first catch-up but swaps during it. 2 GB or mor
    - smallname starts its index at the fork (or as far back as peers still serve logs), catches up through skim's block stream, then follows the head.
    - Check progress at `curl localhost:8787/v1/status`.
 3. **Public endpoint:** a tunnel ([`cloudflared.yml`](cloudflared.yml)) or any reverse proxy that forwards only `/`, `/v1/*` and `/healthz` to `127.0.0.1:8787`.
+4. **Grafana (optional):** skim runs with `--metrics 127.0.0.1:9465` ([`skim.service`](skim.service)). Copy the repo's [`metrics/`](../../../metrics) stack plus [`grafana/`](grafana) (a compose override and a datasource file) into one directory, put `GRAFANA_ADMIN_PASSWORD` (and `GRAFANA_ROOT_URL`, the public URL) in its `.env`, then run `docker compose up -d` there.
+   - The override puts Prometheus (`127.0.0.1:9091`) and Grafana (`127.0.0.1:3001`) on the host network, bound to loopback, so a host firewall that only allows SSH needs no change.
+   - The tunnel's Grafana hostname forwards to `127.0.0.1:3001`. Anonymous visitors can view the dashboards only; changing anything needs the admin login.
 
 ## Updating
 - **skim:** swap the binary and restart it.
