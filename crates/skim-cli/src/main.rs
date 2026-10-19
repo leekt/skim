@@ -31,6 +31,7 @@ mod rpc;
 mod run;
 mod serving;
 mod stats;
+mod status;
 mod stream;
 
 use clap::{Parser, Subcommand};
@@ -62,6 +63,8 @@ enum Cmd {
     /// Follow the chain and serve JSON-RPC (eth_call, eth_getStorageAt, ...) on top of it. Any
     /// Glamsterdam network (`--network`); the other subcommands are Sepolia diagnostics.
     Run(run::Args),
+    /// Ask a running skim how it's doing: chain, peers, light client, subscriptions, with hints.
+    Status(status::Args),
     /// P3 baseline: same per-block eth_call workload against a full node's RPC.
     BenchNode(bench_node::Args),
     /// Peer-count sweep (Sepolia only): one large learned wave fetched with 1/2/4/all peers per block.
@@ -106,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::ProbeCall(args) => probe_call::run(args).await,
         Cmd::Follow(args) => follow::run(args).await,
         Cmd::Run(args) => run::run(args).await,
+        Cmd::Status(args) => status::run(args).await,
         Cmd::BenchNode(args) => bench_node::run(args).await,
         Cmd::ProbeWave(args) => probe_call::run_wave(args).await,
         Cmd::ProbeCl(args) => probe_cl::run(args).await,
