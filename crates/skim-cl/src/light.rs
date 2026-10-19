@@ -496,20 +496,31 @@ pub mod testkit {
 
     /// A `SyncCommittee` of 512 copies of `sk`'s key: (bytes, root).
     pub fn committee_bytes(sk: &SecretKey) -> (Vec<u8>, [u8; 32]) {
+        committee_bytes_with(sk, &LcConfig::SEPOLIA)
+    }
+
+    /// A `SyncCommittee` of the preset's size, all `sk`'s key: (bytes, root).
+    pub fn committee_bytes_with(sk: &SecretKey, cfg: &LcConfig) -> (Vec<u8>, [u8; 32]) {
         let pk = sk.sk_to_pk().to_bytes();
-        let mut b: Vec<u8> = (0..SYNC_COMMITTEE_SIZE).flat_map(|_| pk).collect();
+        let mut b: Vec<u8> = (0..cfg.committee_size).flat_map(|_| pk).collect();
         b.extend_from_slice(&pk);
-        let root = sha(&merkleize(b[..SYNC_COMMITTEE_SIZE * 48].chunks(48).map(pubkey_root).collect()), &pubkey_root(&pk));
+        let root = sha(&merkleize(b[..cfg.committee_size * 48].chunks(48).map(pubkey_root).collect()), &pubkey_root(&pk));
         (b, root)
     }
 
     /// A sync aggregate: the first MIN_PARTICIPANTS members (all `sk`) sign `h`.
     pub fn aggregate(sk: &SecretKey, h: &BeaconHeader) -> Vec<u8> {
-        let sig = sk.sign(&signing_root(h.root(), FV, SEPOLIA_GENESIS_VALIDATORS_ROOT), BLS_DST, &[]);
-        let sigs = vec![&sig; MIN_PARTICIPANTS];
+        aggregate_with(sk, h, &LcConfig::SEPOLIA)
+    }
+
+    /// [`aggregate`] for the preset's committee size and the config's validators root.
+    pub fn aggregate_with(sk: &SecretKey, h: &BeaconHeader, cfg: &LcConfig) -> Vec<u8> {
+        let sig = sk.sign(&signing_root(h.root(), FV, cfg.genesis_validators_root), BLS_DST, &[]);
+        let n = cfg.min_participants();
+        let sigs = vec![&sig; n];
         let agg = AggregateSignature::aggregate(&sigs, false).unwrap().to_signature();
-        let mut b = vec![0u8; 64];
-        for i in 0..MIN_PARTICIPANTS {
+        let mut b = vec![0u8; cfg.committee_size / 8];
+        for i in 0..n {
             b[i / 8] |= 1 << (i % 8);
         }
         b.extend_from_slice(&agg.to_bytes());
@@ -517,8 +528,12 @@ pub mod testkit {
     }
 
     pub fn optimistic(sk: &SecretKey, attested_slot: u64, signature_slot: u64) -> Vec<u8> {
+        optimistic_with(sk, attested_slot, signature_slot, &LcConfig::SEPOLIA)
+    }
+
+    pub fn optimistic_with(sk: &SecretKey, attested_slot: u64, signature_slot: u64, cfg: &LcConfig) -> Vec<u8> {
         let (mut b, h) = lc_header(attested_slot, [3; 32]);
-        b.extend_from_slice(&aggregate(sk, &h));
+        b.extend_from_slice(&aggregate_with(sk, &h, cfg));
         b.extend_from_slice(&signature_slot.to_le_bytes());
         b
     }
@@ -531,21 +546,36 @@ pub mod testkit {
     pub const BOUNDARY: u64 = (P + 1) * SLOTS_PER_PERIOD; // first slot of period P + 1
 
     pub fn bootstrapped(sk: &SecretKey) -> Committees {
-        let (cb, root) = committee_bytes(sk);
+        bootstrapped_with(sk, &LcConfig::SEPOLIA)
+    }
+
+    /// The first slot of period P + 1 for `cfg`'s period length.
+    pub fn boundary(cfg: &LcConfig) -> u64 {
+        (P + 1) * cfg.slots_per_period
+    }
+
+    /// Bootstrapped a few slots before [`boundary`], in period P.
+    pub fn bootstrapped_with(sk: &SecretKey, cfg: &LcConfig) -> Committees {
+        let (cb, root) = committee_bytes_with(sk, cfg);
         let br = nodes(0x20, 11);
-        let (hb, h) = lc_header(BOUNDARY - 100, fold(root, &br, CURRENT_SYNC_COMMITTEE_GINDEX));
+        let at = boundary(cfg) - 5;
+        let (hb, h) = lc_header(at, fold(root, &br, CURRENT_SYNC_COMMITTEE_GINDEX));
         let mut b = hb;
         b.extend_from_slice(&cb);
         br.iter().for_each(|n| b.extend_from_slice(n));
-        let (header, c) = bootstrap(&b, B256::from(h.root()), &LcConfig::SEPOLIA).unwrap();
-        assert_eq!((header.beacon.slot, c.period), (BOUNDARY - 100, P));
-        Committees::new(c, LcConfig::SEPOLIA)
+        let (header, c) = bootstrap(&b, B256::from(h.root()), cfg).unwrap();
+        assert_eq!((header.beacon.slot, c.period), (at, P));
+        Committees::new(c, *cfg)
     }
 
     /// A `LightClientUpdate` attested at `attested_slot` (no finalized header), carrying
     /// `next`'s committee, signed by `signer` at `signature_slot`.
     pub fn update(signer: &SecretKey, next: &SecretKey, attested_slot: u64, signature_slot: u64, tamper: bool) -> Vec<u8> {
-        let (cb, root) = committee_bytes(next);
+        update_with(signer, next, attested_slot, signature_slot, tamper, &LcConfig::SEPOLIA)
+    }
+
+    pub fn update_with(signer: &SecretKey, next: &SecretKey, attested_slot: u64, signature_slot: u64, tamper: bool, cfg: &LcConfig) -> Vec<u8> {
+        let (cb, root) = committee_bytes_with(next, cfg);
         let nb = nodes(0x30, 11);
         let state_root = fold(if tamper { [0xad; 32] } else { root }, &nb, NEXT_SYNC_COMMITTEE_GINDEX);
         let (mut b, h) = lc_header(attested_slot, state_root);
@@ -553,7 +583,7 @@ pub mod testkit {
         nb.iter().for_each(|n| b.extend_from_slice(n));
         b.extend_from_slice(&[0u8; HEADER_LEN]); // no finalized header
         b.extend_from_slice(&[0u8; 32 * 9]);
-        b.extend_from_slice(&aggregate(signer, &h));
+        b.extend_from_slice(&aggregate_with(signer, &h, cfg));
         b.extend_from_slice(&signature_slot.to_le_bytes());
         b
     }
@@ -743,5 +773,41 @@ mod tests {
         assert_eq!(r.applied, 0);
         assert!(matches!(r.stopped, Some(LcError::Period(..))));
         assert_eq!((cs.current.period, cs.next.is_none()), (P, true));
+    }
+
+    /// The minimal preset (devnets): 32-member committees, 64-slot periods, another chain's
+    /// genesis validators root.
+    const MINIMAL: LcConfig = LcConfig { committee_size: 32, slots_per_period: 64, genesis_validators_root: [0x42; 32] };
+
+    #[test]
+    fn the_minimal_preset_bootstraps_verifies_and_rotates() {
+        use testkit::*;
+        let (a, b) = (key(1), key(2));
+        let mut cs = bootstrapped_with(&a, &MINIMAL);
+        let edge = boundary(&MINIMAL);
+        // Signed by a supermajority of 32 (22 members).
+        let (h, n) = optimistic_update(&cs, &optimistic_with(&a, edge - 3, edge - 2, &MINIMAL), FV).unwrap();
+        assert_eq!((h.beacon.slot, n), (edge - 3, MINIMAL.min_participants()));
+        assert_eq!(MINIMAL.min_participants(), 22);
+        // The next committee, learned in period P, signs period P + 1 (64 slots later).
+        let up = full_update(&cs, &update_with(&a, &b, edge - 4, edge - 3, false, &MINIMAL), FV).unwrap();
+        cs.next = up.next;
+        assert!(optimistic_update(&cs, &optimistic_with(&b, edge + 1, edge + 2, &MINIMAL), FV).is_ok());
+        assert!(cs.advance(edge + 10));
+        assert_eq!(cs.current.period, P + 1);
+    }
+
+    #[test]
+    fn data_from_another_preset_or_chain_is_refused() {
+        use testkit::*;
+        let a = key(1);
+        let cs = bootstrapped_with(&a, &MINIMAL);
+        let edge = boundary(&MINIMAL);
+        // A mainnet-sized update can't be read as a minimal one.
+        let mainnet = optimistic(&a, edge - 3, edge - 2);
+        assert!(matches!(optimistic_update(&cs, &mainnet, FV), Err(LcError::Length(..))));
+        // Signed over Sepolia's validators root: wrong domain for this chain.
+        let other_chain = LcConfig { genesis_validators_root: SEPOLIA_GENESIS_VALIDATORS_ROOT, ..MINIMAL };
+        assert_eq!(optimistic_update(&cs, &optimistic_with(&a, edge - 3, edge - 2, &other_chain), FV), Err(LcError::Signature));
     }
 }
