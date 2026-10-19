@@ -90,7 +90,7 @@ Read results from `skim_subscriptionStatus`, or get them pushed over WebSocket w
 
 **Examples:** a wallet backend showing balances of arbitrary tokens, a block explorer's "read contract" tab, a generic contract UI.
 
-**Limits:** peers serve state only for recent roots, so reads at older blocks of keys skim wasn't holding aren't possible (see [6](#6-state-at-past-blocks)). For a per-user, low-volume wallet, a light client in the wallet may fit better: see [skim or Helios](skim-vs-helios.md).
+**Limits:** peers serve state only for recent roots, so reads at older blocks of keys skim wasn't holding aren't possible (see [6](#6-state-at-past-blocks)). For a per-user, low-volume wallet, a light client in the wallet may fit better: see [skim compared](compared.md).
 
 ## 5. Event history, indexed
 **Need:** every event of some contracts since some point, kept in your own index, correct across reorgs.
