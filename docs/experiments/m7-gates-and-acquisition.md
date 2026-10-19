@@ -218,6 +218,13 @@ All mutation-checked. Not done: batching the initial base writes of many keys in
 
 Metrics the review asked for: `skim_store_archive_base_writes_total` (expected ~0 per block once archived keys are based) and `skim_subscription_maintenance_seconds` (P50/P99 in Grafana, "State and addresses").
 
+## Seventeenth review: reorgs and chain data
+| Finding | Fix | Regression test |
+|---|---|---|
+| P2 candidate: on a reorg the store rolled back, then the new block was applied, while ChainData kept the old fork's headers and index until `on_applied`; a request in between could see the store rolled back and the old fork canonical in chain data | Every rollback goes through `Chain::rollback`: `on_rollback` first (`ChainData::rollback_to`: headers, index entries and inclusions above the fork point dropped; sent transactions there pending again), then the store. A request in the gap finds nothing at those heights (`-32002`) instead of the old fork | `a_reorg_rolls_chain_data_back_before_the_store_then_applies_the_new_block` (fails without the callback), `rolling_back_forgets_the_old_forks_blocks_and_inclusions` |
+
+Also from this review, tracked in [TODO](../TODO.md): the hedged-fetch A/B (cold-read p95/p99 and the extra requests per peer), a long zero-config soak, and signed release artifacts or provenance (the install script's SHA-256 check catches corrupted downloads, not a compromised release).
+
 ## Peer requests: coalescing and fetch order
 Measured on the aarch64 Linux deployment host (2 cores), each run on a fresh instance with its own ports and data directory, counted with `skim_status.peer_requests`.
 
