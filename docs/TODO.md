@@ -10,7 +10,7 @@ Items are removed from this file when they're done, and the commit that closes o
     shown not to exist on the networks skim targets.
 
 ## Measurements
-27. **Hedged fetch, measured.** Hedging now follows each peer's own latency (`baec2a1`), shown in a unit test; its effect on public peers isn't measured. Done when two nodes side by side (`--snap-hedge fixed` vs the default) give cold-read p50/p95/p99 and requests per peer for the same reads.
+27. **Hedged fetch under stalls.** Measured on 3,600 interleaved cold reads: no regression and no extra requests with healthy peers, but no peer stalled, so the benefit (re-sending after ~150 ms instead of 1.2 s) wasn't observed live (M7, "Hedged fetch"). Done when a run that includes stalls (a long soak; `skim_snap_fetch` hedges > 0) shows the tail with adaptive vs fixed.
 
 ## Releases
 28. **Signed releases.** `install.sh` checks each tarball's SHA-256 from the same release, which catches corrupted downloads but not a compromised release. Done when release artifacts carry signatures or build provenance (e.g. GitHub artifact attestations) and the install docs say how to verify them.

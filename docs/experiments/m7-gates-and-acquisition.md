@@ -356,3 +356,13 @@ Nethermind's BAL catch-up ([PR 14157](https://github.com/NethermindEth/nethermin
 
 Getting there found a bug: after the devnet's blob-parameter fork (BPO3, after Amsterdam), no new EL session formed. reth builds a genesis's fork list in mainnet's order (BPO3 before Amsterdam) and folds timestamp forks into the EIP-2124 fork id in list order, so skim's id matched no peer once both forks were active. Nethermind closed the session (`ProtocolBreach`) and then refused the address at the ECIES handshake. The afternoon's live-fork run hadn't shown it: its sessions were made before the fork. Fixed by ordering timestamp forks by activation time (`a1ac222`, `a_blob_parameter_fork_after_amsterdam_folds_into_the_fork_id_in_activation_order`, mutation-checked). Sepolia schedules no fork after Amsterdam, so production wasn't affected.
 
+## Hedged fetch: adaptive vs fixed, on public Sepolia peers (2026-10-19)
+One node (build `d72e0ae`, `--debug-rpc`, macOS, 5+ SNAP peers), 3,600 cold reads of never-read keys (random accounts with `eth_getBalance`, random WETH slots with `eth_getStorageAt`), sequential; the hedging mode switched at random per read (`skim_debugSetSnapHedge`), so both modes saw the same peers at the same time ([`tools/hedge_ab.py`](tools/hedge_ab.py)). Two nodes side by side were tried first and dropped: after 20 minutes they had 3 and 9 SNAP peers, which would have measured peer luck.
+
+| Mode | Reads | p50 | p95 | p99 | Max | SNAP requests per read | Hedges |
+|---|---|---|---|---|---|---|---|
+| adaptive | 1,812 | 46-49 ms | 100-119 ms | 112-163 ms | 330 ms | 1.00 | 1 |
+| fixed (1.2 s) | 1,788 | 46-48 ms | 101-115 ms | 112-135 ms | 248 ms | 1.00 | 0 |
+
+(Ranges: the two batches, 600 and 3,000 reads.) No peer stalled in these runs: the slowest read was 330 ms, far below the fixed 1.2 s threshold, so neither mode had a tail to cut, and adaptive hedging cost nothing (one hedge in 3,600 reads). Its benefit, a stalled request re-sent after ~150 ms instead of 1.2 s, is shown by `a_stall_at_a_fast_peer_is_hedged_after_its_own_latency_not_a_fixed_delay` but wasn't observed live, because the condition didn't occur. Earlier runs did record stalls (worst on-path fetch 1.6 s, [M2](m2-p0-miss-tail.md)); a long soak with the hedge counter is where they'd show.
+
