@@ -10,9 +10,13 @@
     "ws": "node websocket/watch.mjs",
     "ens": "node bigname/ens.mjs",
     "smallname": "node --experimental-sqlite --no-warnings smallname/smallname.mjs",
-    "smallname-test": "node --experimental-sqlite --no-warnings smallname/test.mjs"
+    "smallname-test": "node --experimental-sqlite --no-warnings smallname/test.mjs",
+    "watch": "node watch.mjs",
+    "wallet": "node wallet/wallet.mjs",
+    "wallet-test": "node wallet/test.mjs"
   },
   "dependencies": {
+    "@noble/hashes": "1.8.0",
     "viem": "2.57.1"
   }
 }
