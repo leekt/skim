@@ -7,6 +7,18 @@ Four ways to read Ethereum without taking a third party's word for it:
 - **A full node** (an execution client such as geth, reth or Nethermind, plus a consensus client such as Lighthouse): it downloads and executes every block itself and holds the whole current state, plus recent states (pruned).
 - **An archive node:** a full node that also keeps every historical state, so any account or slot can be read at any past block.
 
+What sets skim apart is not that it applies BALs without re-executing blocks: full nodes do that too now (below). It's that skim keeps only the state your app needs current, without holding Ethereum's full state, and executes locally against it.
+
+**Full nodes catch up from BALs too.** Nethermind applies BAL post-values instead of executing blocks when catching up ([PR 14157](https://github.com/NethermindEth/nethermind/pull/14157), merged 2026-10-07, on by default with EIP-7928): about 115x faster over 2,000 devnet blocks (4,599 s to 40 s, its benchmark), at ~0.3 MB of BAL and ~10 KB of receipts downloaded per block. The mechanism is skim's; the job is different:
+
+| | Nethermind BAL catch-up | skim |
+|---|---|---|
+| State held | all of it | the app's keys |
+| Checks after applying a BAL | BAL commitment, receipts root, and the full `stateRoot` recomputed | BAL commitment, receipts root; Merkle proofs for fetched values (no full state to recompute a root from) |
+| Which blocks | ancestors of the finalized block (by hash); the unfinalized tail is executed | every block to the head; `latest` is optimistic by default, `safe`/`finalized` authenticated |
+| Missing data | executes the block instead | fetches it, or refuses the request |
+| Purpose | a lagging full node catching up | a small, current, app-specific state for local execution |
+
 The verification scopes differ. skim always checks fetched state proofs and block commitments; its default `latest` follows optimistic gossip, while `safe`, `finalized` and `--require-verified` need a bootstrapped light client and usable signed updates. A full or archive node also re-executes every block. See [trust and correctness](trust-and-correctness.md).
 
 **Where the numbers come from:**
