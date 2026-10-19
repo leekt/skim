@@ -210,6 +210,14 @@ All mutation-checked. Two fixes have a second guard that no test isolates: the "
 
 All mutation-checked. Not done: batching the initial base writes of many keys into one commit (each key is now written once per segment).
 
+## Sixteenth review: chain data follows the store; the archive base cache checked
+| Finding | Fix | Regression test |
+|---|---|---|
+| P2: `chain.rs` noted a header in ChainData (canonical index, transaction inclusion) before the store applied the block, so a block the store refused could be canonical for transaction lookups while the store's head stayed on its parent | `Chain` has two callbacks: `on_header` (header caches execution needs, before the apply) and `on_applied` (ChainData, only after the store applied the block) | `a_block_the_store_refuses_is_never_reported_as_applied` (a child of the head by hash at the wrong height: `Deferred`, nothing reported; the real child: reported) |
+| P2 (to verify): does the `based` cache (archived keys whose base is written) agree with archive coverage across segment ends and reorgs? | Checked: coverage ends only through `release_archived`, which clears the entry; `truncate_above` drops exactly the coverage starting above the fork point, as `based` drops entries above it; a restart starts empty. No change needed | `the_based_cache_follows_coverage_through_release_and_reorgs`: after each transition, every based key's coverage starts at or before its base (fails without either invalidation) |
+
+Metrics the review asked for: `skim_store_archive_base_writes_total` (expected ~0 per block once archived keys are based) and `skim_subscription_maintenance_seconds` (P50/P99 in Grafana, "State and addresses").
+
 ## Peer requests: coalescing and fetch order
 Measured on the aarch64 Linux deployment host (2 cores), each run on a fresh instance with its own ports and data directory, counted with `skim_status.peer_requests`.
 

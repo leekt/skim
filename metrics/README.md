@@ -45,7 +45,7 @@
 | Peer acquisition | time to the first SNAP peer, SNAP peers seen and held (≥ 60 s), sessions by client, session ends by reason |
 | EL networking (reth) | connections, known peers, disconnect reasons (e.g. remote `too_many_peers`) |
 | JSON-RPC | request rate, P95 latency and outcomes per method, plus a method table |
-| State and addresses | the addresses your calls read (pinned / partly pinned / on demand, keys fetched), call and fetch rates per address, store size, subscription readiness |
+| State and addresses | the addresses your calls read (pinned / partly pinned / on demand, keys fetched), call and fetch rates per address, store size, subscription readiness, subscription maintenance time (P50/P99) and archive base writes |
 | Serving the network | requests skim answered for other peers, and items sent |
 | Process | CPU, RSS, file descriptors, threads, estimated retained data and entries by structure |
 
@@ -88,6 +88,8 @@ The bundled head-age threshold is fixed at 36 s. Adjust it for a custom network'
 | `skim_store_bytes` | gauge | `kind` (`code`, `recent_bals`) |
 | `skim_store_admissions_refused_total`, `skim_store_on_demand_evicted_total` | counter | |
 | `skim_store_resolved_from_bal_total` | counter | reads of untracked keys answered from a recent BAL (no fetch) |
+| `skim_store_archive_base_writes_total` | counter | archive base writes (one redb commit each); ~0 per block once archived keys have their base |
+| `skim_subscription_maintenance_seconds` | histogram | one subscription maintenance pass, per applied block |
 | `skim_subscription_ready`, `skim_subscription_missing_keys` | gauge | `name` |
 | `skim_served_requests_total`, `skim_served_items_total` | counter | `layer`, `kind` |
 | `skim_address_calls_total`, `skim_address_fetched_keys_total` | counter | `address` |

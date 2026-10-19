@@ -57,6 +57,8 @@ fn describe() {
     describe_gauge!("skim_store_keys", "Store keys by kind (subscribed, on_demand)");
     describe_gauge!("skim_store_bytes", "Store sizes in bytes by kind (code, recent_bals)");
     describe_counter!("skim_store_admissions_refused_total", "Keys refused by max_subscribed_keys");
+    describe_counter!("skim_store_archive_base_writes_total", "Archive base writes (one redb commit each); ~0 per block once archived keys are based");
+    describe_histogram!("skim_subscription_maintenance_seconds", Unit::Seconds, "One subscription maintenance pass (per applied block)");
     describe_counter!("skim_store_on_demand_evicted_total", "On-demand keys evicted by max_on_demand_keys");
     describe_counter!("skim_store_resolved_from_bal_total", "Reads of untracked keys answered from a recent block's BAL write instead of a fetch");
     describe_gauge!("skim_subscription_ready", "1 when a subscription's state is complete at the head");

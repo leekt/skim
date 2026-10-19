@@ -919,6 +919,7 @@ impl Rpc {
         counter!("skim_store_admissions_refused_total").absolute(z.admissions_refused);
         counter!("skim_store_on_demand_evicted_total").absolute(z.on_demand_evicted);
         counter!("skim_store_resolved_from_bal_total").absolute(z.resolved_from_bal);
+        counter!("skim_store_archive_base_writes_total").absolute(z.archive_base_writes);
         if let Some(subs) = &self.subs {
             for s in subs.status() {
                 gauge!("skim_subscription_ready", "name" => s.name.clone()).set(s.ready as u8 as f64);

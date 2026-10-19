@@ -449,7 +449,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 // fresh is usually faster than replaying a long snapshot gap. Both run; the
                 // restore fills in only what is still unknown when it finishes.
                 let Some(b) = *maint_rx.borrow_and_update() else { continue };
+                let t0 = std::time::Instant::now();
                 subs.maintain(&sim, &b).await;
+                metrics::histogram!("skim_subscription_maintenance_seconds").record(t0.elapsed().as_secs_f64());
                 let _ = events.send(crate::rpc::WsEvent::Subscriptions(b.number));
             }
         });

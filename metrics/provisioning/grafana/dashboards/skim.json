@@ -2873,15 +2873,127 @@
       }
     },
     {
+      "type": "timeseries",
+      "title": "Subscription maintenance (per block)",
+      "description": "One subscription pass after each applied block: declared keys, calls, readiness. P99 should stay flat as subscribed and archived keys grow.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(skim_subscription_maintenance_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "P50",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(skim_subscription_maintenance_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "P99",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 97,
+        "w": 12,
+        "h": 8
+      },
+      "id": 48,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Archive base writes",
+      "description": "One redb commit each. Expected near 0 once archived keys have their base: re-subscribing a based key writes nothing.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(increase(skim_store_archive_base_writes_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "per minute",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "showPoints": "never",
+            "spanNulls": true,
+            "drawStyle": "bars"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 97,
+        "w": 12,
+        "h": 8
+      },
+      "id": 49,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      }
+    },
+    {
       "type": "row",
       "title": "Serving the network",
-      "id": 48,
+      "id": 50,
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 97
+        "y": 105
       },
       "panels": []
     },
@@ -2930,11 +3042,11 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 98,
+        "y": 106,
         "w": 12,
         "h": 8
       },
-      "id": 49,
+      "id": 51,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2985,11 +3097,11 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 98,
+        "y": 106,
         "w": 12,
         "h": 8
       },
-      "id": 50,
+      "id": 52,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2998,13 +3110,13 @@
     {
       "type": "row",
       "title": "Process",
-      "id": 51,
+      "id": 53,
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 106
+        "y": 114
       },
       "panels": []
     },
@@ -3049,11 +3161,11 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 107,
+        "y": 115,
         "w": 8,
         "h": 8
       },
-      "id": 52,
+      "id": 54,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -3100,11 +3212,11 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 107,
+        "y": 115,
         "w": 8,
         "h": 8
       },
-      "id": 53,
+      "id": 55,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -3160,11 +3272,11 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 107,
+        "y": 115,
         "w": 8,
         "h": 8
       },
-      "id": 54,
+      "id": 56,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -3251,11 +3363,11 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 115,
+        "y": 123,
         "w": 16,
         "h": 10
       },
-      "id": 55,
+      "id": 57,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -3306,11 +3418,11 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 115,
+        "y": 123,
         "w": 8,
         "h": 10
       },
-      "id": 56,
+      "id": 58,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"

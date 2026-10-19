@@ -847,6 +847,50 @@ fn a_reloaded_archived_key_warmed_by_an_on_demand_read_first_still_gets_a_base()
     assert_eq!(ar.get(&slot(1), 2).unwrap(), archive::ArchiveRead::Value(U256::from(4)), "the earlier segment is untouched");
 }
 
+/// Every key the store believes has its base written has archive coverage starting at or
+/// before that block (so skipping a re-registration's write never leaves a gap).
+fn based_matches_coverage(s: &Store) {
+    let cov: std::collections::HashMap<StateKey, u64> = s.archive().unwrap().coverages().unwrap().into_iter().map(|(k, c, _)| (k, c)).collect();
+    for (k, b) in s.inner.read().based.iter() {
+        let c = cov.get(k).copied();
+        assert!(c.is_some_and(|c| c <= *b), "{k:?}: base at {b} but coverage starts at {c:?}");
+    }
+}
+
+#[test]
+fn the_based_cache_follows_coverage_through_release_and_reorgs() {
+    // Review (to verify): the cache of written bases must agree with the archive's coverage
+    // when a segment ends and restarts, and across reorgs below and above a base.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::with_archive(8, archive::Archive::open(&d.path().join("a.redb")).unwrap()).unwrap();
+    s.apply_block(blk(1, 0), writes(&[(slot(1), 4)])).unwrap();
+    s.archive_key(slot(1)); // base at 1
+    for n in 2..=5 {
+        s.apply_block(blk(n, 0), writes(&if n == 5 { vec![(slot(2), 3)] } else { vec![] })).unwrap();
+    }
+    s.archive_key(slot(2)); // base at 5
+    based_matches_coverage(&s);
+    // A reorg below slot 2's base (5) but above slot 1's (1).
+    s.rollback_to(4);
+    assert!(s.inner.read().based.contains_key(&slot(1)), "slot 1's base survives");
+    assert!(!s.inner.read().based.contains_key(&slot(2)), "slot 2's base was truncated");
+    based_matches_coverage(&s);
+    let w = s.sizes().archive_base_writes;
+    assert!(s.archive_key_checked(slot(1)));
+    assert_eq!(s.sizes().archive_base_writes, w, "slot 1: nothing to rewrite");
+    // The new fork writes slot 2 again at 5; re-registering it makes a new base and coverage.
+    s.apply_block(blk(5, 1), writes(&[(slot(2), 9)])).unwrap();
+    assert!(s.archive_key_checked(slot(2)));
+    based_matches_coverage(&s);
+    assert_eq!(s.archive().unwrap().get(&slot(2), 5).unwrap(), archive::ArchiveRead::Value(U256::from(9)));
+    // A segment ends and restarts.
+    s.release_archived(&[slot(1)]);
+    assert!(!s.inner.read().based.contains_key(&slot(1)));
+    assert!(s.archive_key_checked(slot(1)));
+    based_matches_coverage(&s);
+    assert_eq!(s.archive().unwrap().get(&slot(1), 5).unwrap(), archive::ArchiveRead::Value(U256::from(4)));
+}
+
 #[test]
 fn re_subscribing_an_archived_key_whose_base_is_written_writes_nothing() {
     // Review: subscription maintenance re-registers archive keys every block, and each

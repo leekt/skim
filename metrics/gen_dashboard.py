@@ -232,6 +232,13 @@ table("Subscriptions", [
         {"id": "custom.cellOptions", "value": {"type": "color-text"}},
         {"id": "mappings", "value": [{"type": "value", "options": {"1": {"text": "ready", "color": "green", "index": 0}, "0": {"text": "not ready", "color": "red", "index": 1}}}]}]}])
 next_row(8)
+ts("Subscription maintenance (per block)", [
+    target(f"histogram_quantile(0.5, sum by (le) (rate(skim_subscription_maintenance_seconds_bucket{{{I}}}[5m])))", "P50"),
+    target(f"histogram_quantile(0.99, sum by (le) (rate(skim_subscription_maintenance_seconds_bucket{{{I}}}[5m])))", "P99", ref="B"),
+], "s", x=0, w=12, desc="One subscription pass after each applied block: declared keys, calls, readiness. P99 should stay flat as subscribed and archived keys grow.")
+ts("Archive base writes", [target(f"sum(increase(skim_store_archive_base_writes_total{{{I}}}[1m]))", "per minute")], x=12, w=12, bars=True,
+   desc="One redb commit each. Expected near 0 once archived keys have their base: re-subscribing a based key writes nothing.")
+next_row(8)
 
 # ---- Serving ---------------------------------------------------------------------------------
 row("Serving the network")
