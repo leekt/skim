@@ -819,20 +819,25 @@ impl Rpc {
     /// A JSON-RPC batch: independent requests, answered concurrently (up to
     /// `BATCH_CONCURRENCY` at a time) against the same `latest` block, in request order. A batch
     /// of cold reads then overlaps its network waits instead of queueing them.
-    async fn batch<'a>(&'a self, reqs: Vec<&'a Value>, latest: &'a Option<BlockRef>) -> Vec<Value> {
+    /// The reorg epoch to capture together with `latest` (before it).
+    fn reorg_epoch(&self) -> u64 {
+        self.sim.store.reorg_epoch()
+    }
+
+    async fn batch<'a>(&'a self, reqs: Vec<&'a Value>, latest: &'a Option<BlockRef>, epoch: u64) -> Vec<Value> {
         use futures::StreamExt;
-        let calls: Vec<_> = reqs.into_iter().map(|r| self.one(r, latest)).collect();
+        let calls: Vec<_> = reqs.into_iter().map(|r| self.one(r, latest, epoch)).collect();
         futures::stream::iter(calls).buffered(BATCH_CONCURRENCY).collect().await
     }
 
-    async fn one(&self, req: &Value, latest: &Option<BlockRef>) -> Value {
+    async fn one(&self, req: &Value, latest: &Option<BlockRef>, epoch: u64) -> Value {
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         let Some(method) = req.get("method").and_then(Value::as_str) else {
             return json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": "invalid request"}});
         };
         let params = req.get("params").cloned().unwrap_or(json!([]));
         let t = std::time::Instant::now();
-        let res = self.dispatch(method, &params, latest).await;
+        let res = reorg_guard(method, epoch, self.reorg_epoch(), self.dispatch(method, &params, latest).await);
         let ms = t.elapsed().as_secs_f64() * 1e3;
         tracing::debug!(method, ms, ok = res.is_ok(), "rpc");
         if method != "skim_dashboard" {
@@ -861,6 +866,25 @@ impl Rpc {
             }
         }
     }
+}
+
+/// Methods whose answer doesn't depend on which fork is canonical, or that had a side effect
+/// already (a broadcast transaction must not be reported as failed).
+const REORG_SAFE: &[&str] = &[
+    "eth_chainId", "net_version", "net_listening", "web3_clientVersion", "eth_accounts", "eth_requestAccounts", "eth_syncing",
+    "eth_sendRawTransaction", "skim_status", "skim_dashboard", "skim_subscriptionStatus", "skim_debugSetSnapHedge",
+    // Streams carry their own cursor and rewind on reorgs.
+    "skim_streamNext",
+];
+
+/// A request that started before a reorg (`epoch` captured with its `latest`) and finished after
+/// it may have read the old fork in one place and the new one in another: refused as
+/// `chain_changed` (retry), never answered.
+fn reorg_guard(method: &str, epoch: u64, now: u64, res: R) -> R {
+    if epoch == now || REORG_SAFE.contains(&method) {
+        return res;
+    }
+    Err(RpcError::unavailable_because("the chain reorganized during the request; retry", "chain_changed", true))
 }
 
 /// The label a request is counted under: its method if skim implements it (dispatch didn't answer
@@ -1144,14 +1168,16 @@ impl Rpc {
 }
 
 async fn handle(State(rpc): State<Arc<Rpc>>, Json(body): Json<Value>) -> Json<Value> {
+    // The epoch before `latest`: a reorg between the two shows up as a changed epoch.
+    let epoch = rpc.reorg_epoch();
     let latest = rpc.latest();
     match body {
         Value::Array(reqs) => {
             let mut out = Vec::with_capacity(reqs.len());
-            out.extend(rpc.batch(reqs.iter().collect(), &latest).await);
+            out.extend(rpc.batch(reqs.iter().collect(), &latest, epoch).await);
             Json(Value::Array(out))
         }
-        req => Json(rpc.one(&req, &latest).await),
+        req => Json(rpc.one(&req, &latest, epoch).await),
     }
 }
 
@@ -1212,6 +1238,7 @@ async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
                     let _ = tx.send(Message::Text(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "parse error"}}).to_string().into())).await;
                     continue;
                 };
+                let epoch = rpc.reorg_epoch();
                 let latest = rpc.latest();
                 let mut one = |req: &Value| -> Option<Value> {
                     let method = req.get("method").and_then(Value::as_str)?;
@@ -1247,7 +1274,7 @@ async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
                         // other requests concurrently.
                         let mut out: Vec<Option<Value>> = reqs.iter().map(&mut one).collect();
                         let rest: Vec<&Value> = reqs.iter().zip(&out).filter(|(_, o)| o.is_none()).map(|(r, _)| r).collect();
-                        let mut answered = rpc.batch(rest, &latest).await.into_iter();
+                        let mut answered = rpc.batch(rest, &latest, epoch).await.into_iter();
                         for o in out.iter_mut().filter(|o| o.is_none()) {
                             *o = answered.next();
                         }
@@ -1255,7 +1282,7 @@ async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
                     }
                     req => match one(req) {
                         Some(v) => v,
-                        None => rpc.one(req, &latest).await,
+                        None => rpc.one(req, &latest, epoch).await,
                     },
                 };
                 if tx.send(Message::Text(reply.to_string().into())).await.is_err() {
@@ -1358,5 +1385,19 @@ mod tests {
         assert_eq!(data(DataError::Expired("old".into()).into()), r("outside_retention", false));
         assert_eq!(data(DataError::ChainChanged("reorg".into()).into()), r("chain_changed", true));
         assert_eq!(data(DataError::Unavailable("busy".into()).into()), r("not_served", true));
+    }
+
+    #[test]
+    fn a_request_spanning_a_reorg_is_refused_never_answered() {
+        // Review: rollback, chain-data cleanup and the new block aren't one atomic step; a request
+        // that ran across them may have mixed forks.
+        let ok = || -> R { Ok(json!("0x1")) };
+        assert_eq!(reorg_guard("eth_call", 4, 4, ok()).unwrap(), json!("0x1"), "no reorg: answered");
+        let e = reorg_guard("eth_call", 4, 5, ok()).unwrap_err();
+        assert_eq!((e.code, e.data.unwrap()["reason"].clone()), (-32002, json!("chain_changed")));
+        assert!(reorg_guard("eth_getTransactionReceipt", 4, 6, ok()).is_err());
+        // A broadcast already happened: reporting it as failed would be wrong.
+        assert!(reorg_guard("eth_sendRawTransaction", 4, 5, ok()).is_ok());
+        assert!(reorg_guard("eth_chainId", 4, 5, ok()).is_ok());
     }
 }

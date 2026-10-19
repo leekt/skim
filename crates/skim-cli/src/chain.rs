@@ -54,6 +54,8 @@ pub struct Chain {
 
 impl Chain {
     fn rollback(&self, n: u64) {
+        // The epoch first: a request that saw the old fork anywhere will be refused, not answered.
+        self.store.note_reorg();
         (self.on_rollback)(n);
         self.store.rollback_to(n);
     }
@@ -373,8 +375,11 @@ mod tests {
         let (e1, e2) = (events.clone(), events.clone());
         let store = chain.store.clone();
         chain.on_applied = Box::new(move |h| e1.lock().unwrap().push(format!("applied {} {:x}", h.number, h.hash_slow().0[0])));
+        let epoch0 = chain.store.reorg_epoch();
         chain.on_rollback = Box::new(move |n| {
-            // Called before the store rolls back: it still holds the old fork's head.
+            // Called before the store rolls back (it still holds the old fork's head), and after
+            // the reorg epoch moved, so requests in flight across it are refused.
+            assert!(store.reorg_epoch() > epoch0, "the epoch moves before anything is rolled back");
             e2.lock().unwrap().push(format!("rollback {n} (store head {})", store.head().unwrap().number));
         });
         assert!(matches!(chain.place(a[1].0.clone(), Default::default()).await, Placed::Applied { .. }));

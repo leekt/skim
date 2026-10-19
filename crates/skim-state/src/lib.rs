@@ -283,6 +283,9 @@ pub struct Store {
     max_subscribed: std::sync::atomic::AtomicUsize,
     admissions_refused: std::sync::atomic::AtomicU64,
     archive_base_writes: std::sync::atomic::AtomicU64,
+    /// Bumped whenever the chain is rolled back: a request that started under another epoch may
+    /// have mixed the old fork and the new one, and is refused instead of answered.
+    reorg_epoch: std::sync::atomic::AtomicU64,
     /// Hard limit on on-demand (TTL) keys; the soonest-expiring are evicted first.
     max_on_demand: std::sync::atomic::AtomicUsize,
     on_demand_evicted: std::sync::atomic::AtomicU64,
@@ -315,6 +318,7 @@ impl Store {
             max_subscribed: std::sync::atomic::AtomicUsize::new(usize::MAX),
             admissions_refused: Default::default(),
             archive_base_writes: Default::default(),
+            reorg_epoch: Default::default(),
             max_on_demand: std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_ON_DEMAND),
             on_demand_evicted: Default::default(),
             resolved_from_bal: Default::default(),
@@ -342,6 +346,7 @@ impl Store {
             max_subscribed: std::sync::atomic::AtomicUsize::new(usize::MAX),
             admissions_refused: Default::default(),
             archive_base_writes: Default::default(),
+            reorg_epoch: Default::default(),
             max_on_demand: std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_ON_DEMAND),
             on_demand_evicted: Default::default(),
             resolved_from_bal: Default::default(),
@@ -764,7 +769,19 @@ impl Store {
     }
 
     /// Drops chain entries, BAL index and versions above `number` (reorg to that ancestor).
+    /// The current reorg epoch (see [`Self::note_reorg`]).
+    pub fn reorg_epoch(&self) -> u64 {
+        self.reorg_epoch.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A reorg is starting: bump the epoch before anything is rolled back, so every request in
+    /// flight across it can tell.
+    pub fn note_reorg(&self) {
+        self.reorg_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn rollback_to(&self, number: u64) {
+        self.note_reorg();
         // Archive and memory roll back under the same lock as every other mutation of either.
         let mut st = self.inner.write();
         if let Some(ar) = &self.archive {
