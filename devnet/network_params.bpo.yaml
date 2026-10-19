@@ -1,0 +1,25 @@
+# A local Glamsterdam devnet for testing skim on a network other than Sepolia (see README.md).
+#
+#   kurtosis run --enclave skim-devnet github.com/ethpandaops/ethereum-package --args-file devnet/network_params.yaml
+#
+# Images: ethPandaOps' glamsterdam-devnet-8 builds. Minimal preset (6 s slots, 8-slot epochs,
+# 32-member sync committees); Gloas activates at epoch 4, about 3 minutes in.
+participants:
+  # Nethermind only: geth's devnet-8 build refuses a blob-parameter fork after Amsterdam
+  # ("unsupported fork ordering").
+  - el_type: nethermind
+    el_image: ethpandaops/nethermind:glamsterdam-devnet-8
+    cl_type: lodestar
+    cl_image: ethpandaops/lodestar:glamsterdam-devnet-8
+    count: 3
+network_params:
+  preset: minimal
+  gloas_fork_epoch: 4
+  # A blob-parameter fork after Gloas: the fork digest changes at epoch 12 (~9.6 min in), while
+  # skim is running (TODO 24).
+  bpo_3_epoch: 12
+  bpo_3_max_blobs: 33
+  bpo_3_target_blobs: 22
+  bpo_3_base_fee_update_fraction: 13739630
+additional_services:
+  - dora

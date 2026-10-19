@@ -66,6 +66,8 @@ pub struct NodeConfig {
     pub genesis_time: u64,
     pub slot_ms: u64,
     pub slots_per_epoch: u64,
+    /// Light-client gossip message sizes for the network's preset (optimistic, finality).
+    pub lc_update_lens: (usize, usize),
     /// TCP and discv5 UDP port.
     pub port: u16,
     /// QUIC UDP port (0 disables QUIC listening).
@@ -104,6 +106,7 @@ impl NodeConfig {
             genesis_time: n.genesis_time,
             slot_ms: n.slot_ms,
             slots_per_epoch: n.preset.slots_per_epoch,
+            lc_update_lens: (n.light_client().optimistic_update_len(), n.light_client().finality_update_len()),
             port,
             quic_port: port + 1,
             target_peers: 50,
@@ -344,6 +347,43 @@ fn rr(protocols: &[&'static str]) -> request_response::Behaviour<Codec> {
     )
 }
 
+/// How long topic subscriptions overlap around a fork-digest change, before and after (epochs).
+pub const FORK_TOPIC_OVERLAP_EPOCHS: u64 = 2;
+
+/// What [`digest_plan`] says to do at an epoch.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DigestPlan {
+    /// Digests whose topics should be subscribed (idempotent).
+    pub subscribe: Vec<[u8; 4]>,
+    /// The digest to switch Status, ENR and codecs to, if the fork has activated.
+    pub switch_to: Option<[u8; 4]>,
+    /// The previous digest whose topics can now be left.
+    pub unsubscribe: Option<[u8; 4]>,
+}
+
+/// The digest transition at `epoch`, given the schedule, the digest in use, and the previous one
+/// still subscribed (with the epoch to leave it at).
+pub fn digest_plan(schedule: &[(u64, [u8; 4])], current: [u8; 4], epoch: u64, retiring: Option<([u8; 4], u64)>) -> DigestPlan {
+    let mut plan = DigestPlan::default();
+    let in_force = schedule.iter().rev().find(|(e, _)| epoch >= *e).map(|(_, d)| *d).unwrap_or(current);
+    if in_force != current {
+        plan.subscribe.push(in_force);
+        plan.switch_to = Some(in_force);
+    }
+    if let Some((e, d)) = schedule.iter().find(|(e, _)| *e > epoch)
+        && epoch + FORK_TOPIC_OVERLAP_EPOCHS >= *e
+        && *d != in_force
+    {
+        plan.subscribe.push(*d);
+    }
+    if let Some((old, until)) = retiring
+        && epoch >= until
+    {
+        plan.unsubscribe = Some(old);
+    }
+    plan
+}
+
 /// The ENR `eth2` value: SSZ `ENRForkID { fork_digest, next_fork_version, next_fork_epoch }`.
 pub fn enr_fork_id(digest: [u8; 4], fork_version: [u8; 4]) -> [u8; 16] {
     let mut v = [0u8; 16];
@@ -490,6 +530,7 @@ impl ClNode {
         }
 
         let envelopes_codec = rpc::EnvelopesCodec::new(cfg.fork_digest);
+        let digest_at_start = cfg.fork_digest;
         let empty: Vec<&'static str> = rpc::EMPTY_SERVED.to_vec();
         let behaviour = Behaviour {
             gossipsub: gs,
@@ -570,6 +611,8 @@ impl ClNode {
             pending_disconnect: Vec::new(),
             seen_nodes: HashSet::new(),
             envelopes_codec,
+            subscribed_digests: vec![digest_at_start],
+            retiring: None,
         };
         tokio::spawn(runner.run());
         Ok((Self { stats, local_peer_id, cmd: cmd_tx }, rx))
@@ -595,6 +638,11 @@ struct Runner {
     seen_nodes: HashSet<NodeId>,
     /// Shares the current fork digest with the envelope codecs (see [`Self::follow_digest_schedule`]).
     envelopes_codec: rpc::EnvelopesCodec,
+    /// Digests whose topics skim is subscribed to (the current one, plus the next one from two
+    /// epochs before its fork, plus the previous one until two epochs after).
+    subscribed_digests: Vec<[u8; 4]>,
+    /// The previous digest and the epoch its topics are dropped at.
+    retiring: Option<([u8; 4], u64)>,
 }
 
 impl Runner {
@@ -828,27 +876,52 @@ impl Runner {
         }
     }
 
-    /// A blob-parameter fork that activates while running changes the fork digest: move the
-    /// topic subscriptions, the Status skim sends, the envelope codecs and the ENR to the new one.
+    /// A fork that activates while running (a blob-parameter fork) changes the fork digest. Like
+    /// other clients, skim overlaps the topics instead of swapping them at once: it subscribes to
+    /// the next digest's topics [`FORK_TOPIC_OVERLAP_EPOCHS`] before the fork, switches Status,
+    /// the ENR and the envelope codecs at the fork, and leaves the old topics that long after it.
+    /// (A swap at the boundary churned the mesh, and peers dropped skim soon after.)
     fn follow_digest_schedule(&mut self) {
-        let d = self.cfg.digest_at_slot(self.cfg.current_slot());
-        if d == self.cfg.fork_digest {
-            return;
-        }
-        let old = self.cfg.fork_digest;
-        let gs = &mut self.swarm.behaviour_mut().gossipsub;
-        for t in &self.cfg.topics {
-            let _ = gs.unsubscribe(&gossipsub::IdentTopic::new(gossip::topic(old, t)));
-            if let Err(e) = gs.subscribe(&gossipsub::IdentTopic::new(gossip::topic(d, t))) {
-                tracing::warn!(topic = %t, "subscribing after the fork digest changed: {e:?}");
+        let slot = self.cfg.current_slot();
+        let epoch = slot / self.cfg.slots_per_epoch.max(1);
+        let plan = digest_plan(&self.cfg.digest_schedule, self.cfg.fork_digest, epoch, self.retiring);
+        for d in plan.subscribe {
+            if !self.subscribed_digests.contains(&d) {
+                self.set_topics(d, true);
+                self.subscribed_digests.push(d);
+                tracing::info!(digest = %alloy_primitives::hex::encode(d), "subscribed to the next fork's topics ahead of it");
             }
         }
-        self.cfg.fork_digest = d;
-        self.envelopes_codec.digest.store(u32::from_be_bytes(d), std::sync::atomic::Ordering::Relaxed);
-        if let Err(e) = self.discv5.enr_insert("eth2", &Bytes::copy_from_slice(&enr_fork_id(d, self.cfg.fork_version))) {
-            tracing::warn!("updating the ENR's fork id: {e:?}");
+        if let Some(new) = plan.switch_to {
+            let old = self.cfg.fork_digest;
+            self.cfg.fork_digest = new;
+            self.envelopes_codec.digest.store(u32::from_be_bytes(new), std::sync::atomic::Ordering::Relaxed);
+            if let Err(e) = self.discv5.enr_insert("eth2", &Bytes::copy_from_slice(&enr_fork_id(new, self.cfg.fork_version))) {
+                tracing::warn!("updating the ENR's fork id: {e:?}");
+            }
+            self.retiring = Some((old, epoch + FORK_TOPIC_OVERLAP_EPOCHS));
+            tracing::info!(old = %alloy_primitives::hex::encode(old), new = %alloy_primitives::hex::encode(new), "fork digest changed (a scheduled fork activated): status, ENR and envelopes use the new one");
         }
-        tracing::info!(old = %alloy_primitives::hex::encode(old), new = %alloy_primitives::hex::encode(d), "fork digest changed (a scheduled fork activated); topics, status and ENR moved over");
+        if let Some(d) = plan.unsubscribe {
+            self.set_topics(d, false);
+            self.subscribed_digests.retain(|x| *x != d);
+            self.retiring = None;
+            tracing::info!(digest = %alloy_primitives::hex::encode(d), "left the previous fork's topics");
+        }
+    }
+
+    fn set_topics(&mut self, digest: [u8; 4], on: bool) {
+        let gs = &mut self.swarm.behaviour_mut().gossipsub;
+        for t in &self.cfg.topics {
+            let topic = gossipsub::IdentTopic::new(gossip::topic(digest, t));
+            if on {
+                if let Err(e) = gs.subscribe(&topic) {
+                    tracing::warn!(topic = %t, "subscribing to a fork's topics: {e:?}");
+                }
+            } else {
+                let _ = gs.unsubscribe(&topic);
+            }
+        }
     }
 
     fn is_explicit(&self, peer: &PeerId) -> bool {
@@ -1014,11 +1087,11 @@ impl Runner {
                     // Size check only here; signatures are verified by the light client.
                     "light_client_optimistic_update" => {
                         tracing::debug!(len = message.data.len(), "light_client_optimistic_update gossip");
-                        message.data.len() == crate::light::OPTIMISTIC_UPDATE_LEN
+                        message.data.len() == self.cfg.lc_update_lens.0
                     }
                     "light_client_finality_update" => {
                         tracing::debug!(len = message.data.len(), "light_client_finality_update gossip");
-                        message.data.len() == crate::light::FINALITY_UPDATE_LEN
+                        message.data.len() == self.cfg.lc_update_lens.1
                     }
                     // Syntactic check only: skim cannot verify attestations (no state/BLS).
                     n if n.starts_with("beacon_attestation_") => {
@@ -1218,5 +1291,20 @@ mod tests {
         assert!(enr_dial(&tcp_only).unwrap().1[0].to_string().starts_with("/ip4/10.0.0.3/tcp/9000/"));
         let neither = Enr::builder().ip4(std::net::Ipv4Addr::new(10, 0, 0, 2)).udp4(9000).build(&key).unwrap();
         assert!(enr_dial(&neither).is_none());
+    }
+
+    #[test]
+    fn topics_overlap_around_a_fork_digest_change() {
+        let (a, b) = ([0, 0, 0, 0xa], [0, 0, 0, 0xb]);
+        let sched = vec![(4, a), (12, b)];
+        // Before the overlap window: nothing to do.
+        assert_eq!(digest_plan(&sched, a, 9, None), DigestPlan::default());
+        // Two epochs before the fork: subscribe to the next digest's topics, keep using `a`.
+        assert_eq!(digest_plan(&sched, a, 10, None), DigestPlan { subscribe: vec![b], ..Default::default() });
+        // At the fork: switch.
+        assert_eq!(digest_plan(&sched, a, 12, None), DigestPlan { subscribe: vec![b], switch_to: Some(b), unsubscribe: None });
+        // After: keep the old topics until two epochs past the fork, then leave them.
+        assert_eq!(digest_plan(&sched, b, 13, Some((a, 14))), DigestPlan::default());
+        assert_eq!(digest_plan(&sched, b, 14, Some((a, 14))), DigestPlan { unsubscribe: Some(a), ..Default::default() });
     }
 }

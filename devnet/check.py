@@ -1,12 +1,12 @@
 """Compares skim on the devnet with a devnet EL node at the same block hash.
 
-usage: python3 -I devnet/check.py <devnet EL rpc port> [skim rpc port, default 8600]
+usage: python3 -I devnet/check.py <devnet EL rpc port> [skim rpc port, default 8600] [enclave, default skim-devnet]
 Checks pre-funded balances, the deposit contract's code, and an eth_call (get_deposit_count).
 """
 import json, os, sys, urllib.request
 
 node, skim = int(sys.argv[1]), int(sys.argv[2]) if len(sys.argv) > 2 else 8600
-net = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out", "net")
+net = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out", sys.argv[3] if len(sys.argv) > 3 else "skim-devnet", "net")
 
 def rpc(port, method, params):
     req = urllib.request.Request(f"http://127.0.0.1:{port}", data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),

@@ -3,22 +3,25 @@
 # Docker network (beacon nodes there may listen on QUIC only, which isn't reachable from the host).
 #
 #   devnet/run.sh <skim linux binary> [extra skim args...]
+#   ENCLAVE=skim-bpo PARAMS=network_params.bpo.yaml SKIM_RPC_PORT=8601 devnet/run.sh ...   (a second devnet)
 #
-# Starts the devnet if the enclave doesn't exist, exports its network config to devnet/out/net,
+# Starts the devnet if the enclave doesn't exist, exports its network config to devnet/out/<enclave>/net,
 # then runs skim with the devnet's EL nodes as trusted peers and its finalized root as the
 # light-client checkpoint. CL peers come from discovery (bootstrap_nodes.txt).
-# JSON-RPC: http://127.0.0.1:${SKIM_RPC_PORT:-8600}. Logs: docker logs -f skim-devnet-node
+# JSON-RPC: http://127.0.0.1:${SKIM_RPC_PORT:-8600}. Logs: docker logs -f skim-<enclave>-node
 set -euo pipefail
 BIN=$(cd "$(dirname "$1")" && pwd)/$(basename "$1"); shift
 HERE=$(cd "$(dirname "$0")" && pwd)
 ENCLAVE=${ENCLAVE:-skim-devnet}
-OUT=$HERE/out
+PARAMS=${PARAMS:-network_params.yaml}
+OUT=$HERE/out/$ENCLAVE
 PORT=${SKIM_RPC_PORT:-8600}
+NAME=skim-$ENCLAVE-node
 
 # Start the devnet only if the enclave doesn't exist: re-running the package into an existing
 # enclave would replace the chain (a new genesis).
 if ! kurtosis enclave ls 2>/dev/null | awk '{print $2}' | grep -qx "$ENCLAVE"; then
-  kurtosis run --enclave "$ENCLAVE" github.com/ethpandaops/ethereum-package --args-file "$HERE/network_params.yaml"
+  kurtosis run --enclave "$ENCLAVE" github.com/ethpandaops/ethereum-package --args-file "$HERE/$PARAMS"
 fi
 kurtosis enclave inspect "$ENCLAVE" >/dev/null || { echo "kurtosis can't inspect enclave $ENCLAVE (see above); not touching it" >&2; exit 1; }
 mkdir -p "$OUT/bin"
@@ -49,9 +52,9 @@ for svc in $(echo "$inspect" | awk '$2 ~ /^el-[0-9]+-/ {print $2}'); do
 done
 
 NET=$(docker network ls --format '{{.Name}}' | grep "^kt-$ENCLAVE$")
-docker rm -f skim-devnet-node >/dev/null 2>&1 || true
-docker run -d --name skim-devnet-node --network "$NET" -p "127.0.0.1:$PORT:8545" -e RUST_LOG="${RUST_LOG:-info}" \
+docker rm -f "$NAME" >/dev/null 2>&1 || true
+docker run -d --name "$NAME" --network "$NET" -p "127.0.0.1:$PORT:8545" -e RUST_LOG="${RUST_LOG:-info}" \
   -v "$OUT/bin:/b:ro" -v "$OUT/net:/net:ro" ubuntu:24.04 \
   sh -c 'cp /b/skim /usr/local/bin/skim && chmod +x /usr/local/bin/skim && exec skim "$@"' -- \
   run --network /net --rpc 0.0.0.0:8545 --data-dir /tmp/skim --checkpoint "$CHECKPOINT" "${PEERS[@]}" "$@"
-echo "skim on the devnet: http://127.0.0.1:$PORT  (docker logs -f skim-devnet-node)"
+echo "skim on the devnet: http://127.0.0.1:$PORT  (docker logs -f $NAME)"
