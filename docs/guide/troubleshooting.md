@@ -30,7 +30,12 @@ skim isn't receiving consensus gossip. Check:
 - **Outbound UDP and TCP to the CL port range.** Some networks block discv5 (UDP).
 - **The clock.** Gossip validation is slot-based, so a skewed clock drops messages.
 - **Two skims on the same ports.** Pass a different `--cl-port`/`--el-port` per instance.
-- **Custom networks:** check the config/genesis and bootnodes selected by `--network`. Peers must match the Gloas/blob-parameter fork digest. Discovery accepts QUIC peers as well as TCP; TCP requires yamux. Use `--cl-peer` to add a known peer directly. See [network configuration](configuration.md#networks) and the [devnet walkthrough](../../devnet/README.md).
+- **Custom networks:** check the config/genesis and bootnodes selected by `--network`. Peers must match the Gloas/blob-parameter fork digest. skim dials QUIC first when a peer announces it, then TCP; over TCP it offers only yamux, so a TCP-only peer without yamux can't connect ([TODO 25](../TODO.md)). Use `--cl-peer` to add a known peer directly. See [network configuration](configuration.md#networks) and the [devnet walkthrough](../../devnet/README.md).
+
+### Custom network: EL peers drop at the handshake
+On a network with a fork scheduled after Amsterdam (for example a blob-parameter fork), builds before commit `a1ac222` computed the wrong EL fork id once that fork was active. Sessions opened before the fork survived; after it, peers closed them and refused new ones at the handshake. Update skim. A peer may keep refusing the old address for a while (on the devnet: `ECIES ... UnreadableStream`); starting skim from another address avoids the wait ([devnet walkthrough](../../devnet/README.md#state-edge-cases)). If peers still drop right after connecting, compare `genesis.json` with the one your peers use: the fork id is derived from its genesis hash and fork timestamps, so any difference (a different `amsterdamTime` or BPO time, for example) produces the same symptom.
+
+skim also refuses at startup a `genesis.json` whose Cancun (`cancunTime`) isn't active by `amsterdamTime` ("Cancun (EIP-6780) must be active by amsterdamTime").
 
 ### `safe`, `finalized` or `--require-verified` stays unavailable
 
@@ -52,9 +57,17 @@ Fetches go through whichever peers are connected. With 1–2 peers, a wide fetch
 - **Range cap:** `--max-logs-range` caps the range; larger requests get `-32005`.
 
 ### `eth_sendRawTransaction` succeeded but no receipt
-- **Not included yet:** the receipt is `null` until a block includes the transaction. skim re-broadcasts every 12 s for 30 minutes.
+- **Not included yet:** the receipt is `null` until a block includes the transaction. skim re-broadcasts every 12 s for 30 minutes, then forgets it (`eth_getTransactionByHash` returns `null` from then on).
 - **Dropped by peers:** a fee below the current base fee, or a nonce gap (an earlier nonce still missing), makes peers ignore the transaction. Check `eth_getTransactionCount(addr, "pending")` against your nonce.
 - **No EL peers:** check `skim_el: session` lines in the log.
+
+### `eth_getTransactionByHash` returns `null` for a mined transaction
+skim indexes transactions by hash only for the last `--tx-index-blocks` blocks (2,048 by default), and with the default `--tx-index pinned` only those whose block access list shows a change to a pinned address (an address with any subscribed key, including the sender's nonce). A transaction that only reads a pinned contract, or touches nothing you subscribe, isn't indexed, so `eth_getTransactionByHash` and `eth_getTransactionReceipt` return `null` and `debug_traceTransaction` returns `-32002`. Remedies:
+- **Look it up by block** if you know where it is: `eth_getBlockByNumber(n, true)`, `eth_getBlockReceipts`, `eth_getTransactionByBlockNumberAndIndex` and `debug_traceBlockByNumber` don't use the index.
+- **Index everything** with `--tx-index all` (a wallet backend or explorer). Its memory grows with chain activity over the index window, not with your subscriptions. Blocks are indexed as they arrive, so only blocks after the restart are covered.
+- **Subscribe the address** you care about, so its transactions are indexed from then on.
+
+Transactions sent through skim are found whatever the mode, for 24 h after inclusion (at most 4,096 of them).
 
 ### `-32004` from a tool
 Some tools call methods skim doesn't serve, such as filters (`eth_newFilter`) or `eth_sendTransaction` with node-held keys. Use client-side signing (viem `privateKeyToAccount`, Foundry `--private-key`), and polling instead of filters (viem's `watch*` helpers poll by default over HTTP).

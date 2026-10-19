@@ -29,8 +29,9 @@ smallname avoids maintaining a complete current-state projection. Each kind of a
 **What this guarantees, and what it doesn't:**
 - **Returned values are current and consistent:** every value in a response comes from contract state at the block in `meta.as_of`.
 - **A stale or over-inclusive candidate** is dropped by the live check, so it can't put a wrong row in a list.
+- **A read skim couldn't answer is a failure, never an absent value.** If skim refuses a live read (state it can't fetch right now), the answer says so (names and registry labels: `read_status: "failed"`; records: `status: "failed"`; both with `failure_reason: "state_unavailable"`; a `POST /v1/lookup` input: `status: "failed"`) instead of a null owner or a missing record. A call that reverts still means absent (`not_found`).
 - **Lists aren't guaranteed complete.** If Alice transfers a name to Bob and the index hasn't processed that block yet, a lookup of the name shows Bob, Alice's list drops it, and Bob's list doesn't have it yet. Every response that uses the index reports `meta.index.indexed_block` and `lag_blocks`, next to `meta.as_of` (where values were read). Coverage before `history_from_block` is a separate limit, marked as described below.
-  - **For a UI:** show both positions, e.g. "values read at block X" beside "discovery indexed through Y".
+  - **For a UI:** show both positions. The test page shows "values read at block X" beside "discovery indexed through Y" (with how many blocks behind).
   - **Empty lists:** keep "nothing indexed yet" apart from "none". With `lag_blocks > 0`, an empty list for Bob can just mean the transfer hasn't been indexed, even while a lookup of the name already shows Bob. The test page does this: an empty list says whether the index is caught up, and a list from a lagging index says it may be missing recent changes.
 
 **ENS rules come from the chain.** The Universal Resolver applies ENSv1/ENSv2 resolution. For ownership, smallname follows bigname's [ADR 0007](https://github.com/ensdomains/bigname) ("follow the chain"):
@@ -42,11 +43,11 @@ smallname avoids maintaining a complete current-state projection. Each kind of a
 History comes from what skim can fetch when the index starts, and then the index keeps everything it indexed:
 - **Never before Glamsterdam** (Sepolia block 11,856,337). skim keeps headers only from the fork on and answers `-32004` before it.
 - **Never before what peers still serve.** Receipts come from peers, and each peer announces the oldest block it still serves (eth/69 `earliest_block`). skim reports the result in `skim_status.history.logs_from` and refuses older ranges.
-  - On 2026-10-18, every connected peer reported `0` (full history), so the index reached back to the fork.
-  - Once peers expire history (a couple of weeks), a new index starts later than the fork.
+  - On 2026-10-18, every connected peer reported `0` (full history), so the index reached back to the fork. On 2026-10-19, `skim probe-retention` found all 7 Sepolia eth/71 peers serving bodies and receipts for every sampled block back to the fork block ([M7 log](../../docs/experiments/m7-gates-and-acquisition.md#how-far-back-sepolia-peers-serve-history-skim-probe-retention-2026-10-19)).
+  - Once peers expire that history, a new index starts later than the fork.
 - **After that, the index keeps it.** Indexed events stay indexed however old they get.
 
-**skim does the block work.** smallname reads skim's block stream (`skim_streamNext`): logs matching its filters, batch by batch from its cursor, with `rewind` after a reorg and `gap` where skim can no longer serve logs. Catch-up over history, the head, retries and reorg detection all live in skim; smallname only turns ENS events into index rows. Each batch is applied in one SQLite transaction together with the new cursor, so a crash re-delivers a batch (applying is idempotent) and never skips one.
+**skim does the block work.** smallname reads skim's block stream (`skim_streamNext`): logs matching its filters, batch by batch from its cursor, with `rewind` after a reorg and `gap` where skim can no longer serve logs. A `rewind` deletes every row the replaced blocks produced and puts back what they overwrote in place: a re-mounted ENSv2 registry's parent and its tokens' nodes (kept in `mount_undo`), and a record key's earlier write. Catch-up over history, the head, retries and reorg detection all live in skim; smallname only turns ENS events into index rows. Each batch is applied in one SQLite transaction together with the new cursor, so a crash re-delivers a batch (applying is idempotent) and never skips one.
 
 Anything earlier is marked, not guessed:
 - **History, events and lists:** `meta.completeness: "partial"` and `history_from_block`, which is where this index starts. `unsupported_reason` is `pre_glamsterdam_history` when the index starts at the fork, or `history_before_index_start` when it starts later.
@@ -59,7 +60,7 @@ A name created before the index starts still resolves and has a full profile; th
 - **Unknown labels:** a name whose label text was never seen in an event (`NewOwner` carries only its hash) is listed as `[labelhash].parent.eth`, as bigname does.
 - **Wrapped ancestors:** when an ancestor predates the fork, smallname reads its full name from the NameWrapper (`names(node)`, live, checked against the node) and records it.
 - **Unwrapped ancestors:** a pre-fork ancestor that isn't wrapped can't be named from state. Such rows are left out, under the same `partial` marker, unless a label list names them (below).
-- **Label lists (optional):** `smallname import-labels <file>` reads a newline-separated list of labels, such as a published ENS label list (smallname downloads nothing). Each label is used only where its hash already occurs:
+- **Label lists (optional):** `npm run smallname -- import-labels <file>` reads a newline-separated list of labels, such as a published ENS label list (smallname downloads nothing). Each label is used only where its hash already occurs:
   - it fills in `[labelhash]` rows;
   - as `label.eth`, it names a `.eth` parent the index only knows by node.
   A list can't put a wrong name in the index, only fill gaps.
@@ -120,6 +121,8 @@ Service units, a tunnel config and sizes: [`deploy/`](deploy).
 | `api.mjs` | the `/v1` routes |
 | `store.mjs` | SQLite schema/migrations and transactional rollback; keeps record-key occurrences so removing a later fork's write preserves earlier inventory |
 | `page.html` | the test page |
+| `smallname.mjs` | the entry point: `run` (index + API, the default), `serve` (API only, no indexing), `import-labels <file>` |
+| `test.mjs` | tests without a network (stream transactions, rollbacks, unavailable reads): `npm run -s smallname-test` |
 
 Env:
 - `SKIM_RPC` (default `http://localhost:8545`)

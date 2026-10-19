@@ -76,9 +76,9 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = HistoryMode::Off)]
     history: HistoryMode,
     /// Which transactions `eth_getTransactionByHash`, `eth_getTransactionReceipt` and
-    /// `debug_traceTransaction` can find by hash. `pinned`: only those touching a pinned
-    /// address (the `to`, or a state change in the BAL, which covers the sender), so nothing
-    /// is kept about unrelated transactions. `all`: every transaction (a wallet backend or
+    /// `debug_traceTransaction` can find by hash. `pinned`: only those whose BAL changes touch
+    /// a pinned address (which covers the sender, through its nonce change; a call that only
+    /// reads a pinned contract isn't indexed), so nothing is kept about unrelated transactions. `all`: every transaction (a wallet backend or
     /// explorer looking up arbitrary hashes). Transactions sent through skim are always found.
     #[arg(long, value_enum, default_value_t = TxIndexArg::Pinned)]
     tx_index: TxIndexArg,
@@ -96,7 +96,7 @@ pub struct Args {
     #[arg(long = "trusted-peer")]
     trusted_peer: Vec<skim_el::TrustedPeer>,
     /// Directory for restart data: a snapshot of subscribed state, the EL node key and known
-    /// peers (a few MB at most). Default: `$HOME/.skim/sepolia`.
+    /// peers (a few MB at most). Default: `$HOME/.skim/<network>` (`sepolia` for the built-in one).
     #[arg(long)]
     data_dir: Option<std::path::PathBuf>,
     /// Keep nothing on disk (every start begins empty, with a new node identity).

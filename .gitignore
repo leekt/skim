@@ -10,3 +10,4 @@ fuzz/coverage/
 fuzz/corpus/
 devnet/out/
 /target-fat
+__pycache__/

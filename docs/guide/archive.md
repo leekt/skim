@@ -30,7 +30,7 @@ A historical `eth_call` runs entirely on archived keys, with that block's header
 - **Writes:** each block's BAL already lists every write with its new value, so skim stores a version **only when a key changes**. A key that never changes costs one entry.
 - **Coverage:** a key is covered from the block it became known (subscribe time) onwards, within *segments* of consecutively processed blocks.
 - **Released keys:** a key no subscription needs for 64 blocks stops being archived. It stays covered up to the release block only, and archiving it again starts new coverage.
-- **Restarts:** after a restart, the gap is healed in the background from eth/71 BALs. Peers retain BALs for about 2 weeks.
+- **Restarts:** after a restart, the gap is healed in the background from eth/71 BALs. A reloaded archived key gets its base version whichever reads it first (its subscription or an on-demand read). How far back BALs are available: see [backfill](#backfill-history-from-before-you-subscribed).
 - **Reorgs:** the archive is truncated exactly by a per-block journal.
 
 ## Backfill: history from before you subscribed
@@ -38,7 +38,7 @@ A historical `eth_call` runs entirely on archived keys, with that block's header
 - **A key not written anywhere in that range:** its value was the same for the whole range, because a BAL lists every write. It is covered from the start of the range.
 - **A key written in the range:** it is covered from its **first write** onward. The value *before* that write appears in no BAL, so skim can't know it and refuses (`-32002`) rather than guess.
 
-Backfill depends on a complete verified chain of headers and BALs still served by peers. At Sepolia's 12 s slots, roughly two weeks is on the order of 100k blocks; other networks have different slot durations. `--archive-backfill N` is a target, not a guarantee or an automatic clamp to the fork/retention boundary. Unavailable ranges can keep retrying. Start with a few thousand blocks. Verified live: 300 blocks backfilled, 102 historical reads matched Infura, 3 were correctly refused, 0 were wrong.
+Backfill depends on a complete verified chain of headers and BALs still served by peers. EIP-7928 requires ELs to keep BALs only for the weak subjectivity period (3,533 epochs, ~15.7 days); some may keep them longer. Measured on Sepolia on 2026-10-19 (`skim probe-retention`): all 7 eth/71 peers served BALs for every sampled block back to the Glamsterdam fork block 11,856,337 (~12.7 days then). At 12 s slots, two weeks is on the order of 100k blocks; other networks have different slot durations. `--archive-backfill N` is a target, not a guarantee or an automatic clamp to the fork/retention boundary. Unavailable ranges can keep retrying. Start with a few thousand blocks. Verified live: 300 blocks backfilled, 102 historical reads matched a reference archive node, 3 were correctly refused, 0 were wrong.
 
 Inspect the per-address coverage-start summary with `skim_archiveCoverage([address])`. It reports `key`, `from` and `starts_at_write`; it does not enumerate every segment or healed gap. A successful historical read still requires coverage at that exact block. `--history local` stores headers and log matches separately and does not replace the selective state archive.
 
@@ -49,4 +49,4 @@ Inspect the per-address coverage-start summary with `skim_archiveCoverage([addre
 | K was never subscribed (or not yet at B) | `-32002` |
 | B before the backfill/subscription start, or in an unhealed gap | `-32002` |
 
-Verified against Infura (archive): 90/90 historical reads across slots, balances and quotes; 51/51 inside healed restart gaps. Details: [M4](../experiments/m4-archive.md).
+Verified against a reference archive node: 90/90 historical reads across slots, balances and quotes; 51/51 inside healed restart gaps. Details: [M4](../experiments/m4-archive.md).

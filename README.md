@@ -65,7 +65,7 @@ The age of a value and the age of the block you want to query are different:
 
 **Backfill cannot undo a write.** If a key has no writes throughout the scanned interval, including its known base block, its known value can extend back to the scan's start. If there are writes, coverage starts at the earliest recovered write: BALs contain new values, not the values they replaced.
 
-Peers must retain BALs for at least 3,533 epochs (about 16 days), but may prune them afterward ([EIP-7928](https://eips.ethereum.org/EIPS/eip-7928#engine-api)). This limits new backfills and healing offline gaps; it does **not** expire history already archived locally. `--archive-backfill N` targets N blocks before the archive's first block. The current implementation does not automatically clamp that target to the fork or peers' retained history, so an unavailable range can keep failing and retrying. See the [archive guide](docs/guide/archive.md) for configuration and coverage details.
+Peers must retain BALs for at least 3,533 epochs (about 15.7 days), but may prune them afterward ([EIP-7928](https://eips.ethereum.org/EIPS/eip-7928#engine-api)). On 2026-10-19, all 7 Sepolia eth/71 peers sampled by `skim probe-retention` still served BALs, bodies and receipts back to the fork block (about 12.7 days). This limits new backfills and healing offline gaps; it does **not** expire history already archived locally. `--archive-backfill N` targets N blocks before the archive's first block. The current implementation does not automatically clamp that target to the fork or peers' retained history, so an unavailable range can keep failing and retrying. See the [archive guide](docs/guide/archive.md) for configuration and coverage details.
 
 **External services:** state reads and backfills use Ethereum P2P peers, with no external Ethereum JSON-RPC fallback. Consensus bootstrap separately defaults to an HTTP checkpoint endpoint when neither `--checkpoint` nor a previously verified checkpoint is available; providing a trusted checkpoint avoids that HTTP request. The [trust model](#trust-model) still applies.
 
@@ -100,7 +100,7 @@ Simulation subscriptions don't need you to know storage layouts. skim learns eac
 
 ## What we measured
 
-All numbers are from Sepolia, measured from one home connection over public peers. Details and caveats are in the [experiment logs](docs/README.md#experiment-logs).
+All numbers are from Sepolia over public peers; unless a row says otherwise, measured from one home connection. Details and caveats are in the [experiment logs](docs/README.md#experiment-logs).
 
 | | Result |
 |---|---|
@@ -155,7 +155,7 @@ cargo build --release                     # Rust 1.97 (pinned in rust-toolchain.
 
 Or with Docker (`docker build -t skim .`; the image's default command is `run --rpc 0.0.0.0:8545 --data-dir /data`). Tagged releases publish Linux and macOS binaries and an image at `ghcr.io/leekt/skim`.
 
-Wait for `state ready` in the log. Then point any Ethereum tooling at `http://127.0.0.1:8545`:
+Wait for `state ready` in the log (logged for each applied block; `skim_subscriptionStatus` says when your subscriptions are ready). Then point any Ethereum tooling at `http://127.0.0.1:8545`:
 
 ```js
 import { createPublicClient, http, parseAbi, parseEther } from 'viem'
@@ -212,9 +212,9 @@ For network development, see the [local devnet walkthrough](devnet/README.md). [
 
 **Supported methods:**
 - State and simulation: `eth_call` (with state overrides), `eth_simulateV1`, `debug_traceCall` / `debug_traceTransaction` / `debug_traceBlockBy*` (default, `callTracer`, `prestateTracer`, `4byteTracer`, `muxTracer`), `eth_createAccessList`, `eth_getProof`, `eth_estimateGas`, `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`, `eth_getTransactionCount` (including `pending`)
-- Transactions: `eth_sendRawTransaction` (gossiped straight to EL peers), `eth_getTransactionByHash`, `eth_getTransactionReceipt`
+- Transactions: `eth_sendRawTransaction` (gossiped straight to EL peers), `eth_getTransactionByHash`, `eth_getTransactionReceipt`, `eth_getTransactionByBlock*AndIndex`. Lookups by hash cover recent transactions that change a subscribed address (`--tx-index pinned`, the default) or every transaction (`--tx-index all`), plus every transaction sent through skim; others return null.
 - Logs: `eth_getLogs`. Receipts are fetched only for blocks whose bloom and BAL match, and checked against `receiptsRoot`.
-- Blocks and chain: `eth_getBlockByNumber` / `eth_getBlockByHash` (full transactions), `eth_getBlockReceipts`, `eth_feeHistory`, `eth_blockNumber`, `eth_chainId`, `net_version`, `eth_syncing`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `web3_clientVersion`
+- Blocks and chain: `eth_getBlockByNumber` / `eth_getBlockByHash` (full transactions), `eth_getBlockReceipts`, `eth_feeHistory`, `eth_getBlockTransactionCountBy*`, `eth_blockNumber`, `eth_chainId`, `net_version`, `net_listening`, `eth_syncing`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `web3_clientVersion`
 - `skim_subscriptionStatus`, `skim_status` (including per-structure memory estimates), `skim_dashboard`, `skim_archiveCoverage`, `skim_streamNext` (stateless block streams with log/BAL changes, reorg rewinds and gaps)
 - WebSocket on the same port: `eth_subscribe` for `newHeads`, `logs` and `skim_subscriptions`
 
@@ -258,8 +258,9 @@ Open work, with what "done" means for each item: [`docs/TODO.md`](docs/TODO.md).
 - [x] Serving the network: recent headers, bodies, receipts and BALs (eth/69–71, snap/2), bytecode, and payload envelopes by range/root (consensus), each re-checked against its header before it is sent ([M6](docs/experiments/m6-correctness-and-bounds.md#serving-the-network))
 - [x] **M7: regression gates.** Review findings each have a deterministic test, in CI on every push. A soak gates on availability and recovery as well as wrong answers, and exercises storage-mode transitions on purpose. Also: peer-acquisition tracking with a ranked saved-peer list, parallel restart catch-up (655 blocks in ~9 s), Grafana alerts, release binaries and a container image ([M7](docs/experiments/m7-gates-and-acquisition.md))
 - [x] Consensus light-client verification and committee rotation for both presets; verified end to end on a minimal-preset devnet. Availability on public networks depends on peers serving Gloas light-client data
-- [x] Configured Glamsterdam networks (`--network <dir>`), including minimal-preset devnets, QUIC discovery and scheduled fork-digest topic changes
-- [ ] Live verification across a blob-parameter fork, remaining transport interoperability, and long-run RSS attribution (see [open work](docs/TODO.md))
+- [x] Configured Glamsterdam networks (`--network <dir>`), including minimal-preset devnets, QUIC discovery and scheduled fork-digest topic changes; a live blob-parameter fork crossed on the devnet without losing peers
+- [x] Transaction index limited to transactions that change a subscribed address (`--tx-index`), with a bounded lifecycle for sent transactions
+- [ ] TCP peers that require a muxer other than yamux, and RSS over a 27-hour run (see [open work](docs/TODO.md))
 
 Design: [PROJECT.md](PROJECT.md). Guides and experiment logs: [docs/](docs).
 

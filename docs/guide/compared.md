@@ -38,7 +38,7 @@ Use them as orders of magnitude, and measure your own workload.
 | Who serves data | your provider and a beacon light-client endpoint | Ethereum peers | itself | itself |
 | Request cost | per request: an access list plus a proof per account for each `eth_call` | none | none | none |
 | CPU | low | 0.25-0.5 core | 4 cores recommended (geth); Nethermind ran ~8.5 cores of background load on Sepolia here | similar, more during sync |
-| Memory | small | short macOS soaks ~100 MB median; Linux 179 MB at 26 min, 276 MB at 3 h with an indexer | 8-16 GB+ | 16 GB+ |
+| Memory | small | ~100 MB median in short macOS soaks (head-only); Linux with an indexer: 179 MB at 26 min, flat at ~346 MB from ~7 h (9 h run) | 8-16 GB+ | 16 GB+ |
 | Disk | none | ~1 MB head-only; ~140 MB with `--history local` | Sepolia: 345 GB measured (332 EL + 13 CL). Mainnet: 1.2 TB+ (reth), 650 GB+ growing ~14 GB/week (geth), 2 TB SSD recommended | mainnet: 2.8 TB+ (reth); 12 TB+ for geth's full archive |
 | Bandwidth | proportional to requests | ~0.3 MB/s in, ~0.1 MB/s out, steady | 24-25 Mbit/s+ recommended; the whole chain on first sync | the same |
 | Startup | seconds (from a checkpoint) | following in ~15 s; new keys wait on peers | sync: hours to days | longer (all history) |
@@ -79,7 +79,7 @@ Use them as orders of magnitude, and measure your own workload.
 | | Helios | skim | Full node | Archive node |
 |---|---|---|---|---|
 | CPU | per request (proof checks, local execution) | 0.25-0.5 core steady (verifying blocks, keeping subscribed state current, serving peers); bursts during catch-up | executes every block; several cores, heavy during sync | the same, more during sync |
-| Memory | small | workload/uptime dependent: ~100 MB median in short macOS soaks, up to 276 MB over a measured 3 h Linux run; counters explain part of RSS | 8-16 GB+ (more helps caching under RPC load) | 16 GB+ |
+| Memory | small | workload/uptime dependent: ~100 MB median in short macOS soaks (head-only, `--window 32`); with `--history local` and an indexer on Linux, rising to ~346 MB and flat from ~7 h (9 h run, a build that indexed every transaction) | 8-16 GB+ (more helps caching under RPC load) | 16 GB+ |
 | Bandwidth | proofs per request plus sync-committee updates | ~0.3 MB/s in, ~0.1 MB/s out | 24-25 Mbit/s+; the whole chain first, then block and transaction gossip | the same |
 | Storage | none | restart snapshot ~1 MB; history ~140 MB on Sepolia | Sepolia 345 GB; mainnet 650 GB-2 TB, NVMe | mainnet 2.8-12 TB+, NVMe |
 
@@ -122,7 +122,7 @@ Use them as orders of magnitude, and measure your own workload.
 
 **A wallet, or one user:**
 - **Helios fits best today.** It runs inside the wallet (WebAssembly, mobile), starts in seconds, needs no machine and works on mainnet; at wallet volume the provider costs little. In exchange, the provider sees your addresses and calls, and can stop answering.
-- **skim:** for a user with an always-on machine who wants no provider. Point the wallet at it. Or a community-run skim serving many users.
+- **skim:** for a user with an always-on machine who wants no provider. Point the wallet at it, and subscribe the user's addresses and tokens: by default skim finds transactions by hash only if they change a subscribed address. A community-run skim serving many users needs `--tx-index all` for arbitrary transaction lookups (last ~7 h).
 - **A full node:** the most independent, but a 2 TB NVMe machine is a lot to ask of a user. People who already run a home staking node have one and can point their wallet at it.
 - **An archive node:** more than a wallet ever needs.
 
@@ -132,6 +132,7 @@ Use them as orders of magnitude, and measure your own workload.
   - millisecond reads for the state you subscribe;
   - block streams and log history for indexing;
   - a machine a few times smaller than a full node's.
+  - Transaction lookups by hash cover recent blocks only (2,048 by default), and only transactions touching subscribed addresses unless `--tx-index all`.
 - **A full node fits when reads are unpredictable and must all be fast** (a block explorer, an RPC service, wallets for many users), or when you need the whole chain's recent history.
 - **An archive node fits** when you need any state at any past block: analytics, accounting across many accounts, indexers that start at genesis, tracing old transactions.
 - **Helios:** fine for occasional verified reads in a backend, but every call becomes several provider requests.

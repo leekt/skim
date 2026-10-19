@@ -2,7 +2,7 @@
 
 skim answers fast when the data is already in memory, and slower when it has to fetch it from peers. Most settings move that line: keep more in memory and fewer requests wait on the network, or keep less and pay for it on the misses. This page lists each knob, what it costs and what it buys, then the defaults skim ships with and why.
 
-[Hardware requirements](hardware.md) has the measured footprint; `skim_status.memory.parts` (and the Grafana panel "Retained data by structure (stacked) vs RSS") estimates instrumented structures on a running node. Peer buffers and several other allocations are not counted; `capacity` can mean an allocated capacity, limit or current count depending on the part.
+[Hardware requirements](hardware.md#memory) has the measured footprint, what each structure holds and when it fills, and what `skim_status.memory.parts` does and doesn't count. This page is the decisions.
 
 ## Where latency comes from
 
@@ -34,7 +34,7 @@ So the trade is almost always: memory spent keeping something, against network r
 |---|---|---|
 | **Call result cache** (on by default; `--no-call-cache` turns it off; clear triggers: 20,000 entries or estimated 32 MiB) | an identical `eth_call` at the same block answers without executing | every call executes (still from memory if its state is warm; CPU, not network) |
 | **Block caches** (bodies, receipts, withdrawals: 128 blocks; decoded BALs: 32; raw BALs and envelopes kept to serve peers: 64) | `eth_getLogs`, receipts, transaction replay and log scans over recent blocks need no fetch; peers syncing from skim get answers | requests for older blocks fetch from peers (verified against the header) |
-| **Transaction index** (`--tx-index pinned`, `--tx-index-blocks 2048`) | `--tx-index all`: `eth_getTransactionByHash` / `eth_getTransactionReceipt` find any transaction from the last ~7 hours | by default only transactions changing a pinned address (and ones sent through skim) are found; a shorter window loses older ones. Entries are 8-byte hash prefixes, confirmed against the transaction on lookup |
+| **Transaction index** (`--tx-index`, default `pinned`; `--tx-index-blocks`, default 2,048, 0 = none) | `--tx-index all`: `eth_getTransactionByHash`, `eth_getTransactionReceipt` and `debug_traceTransaction` find any transaction from the last ~7 hours (wallet backends, explorers) | by default only transactions whose state changes touch a pinned address (an address with any subscribed key; covers ones it sent) are found, plus ones sent through skim; read-only interactions aren't indexed. Unindexed lookups return `null`. Entries are 8-byte hash prefixes, confirmed against the transaction on lookup |
 | **`--history local`** | linked post-fork headers and fetched matching logs on disk, so covered queries can outlive peer receipt retention | disk (140 MB measured) plus a 16 MiB database page-cache budget; unfetched coverage still needs peers |
 
 The block-cache sizes are compile-time constants today (the transaction index has its flags); `skim_status.memory` shows what they hold.
@@ -52,14 +52,19 @@ The call cache checks its triggers before insertion. A single large result can p
 
 | Knob | Effect |
 |---|---|
-| **Transparent huge pages** (off; `MIMALLOC_ALLOW_THP=1` turns them on) | Huge pages map memory in 2 MiB pages instead of 4 KiB, so the CPU's address-translation cache covers more memory. That helps programs that sweep large working sets. skim's heap is a few hundred MB of short-lived, scattered allocations: a 2 MiB page with one live object stays fully resident. Measured: 251-256 MB RSS at 26 min with them, 179 MB without. The speed benefit for skim hasn't been measured. |
+| **Transparent huge pages** (off; `MIMALLOC_ALLOW_THP=1` turns them on) | Huge pages map memory in 2 MiB pages instead of 4 KiB, so the CPU's address-translation cache covers more memory. That helps programs that sweep large working sets. skim's heap is a few hundred MB of short-lived, scattered allocations: a 2 MiB page with one live object stays fully resident, so RSS is higher with them (measurements under [Defaults](#defaults-and-why)). The speed benefit for skim hasn't been measured. |
 | **Allocator** | mimalloc on Linux (returns freed memory after long catch-ups), the system allocator on macOS (smaller there). Built in, not a runtime switch. |
 
 ## Choosing
 
-- **Small machine (512 MB-1 GB):** `--window 32`, subscriptions only for what you read every block, defaults otherwise. Expect cold reads to wait on peers.
+- **Small machine (512 MB-1 GB):** the defaults, plus whichever of these fit; expect cold reads to wait on peers.
+  - **`--window 32`:** recent-BAL writes and versions shrink with it, and so do reads at older blocks and reorg depth. Short macOS soaks had ~100 MB medians, with frequent restarts; this is not a Linux or long-run RSS guarantee.
+  - **`--tx-index-blocks 0`:** no transaction lookups by hash except transactions sent through skim. An indexer that only reads logs and state needs none.
+  - **Subscriptions only for what you read every block,** or a lower `max_subscribed_keys`.
+  - **Allocator:** keep the defaults (mimalloc on Linux, huge pages off); see [Defaults](#defaults-and-why).
 - **Lowest latency for a known workload:** subscribe what your calls read (the dashboard's "Addresses your calls read" lists what isn't pinned yet, with a ready-made `skim.yaml` block), keep the default window and call cache. Subscribed state is small next to the block caches (about 100 bytes per key plus a version per change within the window): watch `state.versions` in `skim_status.memory` as you add keys.
 - **History and an indexer:** `--history local` stores headers and fetched matching logs on disk with a bounded 16 MiB page cache. Run the indexer on the same machine so its block stream stays local.
+- **Wallet backend or explorer looking up arbitrary transactions by hash:** `--tx-index all`. Its cost is in the [defaults table](#defaults-and-why).
 - **A deployment that must restart fast:** keep `--data-dir`, and subscribe rather than rely on on-demand keys. A key that's new after a restart, and not in a recent BAL, needs a SNAP peer, and those can take minutes to appear.
 
 ## Defaults, and why
@@ -77,7 +82,7 @@ Each default below records what was chosen, the evidence, and what was turned do
 | **EL peer limits** | 40 outbound + 15 inbound | skim reached 30-42 sessions; reth's larger defaults (100 + 30) permit more session buffers and peer state | reth's defaults; a tighter cap risks fewer SNAP peers, which is what slow restarts waited for |
 | **Fetch order** | completion order (each account's code requested as soon as the account arrives) | no measurable latency difference from the older wave order on 40 cold calls (peer variance dominated, 6-53 s); about 15% more code requests | the wave order; batching codes that arrive close together, if code requests start to matter |
 | **Block caches** | 128 / 64 / 32 blocks | not tuned yet: the per-structure counters now measure what each costs | shorter caches, which would make more recent-block requests fetch from peers |
-| **Transaction index** | pinned transactions only, 2,048 blocks | at 9 h, indexing every transaction held ~21 MB of payload (hash index plus per-block hash lists), about 40-50 MB of RSS with allocator overhead, mostly for transactions no app asked about | `all` (explorers and wallet backends) |
+| **Transaction index** | pinned transactions only, 2,048 blocks | at 9 h, indexing every transaction held ~21 MB of payload (hash index plus per-block hash lists), an estimated 40-50 MB of RSS at the measured ~2.3x overhead, mostly for transactions no app asked about | `all` as the default; it stays available for explorers and wallet backends |
 | **Peer history and dashboard tables** | bounded: 4,096 peer records, 1,024 dial cooldowns, 65,536 seen nodes, unknown RPC methods counted as `other` | each grew with every peer seen or every distinct method name (review findings) | unbounded |
 
-Long runs: memory levels off once the ~7 h caches are full ([hardware](hardware.md#memory): 346 MB at 9 h with every transaction indexed, +3 MB over the last two hours). Headers keep filling slowly until ~27 h.
+Long runs: memory levels off once the ~7 h caches are full ([hardware](hardware.md#long-runs): 346 MB at 9 h with every transaction indexed, +3 MB over the last two hours). Headers keep filling slowly until ~27 h; a run on the `--tx-index pinned` build past 27 h is pending.

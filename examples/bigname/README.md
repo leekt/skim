@@ -21,7 +21,7 @@ So skim takes the read load (verified lookups and hydration, the calls that scal
 From `examples/`, after installing its dependencies:
 
 ```bash
-../target/release/skim run --config bigname/skim.yaml          # terminal 1 (wait for "state ready")
+../target/release/skim run --config bigname/skim.yaml          # terminal 1 (wait for skim_subscriptionStatus to be ready)
 SKIM_RPC=http://localhost:8545 REF_RPC=<another sepolia rpc> npm run ens -- ens.eth nick.eth vitalik.eth
 ```
 

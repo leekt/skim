@@ -79,16 +79,16 @@ The directory supplies:
 |---|---|
 | `config.yaml` | `GLOAS_FORK_VERSION`, `GLOAS_FORK_EPOCH`, slot duration (`SLOT_DURATION_MS` or `SECONDS_PER_SLOT`), and `PRESET_BASE` (`mainnet` or `minimal`; defaults to `mainnet`). `BLOB_SCHEDULE` controls scheduled blob-parameter fork digests. |
 | `genesis.ssz` or `genesis_validators_root.txt` | Beacon genesis time and validators root from the SSZ state, or a 32-byte hex root in the text file. Without SSZ, time comes from `MIN_GENESIS_TIME + GENESIS_DELAY` in `config.yaml`. |
-| `genesis.json` | Execution genesis, including chain id and `amsterdamTime`. |
+| `genesis.json` | Execution genesis, including chain id and `amsterdamTime`. Cancun (`cancunTime`) must be active by `amsterdamTime`, or skim refuses the network: it applies BAL post-values as the new state, which is complete only with EIP-6780's SELFDESTRUCT rules. |
 | `bootstrap_nodes.txt` (optional) | CL discovery ENRs. Direct peers can also be supplied with `--cl-peer`. |
 | `enodes.txt` (optional) | EL bootnodes, one `enode://` per line; `--el-bootnode` adds more. |
 
-The `mainnet` preset names consensus constants; it is not a built-in `--network mainnet` option. The network must provide post-Glamsterdam payloads and BALs. Fork digests follow the configured blob schedule, with gossip topics overlapping around a transition. A live transition remains an open verification task in [TODO](../TODO.md).
+The `mainnet` preset names consensus constants; it is not a built-in `--network mainnet` option. The network must provide post-Glamsterdam payloads and BALs. Fork digests follow the configured blob schedule: Status carries the current fork digest, and gossip topics overlap two epochs either side of a transition. A live blob-parameter fork crossing has been verified on the devnet. The EL fork id also covers forks scheduled after Amsterdam.
 
 Consensus bootstrap uses `--checkpoint`, then a saved verified finalized root, then `--checkpoint-url`. Only built-in Sepolia supplies a default checkpoint URL. With no checkpoint source on another network, the node follows gossip optimistically and records the bootstrap error in `skim_status.light_client`; `--require-verified` refuses `latest` until verification succeeds. See the [devnet example](../../devnet/README.md) and [trust guide](trust-and-correctness.md).
 
 ## `skim run` flags
-Only `skim run` follows networks other than Sepolia (`--network`). The other subcommands (`probe-*`, `follow`, `bench-node`) are measurement tools from the experiments and are Sepolia-only.
+Only `skim run` follows networks other than Sepolia (`--network`). The other subcommands (`probe-*`, including `probe-retention`, `follow`, `bench-node`) are diagnostics and measurement tools from the experiments and are Sepolia-only.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -105,7 +105,7 @@ Only `skim run` follows networks other than Sepolia (`--network`). The other sub
 | `--archive-backfill <blocks>` | `0` | extend archived history backwards from retained BALs (~2 weeks) |
 | `--history <off\|local>` | `off` | `off`: in-memory chain-data history; `local`: post-fork headers and fetched matching logs in `history.redb`; requires a data dir and cannot be combined with `--ephemeral` |
 | `--max-logs-range <blocks>` | `2048` | largest range one `eth_getLogs` may scan |
-| `--tx-index <pinned\|all>` | `pinned` | which transactions `eth_getTransactionByHash`, `eth_getTransactionReceipt` and `debug_traceTransaction` can find by hash. `pinned`: only transactions whose BAL changes touch a pinned address (an address with any subscribed key), which includes everything sent from one (its nonce changes). Nothing is kept about other transactions. A transaction that only *reads* a pinned contract isn't indexed (BAL reads carry no transaction position). `all`: every transaction, e.g. for a wallet backend or explorer. Transactions sent through skim are always found |
+| `--tx-index <pinned\|all>` | `pinned` | which transactions `eth_getTransactionByHash`, `eth_getTransactionReceipt` and `debug_traceTransaction` can find by hash. `pinned`: only transactions whose BAL changes touch a pinned address (an address with any subscribed key), which includes everything sent from one (its nonce changes). Nothing is kept about other transactions; lookups for them return `null`. A transaction that only *reads* a pinned contract isn't indexed (BAL reads carry no transaction position). `all`: every transaction, e.g. for a wallet backend or explorer. Transactions sent through skim are always found (see [JSON-RPC](json-rpc.md)) |
 | `--tx-index-blocks <blocks>` | `2048` | recent blocks the transaction index covers (2,048 is ~7 h of 12 s blocks); `0` = none (sent transactions are still tracked) |
 | `--exclude-snap-peer <node-id>` | none | never use this peer for state (e.g. a node you benchmark against); repeatable |
 | `--data-dir <path>` | `~/.skim/<network>` | restart data: snapshot of subscribed state, EL node key, known peers and verified finalized root; built-in Sepolia uses `~/.skim/sepolia`, custom networks use the directory's basename |
@@ -143,6 +143,6 @@ Anything that doesn't check out (a reorg while skim was down, a gap over 8,192 b
   - **Block data and results:** block-count limits on headers, transaction indexes, bodies, receipts and BALs; the call cache clears before a new insert when it already holds 20,000 entries or an estimated 32 MiB. A single result can take it over the byte threshold until the next insertion.
   - **Database caches and peers:** bounded page caches and EL session targets also consume memory; network buffers and allocator overhead are not fully counted by `skim_status.memory`.
 
-  There is no single total RSS cap. Measurements include 179 MB after 26 minutes on Linux and 276 MB after three hours with an indexer; short macOS soaks with `--window 32` had 99–105 MB medians. These are different workloads and durations, not upper bounds. See [hardware requirements](hardware.md) and [memory and latency](memory-and-latency.md).
+  There is no single total RSS cap. Measurements (Linux aarch64, `--history local` plus an indexer, default window): 179 MB after 26 minutes; on a build that indexed every transaction, 281 MB at 3 h and 346 MB at 9 h, flat after ~7 h once the caches were full. Short macOS soaks with `--window 32` had 99–105 MB medians. These are different workloads and durations, not upper bounds; a run on the default `--tx-index pinned` build is still being measured. See [hardware requirements](hardware.md) and [memory and latency](memory-and-latency.md).
 - **Network and CPU:** skim receives and checks every block's full payload and BAL, so this part follows the whole chain's activity, not just your keys. What scales with your app is the state it keeps and the fetches it makes.
 - **Disk:** restart data in `--data-dir` by default; `--history local` adds `history.redb`, and `--archive` writes its separately selected file. `--ephemeral` without `--archive` keeps no persistent state. Use a separate data directory and archive for each chain/genesis.

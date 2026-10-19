@@ -2,7 +2,7 @@
 
 skim answers Ethereum JSON-RPC for **the state your app uses**, without re-executing every block or storing the full chain state. It combines BAL following, verified fetches, subscriptions and local simulation.
 
-`skim run` defaults to Sepolia and accepts other Glamsterdam networks through `--network <dir>` ([configuration](configuration.md#networks)). Chain id, consensus preset, slot duration, genesis and peer discovery come from that network's configuration.
+`skim run` defaults to Sepolia and accepts other Glamsterdam networks through `--network <dir>` ([configuration](configuration.md#networks)). Chain id, consensus preset, slot duration, genesis and peer discovery come from that network's configuration. Consensus peers are dialed over QUIC when they announce it, with TCP as the fallback.
 
 ## 1. Every block tells skim what changed
 Since Glamsterdam, each block carries a **block-level access list** ([EIP-7928](https://eips.ethereum.org/EIPS/eip-7928)): every account and storage slot the block touched, with the **value after** each write. With ePBS, that list travels inside the execution payload gossiped on the consensus layer.
@@ -65,6 +65,7 @@ Calls run in [revm](https://github.com/bluealloy/revm) with Amsterdam rules, aga
   - checks the transaction against verified head state (chain id, nonce, balance)
   - sends it straight to every connected EL peer
   - re-broadcasts it until a gossiped payload includes it
+- **Lookups by hash** (`eth_getTransactionByHash`, `eth_getTransactionReceipt`, `debug_traceTransaction`): as payloads arrive, skim indexes transaction hashes (8-byte prefixes, confirmed against the verified body on lookup) for the last `--tx-index-blocks` blocks (2,048). By default (`--tx-index pinned`) it indexes only transactions whose BAL entries change a pinned address, so it keeps nothing about the rest of the chain; `--tx-index all` indexes every transaction. Transactions sent through skim are tracked separately and always found.
 - **Receipts:** fetched with `GetReceipts` for that one block, and accepted only if they rebuild the header's `receiptsRoot`.
 - **`eth_getLogs`:**
   - scans headers in the range
@@ -95,13 +96,13 @@ skim answers other peers' requests from recent data it has already verified agai
 |---|---|---|
 | Tracked state | memory, multi-version for `--window` blocks | ~10–100 MB for typical app state |
 | Contract code | memory, only for tracked accounts | per contract |
-| Headers, tx hashes, BAL addresses | memory, last 2,048–8,192 blocks | tens of MB once full (hours) |
+| Headers, BAL addresses, transaction index | memory: headers of the last 8,192 blocks, BAL addresses of 2,048, the transaction index for `--tx-index-blocks` (2,048) | fills over hours; on a build that indexed every transaction, the index group was ~36 MB of payload at ~7 h ([hardware](hardware.md#memory)) |
 | Recent blocks and envelopes for serving | memory: BALs of the last 64 blocks, bodies of 128, envelopes of 64 slots | ~10–25 MB |
 | Restart snapshot | `restart.redb` in `--data-dir` (default `~/.skim/<network>`): subscribed values, node key, peers, verified finalized root | ~1 MB for 2,400 keys |
 | Chain-data history (optional) | `history.redb` with `--history local`: post-fork headers and fetched matching logs | grows with headers and requested log coverage |
 | Archived history (optional) | `redb` file, only for `retention: archive` subscriptions | versions only on change |
 
-Measured on Sepolia: 179 MB RSS at 26 minutes on Linux, rising to 276 MB over three hours with an indexer; short macOS soaks with `--window 32` had 99–105 MB medians. These are workload-specific observations, not memory ceilings. `skim_status.memory.parts` estimates retained payloads but omits network-buffer sizes and allocator overhead; see [hardware requirements](hardware.md). `--ephemeral` disables restart persistence and rejects `--history local`; an explicit `--archive` still writes its file.
+Measured on Sepolia (Linux aarch64, `--history local` plus an indexer): 179 MB RSS at 26 minutes; on a build that indexed every transaction, 346 MB at 9 h, flat after ~7 h. Short macOS soaks with `--window 32` had 99–105 MB medians. These are workload-specific observations, not memory ceilings. `skim_status.memory.parts` estimates retained payloads but omits network-buffer sizes and allocator overhead; see [hardware requirements](hardware.md). `--ephemeral` disables restart persistence and rejects `--history local`; an explicit `--archive` still writes its file.
 
 ## Consensus verification
 

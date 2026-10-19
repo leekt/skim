@@ -21,7 +21,9 @@ kurtosis enclave rm -f skim-devnet                # tear down
 - **The network config** comes from the enclave's `el_cl_genesis_data` artifact
   (`devnet/out/<enclave>/net`): exactly what `skim run --network <dir>` reads.
 - **Defaults:** enclave `skim-devnet`, `network_params.yaml`, skim RPC on `127.0.0.1:8600`.
-  `ENCLAVE`, `PARAMS` (relative to `devnet/`) and `SKIM_RPC_PORT` select separate runs. Each
+  `ENCLAVE`, `PARAMS` (relative to `devnet/`) and `SKIM_RPC_PORT` select separate runs; `CONFIG`
+  passes an app config (subscriptions; see [state edge cases](#state-edge-cases)) and `RUST_LOG`
+  sets skim's log filter (default `info`). Extra arguments after the binary go to `skim run`. Each
   launch replaces skim's container and its container-local `/tmp/skim` restart data; it does
   not replace the existing devnet chain.
 - **Bootstrap:** the runner uses the devnet beacon node's finalized root as `--checkpoint`
@@ -68,6 +70,7 @@ node devnet-edgecases.mjs plan http://<el rpc> <dir>       # addresses (from the
 CONFIG=<dir>/skim.yaml ../devnet/run.sh <skim binary>      # skim subscribed to them
 node devnet-edgecases.mjs run http://<el rpc> http://127.0.0.1:8600 <dir>
 ```
+With `ENCLAVE`/`SKIM_RPC_PORT` set for another devnet (the result below used the BPO one), set them on the `run.sh` line too and use that port.
 
 **Result (2026-10-19, build `a1ac222`, the BPO devnet, Nethermind as the reference):** all 11 steps match on balance, nonce, code and four storage slots of each of the 9 accounts. The values move as the cases intend: D's code is `0xef0100…` after delegating and `0x` after clearing, with its slot 3 written through the delegation kept; the self-destructed contract has no code and its beneficiary holds the 1,000 wei; the reverted call's write isn't there.
 

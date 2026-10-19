@@ -259,6 +259,8 @@ Four more runs (two of each mode) lost every SNAP peer partway through ("no SNAP
 - **Memory:** RSS median 181 MB, quartiles 157/210 MB, max 263 MB, against at most 134 MB for `5237bc1`. 26 BAL promotions; subscribed keys never over the limit. The reasons are measured below.
 
 ## Memory: why head-only RSS went from ~134 MB to ~230 MB
+> Later: the [memory audit](memory-audit.md) and, for current long-run measurements, [hardware requirements](../guide/hardware.md#memory) (TODO 6).
+
 Builds side by side on one machine (macOS), each with soak config A and the same per-block requests (seeded by block number), with no restarts. RSS in MB at equal uptime:
 
 | Build | 10 min | 20 min | 30 min | 38 min | 60 min max |

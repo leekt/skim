@@ -41,7 +41,7 @@ The light client supports both `mainnet` and `minimal` consensus presets and cat
 4. **Errors instead of guesses.** If a read can't be proven, the RPC answers `-32002`.
 
 ## How it was tested
-State and RPC behavior were compared on Sepolia against reference nodes at the same block hashes. Consensus verification also has unit tests for both presets and the devnet check above. See [`docs/experiments`](../experiments):
+State and RPC behavior were compared on Sepolia against reference nodes at the same block hashes, and state edge cases on the devnet against Nethermind. Consensus verification also has unit tests for both presets and the devnet check above. See [`docs/experiments`](../experiments):
 
 | Experiment | Result |
 |---|---|
@@ -51,5 +51,6 @@ State and RPC behavior were compared on Sepolia against reference nodes at the s
 | Verified-state runs | 866 calls, 0 mismatches |
 | Archive | 90/90 and 51/51 historical reads; backfill 102 identical, 3 refused, 0 wrong |
 | Receipts and logs | 32/32 receipts and transactions; every `eth_getLogs` filter identical over 16 and 1,024 blocks |
+| Devnet state edge cases (`examples/devnet-edgecases.mjs`: EIP-7702 delegation and clearing, SELFDESTRUCT, reverted writes, …) | all 11 steps match Nethermind at each block hash ([devnet](../../devnet/README.md#state-edge-cases)) |
 
 A bug found by these checks (an empty SNAP answer treated as zero) is why rule 1 exists.

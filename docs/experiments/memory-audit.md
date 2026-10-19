@@ -1,14 +1,16 @@
-# Handoff: skim memory usage
+# Memory audit (2026-10-18)
+
+A source audit of skim's memory use at `47ceff4`, with the A/B measurements it was based on. Its measurements and recommendations are historical.
 
 ## Current status (2026-10-19)
 
-The audit below was written against `47ceff4`; its measurements and recommendations are historical. Current code has platform-specific allocators (mimalloc on Linux, system allocator on macOS), transparent huge pages disabled by default on Linux, 40 outbound / 15 inbound EL peer targets, per-structure memory estimates in `skim_status.memory.parts` and Grafana, and call-cache clear triggers at 20,000 entries or an estimated 32 MiB. A large result can exceed the byte trigger until the next insertion. Cached read lists contain addresses, not individual storage keys. Chain-data caches and the history database now live in `skim-chain`.
+Since the audit, current code has platform-specific allocators (mimalloc on Linux, system allocator on macOS), transparent huge pages disabled by default on Linux, 40 outbound / 15 inbound EL peer targets, per-structure memory estimates in `skim_status.memory.parts` and Grafana, and call-cache clear triggers at 20,000 entries or an estimated 32 MiB. A large result can exceed the byte trigger until the next insertion. Cached read lists contain addresses, not individual storage keys. Chain-data caches and the history database now live in `skim-chain`. The four cleanup findings below were applied (see "Review of the audit").
 
-The latest recorded production run reached 276 MB RSS after three hours, with about 66 MB of counted payload estimates. Block caches and the recent-write window levelled off; transaction indexes still fill for ~7 hours, headers for ~27. The uncounted RSS gap rose about 10 MB over the last 75 minutes. This has not established a leak or a long-run plateau. See [hardware measurements](docs/guide/hardware.md#memory), [memory and latency](docs/guide/memory-and-latency.md), and [TODO 6](docs/TODO.md).
+**Current measurements:** [hardware requirements](../guide/hardware.md#memory) and [memory and latency](../guide/memory-and-latency.md). In short: production, Linux aarch64, `--history local` plus an indexer, on the build that indexed every transaction, RSS was 147 MB at start, 281 MB at 3 h, 335 MB at 6 h and 346 MB at 9 h, flat after about 7 h (+3 MB over the last 2 h). The counted structures reached ~91 MB; RSS grew about 2.3x the counted payload (hash-table and allocator overhead), and 305 of 339 MB was mimalloc's heap. Whether RSS stays flat once headers fill (~27 h) is [TODO 6](../TODO.md#memory), now measured on the `--tx-index pinned` build.
 
-Short macOS soaks restart every 6–12 minutes and use `--window 32`: their ~100 MB medians cannot be attributed to full seven-hour transaction indexes. All in-process caches reset at restart. Payload estimates exclude allocation slack, code pages and several uninstrumented structures, so they are not a complete live-heap breakdown. Next work is to attribute growth past the relevant cache horizons; counters no longer need to be added first.
+Short macOS soaks restart every 6–12 minutes and use `--window 32`: their ~100 MB medians cannot be attributed to full seven-hour transaction indexes. All in-process caches reset at restart. Payload estimates exclude allocation slack, code pages and several uninstrumented structures, so they are not a complete live-heap breakdown.
 
-## Earlier audit (2026-10-18)
+## Scope
 
 Status as of 2026-10-18 (`main` at `47ceff4`). The original handoff treats ~230 MB RSS as
 acceptable and prioritizes finding a **leak**. The follow-up source audit below also records
@@ -40,8 +42,8 @@ Deferred at that review (several items were implemented later; see current statu
 - **Cache horizons and byte budgets, `--window`, new `skim_status` cache counters.** These are
   tuning and instrumentation, recommended steps 3 and 5, left for when lower RSS is wanted.
 
-At that review, these fixes had not been re-measured as RSS. Later measurements are summarized
-above; whether there is a leak in ordinary head following remains open. The applied fixes remove unbounded growth that needs timeouts,
+At that review, these fixes had not been re-measured as RSS. Later measurements: see current status
+above; whether RSS stays flat past 9 h is still open (TODO 6). The applied fixes remove unbounded growth that needs timeouts,
 peer churn, or unusual requests to show up.
 
 ## Historical numbers (head-only, `--history off`)
@@ -124,9 +126,9 @@ At one block every 12 seconds, starting with empty caches:
 
 Missed slots, startup seeding, historical requests, and cacheable-result rates change these
 times. Call results clear at their entry limit, so their occupancy can rise and fall rather
-than plateau. See [chain-data cache limits](crates/skim-chain/src/chaindata.rs),
-[call-result cache](crates/skim-cli/src/rpc.rs), and
-[CL envelope cache](crates/skim-cl/src/serve.rs).
+than plateau. See [chain-data cache limits](../../crates/skim-chain/src/chaindata.rs),
+[call-result cache](../../crates/skim-cli/src/rpc.rs), and
+[CL envelope cache](../../crates/skim-cl/src/serve.rs).
 
 The nine fixtures are `data/fuzz-seeds/envelope-11363645-{0..7}.ssz` (local, gitignored) and
 `crates/skim-cl/tests/fixtures/sepolia-11356920.envelope.ssz`. They average 123.6 transactions
@@ -167,24 +169,24 @@ These are source-level findings. Their contribution to the measured growth has n
 quantified, and some require timeouts, peer churn, unusual requests, or stalled work to occur.
 
 1. **SNAP/1 pending requests survive caller timeout.** In
-   [snap1.rs](crates/skim-el/src/snap1.rs), `pending` removes a sender only when its response
+   [snap1.rs](../../crates/skim-el/src/snap1.rs), `pending` removes a sender only when its response
    arrives or the connection is dropped. `ElNet::snap_any` in
-   [lib.rs](crates/skim-el/src/lib.rs) drops the receiver on timeout, leaving unanswered
+   [lib.rs](../../crates/skim-el/src/lib.rs) drops the receiver on timeout, leaving unanswered
    entries for the session's lifetime. Remove canceled pending requests, skip canceled queued
    commands, and bound the command queue. Cancellation should trigger cleanup even if the peer
    sends no further traffic.
-2. **Peer history never evicts.** In [node.rs](crates/skim-cl/src/node.rs), `last_dial` and
-   `seen_nodes` accumulate distinct peers/nodes. In [book.rs](crates/skim-el/src/book.rs),
+2. **Peer history never evicts.** In [node.rs](../../crates/skim-cl/src/node.rs), `last_dial` and
+   `seen_nodes` accumulate distinct peers/nodes. In [book.rs](../../crates/skim-el/src/book.rs),
    `PeerBook.records` retains every historical peer. Expire dial cooldowns and bound or age
    history records while preserving useful ranking and aggregate statistics. Bounding discovery
    deduplication changes lifetime-unique counting semantics and should be reflected in metrics.
 3. **Dashboard method names are unbounded.** `Dashboard::record_method` in
-   [dashboard.rs](crates/skim-cli/src/dashboard.rs) inserts arbitrary request method strings.
+   [dashboard.rs](../../crates/skim-cli/src/dashboard.rs) inserts arbitrary request method strings.
    Normalize unknown methods to `other`, as the adjacent metrics path in `Rpc::one` already
    does. Also apply the address limit in `record_hit`: it inserts addresses without the pruning
    used by `record_call`, and state-override calls can reach it directly.
 4. **Canceled scheduler jobs can remain queued.** In
-   [skim-snap/src/lib.rs](crates/skim-snap/src/lib.rs), closed waiters are retained, and a job
+   [skim-snap/src/lib.rs](../../crates/skim-snap/src/lib.rs), closed waiters are retained, and a job
    waiting for its first send has no deadline while peers exist. Low-priority capacity becomes
    zero when a peer's adaptive capacity is one. Remove orphaned jobs/closed waiters and add
    queue admission limits and a bounded wait for capacity.
@@ -231,8 +233,8 @@ quantified, and some require timeouts, peer churn, unusual requests, or stalled 
 ## References
 - `docs/experiments/m7-gates-and-acquisition.md`, section "Memory: why head-only RSS went from
   ~134 MB to ~230 MB", and the soak results (third soak).
-- `docs/TODO.md`: item 6 was closed in `47ceff4` with the reasons above. Reopen it if a leak is
-  found.
+- `docs/TODO.md`: item 6 was closed in `47ceff4` with the reasons above. It has since been
+  reopened as "whether RSS levels off" ([TODO 6](../TODO.md#memory)).
 - Earlier catch-up notes: heaptrack on aarch64 Linux showed a 228 MB peak live heap (freed receipt
   buffers). It couldn't unwind the release binary, so a symbolized profile still needs a build
   with debug info (`[profile.release] debug = "line-tables-only"`).

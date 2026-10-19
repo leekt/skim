@@ -7,7 +7,7 @@ This document describes the implemented architecture as of 2026-10-19. Operator 
 | | Current implementation |
 |---|---|
 | Status | Experimental; BAL follower, verified state, local simulation, selective archive and block streams implemented |
-| Networks | Sepolia built in; other post-Glamsterdam networks through `skim run --network <dir>` |
+| Networks | Sepolia built in; other Glamsterdam networks through `skim run --network <dir>` (Cancun must be active by `amsterdamTime`); other subcommands are Sepolia diagnostics |
 | Consensus presets | `mainnet` and `minimal`; preset-sized light-client verification and committee rotation |
 | Language/toolchain | Rust 2024; Rust 1.97.0 pinned in `rust-toolchain.toml` |
 | Core dependencies | reth v2.7.0 networking, libp2p/discv5, revm 43, alloy, redb, axum |
@@ -40,11 +40,11 @@ BAL entries include account changes, storage changes and reads. Changes carry ab
 
 `skim-cl` receives `SignedExecutionPayloadEnvelope` through `execution_payload` gossip or consensus req/resp. It rebuilds the EL header, checks its block hash and BAL commitment, and checks the payload's link to the beacon block's execution-payload bid. These commitment checks do not themselves validate all proposer or builder signatures.
 
-Networking uses discv5 and libp2p gossipsub, QUIC and TCP with yamux, and consensus Status/Metadata/Ping and payload/light-client request protocols. A configured network supplies genesis, preset, slots and fork versions. Blob-parameter fork digests follow `BLOB_SCHEDULE`; gossip topics overlap around transitions. A live transition and remaining TCP-muxer interoperability are still in [TODO](docs/TODO.md).
+Networking uses discv5 and libp2p gossipsub, QUIC and TCP with yamux, and consensus Status/Metadata/Ping and payload/light-client request protocols. A configured network supplies genesis, preset, slots and fork versions. QUIC is dialed first when a peer announces it, TCP as the fallback. Blob-parameter fork digests follow `BLOB_SCHEDULE`; gossip topics overlap two epochs either side of a transition, and Status carries the digest in force. A live transition was crossed on the minimal-preset devnet. TCP peers that require a muxer other than yamux remain in [TODO](docs/TODO.md).
 
 ### 3.3 eth/71 (EIP-8159): BAL retrieval over EL P2P
 
-Execution peers supply headers, bodies, receipts and `GetBlockAccessLists` by hash. Header links and commitments are verified before use. A valid empty BAL (`0xc0`) differs from unavailable data (`0x80`). EL BAL requests fill gaps, recover reorg branches, heal archived segments and backfill history while peers retain it.
+Execution peers supply headers, bodies, receipts and `GetBlockAccessLists` by hash. Header links and commitments are verified before use. A valid empty BAL (`0xc0`) differs from unavailable data (`0x80`). EL BAL requests fill gaps, recover reorg branches, heal archived segments and backfill history while peers retain it. EIP-7928 requires BALs only for the weak subjectivity period (3,533 epochs, ~15.7 days); `skim probe-retention` measures what Sepolia peers actually serve. The EL fork id orders timestamp forks by activation, so forks scheduled after Amsterdam are announced correctly.
 
 ### 3.4 snap/2 (EIP-8189): state retrieval
 
@@ -166,7 +166,7 @@ Supported families include state reads, `eth_call`, gas estimation, `eth_simulat
 
 Unavailable state/data returns `-32002`; explicit unsupported methods return `-32004`, unknown methods `-32601`, invalid parameters `-32602`, and execution reverts code `3`. WebSocket subscriptions support `newHeads`, `logs` and `skim_subscriptions`; HTTP filter creation is unsupported.
 
-## 7.5 Product model: application-specific state client (M3)
+### 7.5 Product model: application-specific state client (M3)
 
 Subscriptions declare accounts, storage slots or calls. They keep required keys current from BAL writes; readiness requires known values and bytecode at the reported block. Call subscriptions use `calls: [{to, data, from?}]`; `on_block: true` publishes fresh results after maintenance. Whole storage uses `storage: all` with a lifetime `max_slots` limit (50,000 by default).
 
@@ -174,13 +174,21 @@ On-demand keys stay tracked for `state.on_demand.cache_ttl_blocks` after use (de
 
 See [configuration](docs/guide/configuration.md) for actual YAML. Chain selection is the `--network` flag, not a YAML field.
 
-## 7.6 M4: selective state archiving
+### 7.6 M4: selective state archiving
 
 `retention: { mode: archive }` with `--archive <path>` records an initial base and changed versions for subscribed keys in redb. Coverage is per key and linked segment. Historical calls succeed only when every dependency is covered. Unneeded archived keys are released after 64 blocks; old covered history remains, but subsequent blocks are no longer covered until tracking resumes.
 
 Restart gaps and `--archive-backfill N` use verified linked headers/BALs from peers. BALs contain post-values, so backfill cannot infer the value before the earliest recovered write. Unchanged keys can extend back only across a complete verified scan, including their known base boundary. There is no unlimited historical reconstruction guarantee.
 
+After a restart, a reloaded archived key that an on-demand read warms first still gets its base archived.
+
 `--history local` is a different database: it stores post-fork headers and fetched matching logs/coverage for streams and log queries. It does not archive arbitrary state or retain all historical BALs.
+
+### 7.7 Transactions
+
+`eth_getTransactionByHash`, `eth_getTransactionReceipt` and `debug_traceTransaction` find transactions through an in-memory index in `skim-chain`. `--tx-index pinned` (the default) indexes only transactions whose BAL changes touch a pinned address (one with any subscribed key); that includes the sender, through its nonce change. Transactions that only read a pinned address can't be identified without re-execution and aren't indexed. `--tx-index all` indexes every transaction. `--tx-index-blocks N` sets the covered recent blocks (2,048 by default; 0 = none). Keys are 8-byte hash prefixes, confirmed against the transaction on lookup. Unindexed transactions return null.
+
+`eth_sendRawTransaction` checks and gossips a signed transaction to EL peers. Sent transactions are always found, whatever `--tx-index` is: while pending they are re-broadcast every 12 s, and dropped after 30 minutes if never included; once included they are remembered for 24 h (at most 4,096). A reorg makes an included one pending again.
 
 ## 8. Trust model
 
@@ -196,13 +204,13 @@ Measurements identify the build, network, hardware, workload and cache state. Th
 
 Prometheus exports block arrival/head age, per-method requests/latency, peers and fetch outcomes, subscriptions, serving counters and process resources. `skim_memory_bytes`, `skim_memory_entries` and `skim_memory_capacity` report instrumented retained structures. These are estimates, not a heap profile: peer buffer bytes, some caches, allocator slack and code pages remain uncounted. Some capacity fields are collection capacities; others are configured limits or current counts.
 
-The call cache clears before the next insert after reaching 20,000 entries or an estimated 32 MiB; a large single result can exceed the byte trigger. Block caches are count-bounded (32/64/128 blocks), transaction indexes 2,048 blocks and headers 8,192. Their fill times depend on slot duration, missed slots and historical fetches. Persistence/history/archive page-cache budgets are 8/16/64 MiB respectively.
+The call cache clears before the next insert after reaching 20,000 entries or an estimated 32 MiB; a large single result can exceed the byte trigger. Block caches are count-bounded (32/64/128 blocks), the transaction index by `--tx-index-blocks` (2,048) and headers 8,192. Their fill times depend on slot duration, missed slots and historical fetches. Persistence/history/archive page-cache budgets are 8/16/64 MiB respectively.
 
 ## 10. Plan
 
 M0–M7 delivered network feasibility, BAL following, verified state, the simulator and RPC, subscriptions, archive/backfill, generalized predictions, chain data, serving and regression gates. Experiment names are historical milestone labels, not a list of unimplemented APIs.
 
-Further work is tracked in [TODO](docs/TODO.md): live blob-parameter-fork verification, remaining TCP interoperability and long-run memory attribution. `skim run` supports configured networks; `follow`, `probe-*` and the baseline workload remain Sepolia diagnostics. The [handoff](docs/HANDOFF.md) records test commands and the shared-library boundary.
+Further work is tracked in [TODO](docs/TODO.md): TCP peers without yamux, and whether RSS stays flat over 27 hours. `skim run` supports configured networks; `follow`, `probe-*` and the baseline workload remain Sepolia diagnostics. The [handoff](docs/HANDOFF.md) records test commands and the shared-library boundary.
 
 ## 11. Risks
 
@@ -210,7 +218,7 @@ Further work is tracked in [TODO](docs/TODO.md): live blob-parameter-fork verifi
 - **Cold dependency depth:** unfamiliar calls can require several fetch rounds and wait for usable peers.
 - **Consensus bootstrap:** a trusted root and peers serving usable light-client data are required for authenticated heads.
 - **Reorgs and concurrency:** shared state, caches, restores and streams must remain on one hash-linked chain; regression tests cover the known races.
-- **Memory:** count/byte-triggered caches do not define a total RSS cap. Three-hour production observations still leave uncounted growth; the slowest caches take hours to fill.
+- **Memory:** count/byte-triggered caches do not define a total RSS cap. A nine-hour production run levelled off after ~7 h, but headers take ~27 h to fill and a 27-hour run is pending ([hardware](docs/guide/hardware.md#memory)).
 - **Protocol changes:** new fork schemas or unsupported consensus presets need code support; a configured blob schedule alone does not implement arbitrary future forks.
 
 ## 12. Prior art

@@ -52,6 +52,7 @@ await client.getBlockNumber()
 
 - A missing account or slot is fetched over SNAP with a verified Merkle proof, unless a recent BAL already establishes its value. A fetch can take hundreds of milliseconds to seconds, depending on peers and dependency rounds.
 - Once known, it is local and kept current while subscribed or within its on-demand TTL (4 blocks after use by default). Warm `eth_call`s have measured 0.5–6 ms; expired keys may need another fetch.
+- `eth_getTransactionByHash` and receipts by hash find transactions sent through skim, and by default only mined transactions that change an address you subscribe (`--tx-index all` indexes every transaction; see [JSON-RPC](json-rpc.md)).
 
 State proofs are checked on every fetched value. By default, `latest` follows the newest state-ready gossip block. `safe` and `finalized` require verified light-client updates; `--require-verified` also applies that requirement to `latest`. Check `skim_status.light_client` for the actual verification state ([trust guide](trust-and-correctness.md)).
 

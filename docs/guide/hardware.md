@@ -15,7 +15,9 @@ The measured Linux deployment uses two aarch64 cores. These are sizing recommend
 
 ## Memory
 
-### What was measured
+This section is the measurements and what fills when. Which knobs trade memory for latency, and why the defaults are what they are: [memory and latency](memory-and-latency.md).
+
+### Short runs
 
 | Setup | RSS | Notes |
 |---|---|---|
@@ -24,30 +26,34 @@ The measured Linux deployment uses two aarch64 cores. These are sizing recommend
 | macOS, head-only, `--window 32`, soak load, restarts every 6-12 min | median 99-105 MB, peaks 168-194 MB | peaks are the catch-up right after a restart |
 | Linux, catching up ~40k blocks of history | 230-296 MB | before the huge-page change; glibc's allocator instead: 394-610 MB |
 
-**Over three hours** (production, Linux aarch64, `--history local` plus an indexer, 20 subscriptions, default window, huge pages off), RSS in MB against the sum of what `skim_status.memory` counts:
+### Long runs
+
+Both runs below are the production deployment: Linux aarch64, `--history local` plus an indexer, 20 subscriptions, default window, on builds that indexed every transaction (before `--tx-index pinned` became the default). "Counted structures" is the sum of what `skim_status.memory` counts.
+
+**Three hours** (huge pages off):
 
 | Minutes | 1 | 31 | 61 | 106 | 136 | 181 |
 |---|---|---|---|---|---|---|
-| RSS | 109 | 203 | 240 | 262 | 265 | 276 |
-| Counted structures | 4 | 46 | 61 | 62 | 63 | 66 |
+| RSS (MB) | 109 | 203 | 240 | 262 | 265 | 276 |
+| Counted structures (MB) | 4 | 46 | 61 | 62 | 63 | 66 |
 
 - **Plateaued within about an hour:** block caches (receipts ~10-11 MB, bodies ~8 MB, envelopes served ~7 MB, raw BALs ~3 MB), recent-BAL writes (~16-18 MB), EL peers (~38).
-- **Still growing, as designed:** the transaction index, transaction hashes and BAL addresses, ~1.5 MB per 15 minutes together until 2,048 blocks (~7 h; about 19 MB more), and headers until ~27 h (a few MB).
-- **Not yet explained after three hours:** the gap between RSS and the counted structures grew from ~200 MB to ~210 MB over the last 75 minutes.
+- **Still growing, as designed:** the transaction index, transaction hashes and BAL addresses, ~1.5 MB per 15 minutes together until 2,048 blocks (~7 h), and headers until ~27 h (a few MB).
+- At three hours the gap between RSS and the counted structures was still growing (~200 MB to ~210 MB over the last 75 minutes); the nine-hour run explains it.
 
-**Over nine hours** (same deployment, build `4b99013`, which indexed every transaction), RSS in MB:
+**Nine hours** (the same process continued; build `fb4dd7b`, huge pages off):
 
 | Hours | 0 | 3 | 6 | 7 | 8 | 9 |
 |---|---|---|---|---|---|---|
-| RSS | 147 | 281 | 335 | 343 | 344 | 346 |
+| RSS (MB) | 147 | 281 | 335 | 343 | 344 | 346 |
 
-- **It levels off with the caches.** The counted structures reached ~91 MB by ~6-7 h and stopped growing; RSS went flat with them (+3 MB over the last two hours). Over the run RSS grew about 2.3 MB per MB of counted payload: the counters count keys and values, not hash-table slots, spare capacity or allocator rounding, so the "uncounted" part grows with the caches rather than on its own.
+- **It levels off with the caches.** The counted structures reached ~91 MB by ~6-7 h and stopped growing; RSS went flat with them (+3 MB over the last two hours). Over the run RSS grew about 2.3 MB per MB of counted payload: the counters count keys and values, not hash-table slots, spare capacity or allocator rounding, so the uncounted part grows with the caches rather than on its own.
 - **Where it is:** 305 of 339 MB was mimalloc's heap (skim's own allocations), 22 MB the binary, nothing else of note.
-- **The largest growing group was the transaction index** (index, per-block hash lists and BAL addresses: ~36 MB of payload). From the next build, transactions are indexed only if they change a pinned address (`--tx-index pinned`, the default), the index stores 8-byte hash prefixes, and per-block hash lists are no longer kept. Headers still fill until ~27 h (a few MB).
+- **The largest growing group was the transaction index** (index, per-block hash lists and BAL addresses: ~36 MB of payload). Since `9ed1f49`, transactions are indexed only if they change a pinned address (`--tx-index pinned`, the default), the index stores 8-byte hash prefixes, and the per-block lists hold those 8-byte keys instead of full hashes. Headers still fill until ~27 h (a few MB).
+
+A run on the pinned-index build started 2026-10-19; its numbers past 27 h are pending.
 
 ### What holds memory
-
-How to trade memory for latency, knob by knob, and why the defaults are what they are: [memory and latency](memory-and-latency.md).
 
 `skim_status.memory.parts` (and the Grafana panel "Retained data by structure (stacked) vs RSS") reports instrumented structures' entries, estimated payload bytes and `capacity`. The latter is an allocated collection capacity for some parts, a configured limit or current count for others. Peer payload bytes are currently zero placeholders; network buffers, learned/analyzed-code caches, database page caches, allocator overhead and resident code pages are not fully represented. The sum explains only part of RSS and is not a live-heap measurement.
 
@@ -58,6 +64,7 @@ How to trade memory for latency, knob by knob, and why the defaults are what the
 | Bodies, receipts, withdrawals (`chain.bodies`, `chain.receipts`, `chain.withdrawals`) | 128 blocks each | ~26 min |
 | Recent-BAL writes (`state.recent_bal_writes`) | `--window` blocks (256) | ~51 min; ~19.5 MB when full |
 | Transaction index (`chain.tx_index`, `chain.tx_blocks`): pinned transactions only by default | `--tx-index-blocks` (2,048) | ~7 h; small unless `--tx-index all` |
+| Transactions sent through skim (`chain.sent_txs`, `chain.sent_included`) | pending: re-broadcast for up to 30 min; included: 24 h, at most 4,096 | as sent |
 | BAL addresses per block, an `eth_getLogs` pre-filter (`chain.touched`) | 2,048 blocks | ~7 h |
 | Headers (`chain.headers`) | 8,192 blocks | ~27 h |
 | Call results (`rpc.call_cache`) | clear triggers: 20,000 entries or estimated 32 MiB | cleared before the next insertion once a trigger is reached; one large entry can exceed 32 MiB |
@@ -66,11 +73,7 @@ How to trade memory for latency, knob by knob, and why the defaults are what the
 
 Fill times assume empty caches and 12 s blocks. Startup seeding and historical requests can fill some caches sooner; missed slots delay them. Other networks' slot durations change the time horizons.
 
-So memory rises for the first hour as the block caches and the window fill, then slowly until ~7 h (BAL addresses, and the transaction index with `--tx-index all`) and a little until ~27 h (headers). Ways to lower it:
-- **`--tx-index-blocks 0`:** no transaction lookups by hash except transactions sent through skim (an indexer that only reads logs and state needs none).
-- **`--window 32`:** recent-BAL writes and versions shrink with it. Short macOS soaks had ~100 MB medians, with frequent restarts; this is not a Linux or long-run RSS guarantee. Reads at older blocks and reorg depth shrink too.
-- **Fewer subscriptions, or a lower `max_subscribed_keys`.**
-- **Allocator:** on Linux skim uses mimalloc, which returns memory after a long catch-up (glibc kept 2.4x the live heap). Transparent huge pages are off for the process; `MIMALLOC_ALLOW_THP=1` turns them back on.
+So memory rises for the first hour as the block caches and the window fill, then slowly until ~7 h (BAL addresses, and the transaction index with `--tx-index all`) and a little until ~27 h (headers). To lower it (`--window`, `--tx-index-blocks`, subscriptions, allocator settings), see [memory and latency](memory-and-latency.md#choosing).
 
 ## CPU
 

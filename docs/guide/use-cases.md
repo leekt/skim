@@ -13,9 +13,9 @@ Find the row closest to what your app does, then read its section: what to confi
 | [Event history, indexed](#5-event-history-indexed) | `--history local` + `skim_streamNext` | logs from Glamsterdam on, reorg-safe, catch-up then the head |
 | [State at past blocks](#6-state-at-past-blocks) | `retention: { mode: archive }` + `--archive` | any block since you subscribed (or ~2 weeks back with backfill) |
 | [React to state changes](#7-react-to-state-changes) | `skim_streamNext` with `bal`, or WebSocket subscriptions | every change, per transaction, each block |
-| [Send transactions and track them](#8-send-transactions-and-track-them) | `eth_sendRawTransaction` | gossiped to peers; receipts for ~7 h of blocks |
+| [Send transactions and track them](#8-send-transactions-and-track-them) | `eth_sendRawTransaction` | gossiped to peers; your sent transactions tracked to inclusion and kept 24 h |
 | [Simulate and trace](#9-simulate-and-trace) | the state your transactions touch, subscribed | `eth_call` / `debug_traceCall` / `eth_estimateGas` in ms on warm state |
-| [Run on a small machine](#10-run-on-a-small-machine) | `--window 32`, few subscriptions | short macOS soaks measured ~100 MB median; long-run RSS can grow |
+| [Run on a small machine](#10-run-on-a-small-machine) | `--window 32`, few subscriptions | short macOS soaks measured ~100 MB median; long-run RSS grows until the caches fill |
 | [Not served (yet)](#what-skim-doesnt-serve) | another tool | history before the fork, mainnet until it forks, whole-chain analytics, the mempool |
 
 ## 1. Latest state of a few contracts
@@ -83,7 +83,7 @@ Read results from `skim_subscriptionStatus`, or get them pushed over WebSocket w
 ## 4. Arbitrary calls on any contract
 **Need:** reads you can't predict: whatever contract a user points at.
 
-**Set up:** nothing beyond the defaults (`on_demand.enabled: true`). Subscribe the few contracts most requests hit (popular tokens), so only the long tail is cold.
+**Set up:** nothing beyond the defaults (`on_demand.enabled: true`). Subscribe the few contracts most requests hit (popular tokens), so only the long tail is cold. If the app also looks up arbitrary transactions by hash (a wallet's activity view, an explorer's transaction page), add `--tx-index all`: by default only transactions that change a subscribed address are indexed (see [8](#8-send-transactions-and-track-them)).
 
 **Expect:**
 - **Warm:** the first read fetches over SNAP with proofs, and verified values are cached for `cache_ttl_blocks`, so repeats answer in milliseconds.
@@ -104,7 +104,7 @@ Read results from `skim_subscriptionStatus`, or get them pushed over WebSocket w
 
 **Expect:**
 - **Reach:** logs from Glamsterdam (Sepolia block 11,856,337) at most. Before it: `-32004`.
-- **Peers' retention:** receipts come from peers, so blocks older than what connected peers still serve are a `gap` unless skim already stored their matches.
+- **Peers' retention:** receipts come from peers, so blocks older than what connected peers still serve are a `gap` unless skim already stored their matches. Measured on Sepolia on 2026-10-19 (`skim probe-retention`): all 7 eth/71 peers served receipts for every sampled block back to the fork block (~12.7 days).
 - **Reorgs:** the stream rewinds; every response comes from one hash-linked range.
 - **Catch-up:** catches up in batches, then follows the head, waking on each new block.
 - **Disk:** grows with the matches you ask for, not with all logs. 140 MB for headers and smallname's matches on Sepolia.
@@ -160,11 +160,12 @@ skim run --config skim.yaml --archive data/my-app.redb --archive-backfill 1000
 - The chain id, signature, nonce and balance are checked against verified head state.
 - The transaction is gossiped to connected peers and re-broadcast every 12 s for up to 30 minutes.
 - `eth_getTransactionReceipt` returns `null` until inclusion, then a receipt verified against the block.
-- Transaction lookups by hash work for the last 2,048 blocks (~7 h).
+- Transactions sent through skim are always found by hash: pending, then included (kept 24 h, at most 4,096), then expired. A reorg that drops the block makes them pending again, and they are re-broadcast.
+- Other transactions are found by hash (`eth_getTransactionByHash`, `eth_getTransactionReceipt`, `debug_traceTransaction`) only if indexed: by default (`--tx-index pinned`) those whose state changes touch a subscribed address, which covers ones it sent (its nonce changes) and ETH it received; a transaction that only reads a subscribed contract isn't indexed. `--tx-index all` indexes every transaction. Either way the index covers the last `--tx-index-blocks` blocks (2,048, ~7 h); anything else returns `null`.
 
 **Examples:** a wallet's send flow, a relayer, a bot submitting transactions.
 
-**Limits:** no mempool view (skim doesn't follow pending transactions), and no lookup of transactions older than ~7 h by hash.
+**Limits:** no mempool view (skim doesn't follow pending transactions), and no lookup by hash of transactions older than the index window, except ones sent through skim (kept 24 h).
 
 ## 9. Simulate and trace
 **Need:** run a transaction before sending it: preview, gas estimate, access list, trace.
@@ -188,6 +189,7 @@ skim run --config skim.yaml --archive data/my-app.redb --archive-backfill 1000
 **Expect:**
 - ~100 MB RSS following the head (macOS soak median 99-105 MB).
 - 0.25-0.5 core, and ~0.3 MB/s in plus ~0.1 MB/s out of steady traffic.
+- Memory rises over the first hours as block caches fill, then levels off ([hardware](hardware.md#memory) has the long-run measurements; [memory and latency](memory-and-latency.md#choosing) the knobs).
 
 **Examples:** a personal RPC for your own wallet, a sidecar next to a bot, a small dashboard.
 
@@ -198,4 +200,4 @@ skim run --config skim.yaml --archive data/my-app.redb --archive-backfill 1000
 - **Pre-Glamsterdam networks:** skim needs BALs and Gloas payload envelopes. Sepolia is built in; other compatible networks use `--network <dir>`. There is no built-in `--network mainnet` shortcut.
 - **Whole-chain analytics:** skim keeps what you use, not the chain. Queries across every contract and every block need a full or archive node and a data warehouse.
 - **The mempool:** pending transactions aren't followed.
-- **Old transactions by hash:** only the last ~7 h of blocks are indexed in memory.
+- **Old transactions by hash:** the index covers the last 2,048 blocks (~7 h) by default, in memory; with the default `--tx-index pinned`, only transactions touching subscribed addresses.

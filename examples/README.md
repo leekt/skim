@@ -19,10 +19,13 @@ Run the commands below from `examples/`. Wait for the relevant `skim_subscriptio
 | [`bigname/`](bigname) | ENS for the [bigname](https://github.com/ensdomains/bigname) indexer: skim as its verified-lookup and hydration RPC, checked name by name against a reference node |
 | [`smallname/`](smallname) | bigname, but small: an ENS API with skim serving current state and a small SQLite index for discovery and history; with a test page |
 | [`send-transaction/`](send-transaction) | sign locally, `sendTransaction` → skim gossips it → `waitForTransactionReceipt` |
+| [`devnet-edgecases.mjs`](devnet-edgecases.mjs) | state edge cases (creation, selfdestruct, slot clearing, EIP-7702, reverts) against an executing node on a local devnet; see the [devnet README](../devnet/README.md#state-edge-cases) |
+
+smallname's own tests (no network) run with `npm run -s smallname-test`.
 
 ## Uniswap V3
 ```bash
-../target/release/skim run --config uniswap-v3/skim.yaml          # terminal 1 (wait for "state ready")
+../target/release/skim run --config uniswap-v3/skim.yaml          # terminal 1 (wait for the subscriptions to be ready)
 npm run v3                                                         # terminal 2
 ```
 ```text
@@ -59,9 +62,9 @@ quote 5 USDC -> 0.000109838320618968 ETH  (170.1 ms)
 V4 keeps every pool inside one `PoolManager`, so there's no pool address to subscribe. The config **subscribes the calls**: `StateView.getSlot0(poolId)` and a quote. skim learns which `PoolManager` slots they read (this pool's state, bitmap and ticks) and keeps only those current. The `5 USDC → ETH` quote goes the other direction, so it needed one fetch (170 ms) the first time; repeat it and it's local.
 
 ## WebSocket pushes
-skim serves WebSocket on the same address as HTTP:
+skim serves WebSocket on the same address as HTTP. With skim running the Uniswap V3 config (the subscription names below come from it):
 ```bash
-npm run ws
+npm run ws                                                         # SKIM_WS overrides ws://127.0.0.1:8545
 ```
 ```text
 block 11921517 ready
@@ -76,7 +79,7 @@ PRIVATE_KEY=0x… npm run send -- 0xRecipient 0.001
 ```
 1. viem signs locally. Nonce (`pending`), gas and fees come from skim.
 2. `eth_sendRawTransaction` is checked against verified state, then gossiped to skim's EL peers.
-3. `waitForTransactionReceipt` polls skim. The receipt comes from the including block's peers, checked against `receiptsRoot`.
+3. `waitForTransactionReceipt` polls skim. skim tracks transactions sent through it (pending, then included), so they are found whatever `--tx-index` is set to. The receipt comes from the including block's peers, checked against `receiptsRoot`.
 
 ```text
 from 0x6011…0491  balance 0.05 ETH

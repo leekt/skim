@@ -90,6 +90,8 @@ pub struct TxIndexConfig {
     pub blocks: usize,
 }
 
+/// The library default indexes every transaction (tests and embedders); `skim run` defaults to
+/// `--tx-index pinned` and always sets it.
 impl Default for TxIndexConfig {
     fn default() -> Self {
         Self { mode: TxIndexMode::All, blocks: 2048 }
