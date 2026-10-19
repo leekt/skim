@@ -2,7 +2,7 @@
 
 For an agent picking up work on **skim** (this repo). The sibling project **skim-hub** (a separate, private repo) has its own handoff. The two are developed separately: skim must stay standalone and trust-minimized, and the hub only ever reaches skim through crates and a versioned API (see [The skim-hub boundary](#the-skim-hub-boundary)).
 
-Status as of 2026-10-19, `main` at `ec5ced9` or later.
+Status as of 2026-10-19, `main` at `82131c4` or later.
 
 ## What skim is
 A minimal Ethereum node for apps: it follows the chain over p2p (EL and CL gossip), verifies each block against its BAL commitment and the light client, keeps only the state an app subscribes to (in memory, multi-version for `--window` blocks), fetches the rest from peers over SNAP with proofs, and serves JSON-RPC plus skim-specific methods (subscriptions, `skim_streamNext` block streams, archive).
@@ -44,33 +44,31 @@ Read first:
 - **Memory A/B:** `docs/experiments/tools/mem_ab.py` (several builds, same load, side by side).
 
 ## Where things stand
-**Just landed: any Glamsterdam network by config** (`ec5ced9`).
+**Any Glamsterdam network by config** (`ec5ced9` and after):
 - **The flag:** `--network <sepolia|dir>` reads a standard network-config directory: `config.yaml` with `PRESET_BASE`, `genesis.ssz` or `genesis_validators_root.txt`, `bootstrap_nodes.txt`, plus the EL `genesis.json` (with `amsterdamTime`) and optional `enodes.txt`.
-- **Presets:** `mainnet` and `minimal` (`skim_cl::network::Preset`). The light client uses `LcConfig`, so committee size and period length follow the preset.
-- **Fork digest:** computed (Fulu+: fork data root XOR the blob-parameter hash). A test checks that Sepolia's published config gives `0x669e6c11`, the digest Sepolia peers use.
-- **Process-wide network and chain id:** `skim_cl::network::current()` and `skim_sim::env::chain_id()`, set once at startup; Sepolia by default, which keeps tests unchanged.
-- **New flags:** `--el-bootnode`, `--cl-peer`, and `--hub` (refuses to start: skim-hub isn't supported yet).
-- **Unchanged:** the probe commands (`probe-*`, `follow`) are still Sepolia-only.
+- **Presets:** `mainnet` and `minimal` (`skim_cl::network::Preset`); the light client follows the preset (`LcConfig`). Minimal-preset light-client tests are in (`6fd23e3`).
+- **Fork digest:** computed (Fulu+: fork data root XOR the blob-parameter hash); Sepolia's matches the digest its peers use. It follows scheduled blob-parameter forks while running (`25c2d2e`).
+- **Discovery:** QUIC-only peers are discovered and dialed. QUIC is tried first when announced, TCP as the fallback (`82131c4`).
+- **Process-wide network and chain id:** `skim_cl::network::current()` and `skim_sim::env::chain_id()`, Sepolia by default.
+- **Flags:** `--el-bootnode`, `--cl-peer` (failures are logged), `--hub` (refuses to start).
 
-**Tried against a local Kurtosis devnet** (minimal preset, Gloas at epoch 4; config in the skim-hub repo, `devnet/network_params.yaml`):
-- The network config loads (chain id 3151908, minimal preset, 6 s slots).
-- EL sessions come up with geth and Nethermind.
-- **CL peers don't connect from the host:** Lodestar advertises QUIC only (UDP 9001), Kurtosis doesn't map that UDP port, and skim's direct TCP dials (`--cl-peer`) produced no connection and no error log. So skim never got past "following" to applied blocks there.
+**On the devnet** ([devnet/](../devnet), `devnet/run.sh`): verified end to end on the minimal preset, with peers from discovery alone. The light client verifies and rotates, blocks apply ~0.53 s after their slot, and answers match geth (`devnet/check.py`).
+
+**Memory:** three production hours are in [hardware](guide/hardware.md#memory). Whether RSS levels off is still open (TODO 6).
 
 ## Next tasks (in order)
-1. **Follow the devnet end to end.**
-   - Make CL connectivity work: most likely run skim as a container inside the Kurtosis network (the release workflow builds an image), or map the beacon nodes' TCP and QUIC ports and make sure the explicit dial path logs its failures.
-   - Done when skim applies devnet blocks, its light client bootstraps from the devnet's finalized root, and `eth_call` matches a devnet node.
-2. **Light-client tests for the minimal preset:** the testkit builds mainnet-size committees (512). Add a 32-member variant, and run the bootstrap/update tests under both presets.
-3. **BPO forks after start:** the fork digest is computed once at startup. A blob-parameter fork that activates while skim runs changes the digest, so topics must be resubscribed. Done when a test crosses a `BLOB_SCHEDULE` epoch.
-4. **Extract a `skim-chain` library** from `skim-cli`: chain following and the history store (`ChainData`, `HeaderStore`), with no behaviour change. skim-hub will depend on it.
-5. **Pending measurements:**
-   - **Long-run memory:** whether RSS levels off once every cache is full (the transaction index fills over ~7 h, headers over ~27 h). Watch `skim_memory_bytes{part}` against RSS in Grafana; update [hardware](guide/hardware.md) and [memory and latency](guide/memory-and-latency.md), which state it as open.
+1. **Extract a `skim-chain` library** from `skim-cli`: chain following and the history store (`ChainData`, `HeaderStore`), with no behaviour change. skim-hub will depend on it.
+2. **Open items in [`docs/TODO.md`](TODO.md):**
+   - 24: a live blob-parameter fork on a devnet;
+   - 25: TCP peers without yamux;
+   - 26: probes on any network;
+   - 6: memory past 7 h.
+3. **Pending measurements:**
    - **Huge pages on/off for speed:** a `skim bench-node` A/B on Linux.
    - **Catch-up speed** (blocks/s during a stream backfill) for the use-case guide.
    - **A soak with full correctness coverage,** once the reference provider stops rate-limiting.
-6. **Ideas discussed, not started:**
-   - per-client quotas on block streams, so one indexer's backfill can't starve others;
+4. **Ideas discussed, not started:**
+   - per-client quotas on block streams;
    - subscriptions registered per client over RPC, under one budget.
 
 Loose end: `memory_usage.md` (repo root, uncommitted) is a memory-investigation handoff to another agent. The owner decides whether it gets committed.

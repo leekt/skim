@@ -21,8 +21,16 @@ kurtosis enclave rm -f skim-devnet                # tear down
 - **The network config** comes from the enclave's `el_cl_genesis_data` artifact
   (`devnet/out/net`): exactly what `skim run --network <dir>` reads.
 
-Verified (2026-10-19, `ec5ced9`+), on the minimal preset:
-- the light client bootstraps from the devnet's finalized root and rotates sync committee periods;
-- blocks apply ~0.54 s after their slot;
-- balances and an `eth_call` (state fetched over SNAP from the devnet's nodes) match geth at the
-  same block hash.
+Verified (2026-10-19, `82131c4`), on the minimal preset, with peers found by discovery alone:
+- the light client bootstraps from the devnet's finalized root and follows sync committee periods;
+- blocks apply ~0.53 s after their slot;
+- `devnet/check.py`: balances, the deposit contract's code and an `eth_call` (state fetched over
+  SNAP from the devnet's nodes) match geth at the same block hash.
+
+Found along the way:
+- **The package's `bootstrap_nodes.txt` names an external bootnode**, so `run.sh` writes the local
+  beacon nodes' ENRs instead.
+- **Lodestar's devnet build answers `na` to yamux over TCP.** skim now dials QUIC first when a peer
+  announces it.
+- **Re-running the package into an existing enclave replaces the chain** (a new genesis), so
+  `run.sh` never does that.
