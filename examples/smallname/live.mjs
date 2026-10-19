@@ -100,6 +100,11 @@ function urError(r) {
   }
 }
 
+/** A failed call that isn't a revert: skim couldn't answer, so the value is unknown. A revert
+ *  (code 3) is a chain fact and may mean "none" (e.g. ownerOf of an expired lease); this never
+ *  does: reading it as absent would answer with a wrong owner, expiry or authority. */
+const unknown = (r) => r != null && !r.ok && r.code !== 3;
+
 const ENCODED = /^\[[0-9a-f]{64}\]$/;
 
 /** ENSIP-15 normalization, label by label; `[labelhash]` labels (unknown preimages) pass as is. */
@@ -126,10 +131,12 @@ async function v2Entry(rd, labels) {
         { to: registry, abi: VIEWS.v2Registry, functionName: "getResolver", args: [label] },
       ]);
       if (!state.ok) return { registry, unavailable: state.error };
+      if (unknown(resolver)) return { registry, unavailable: resolver.error };
       const s = state.value;
       let owner = null;
       if (s.status === 2) {
         const o = await rd.one({ to: registry, abi: VIEWS.v2Registry, functionName: "ownerOf", args: [s.tokenId] });
+        if (unknown(o)) return { registry, unavailable: o.error };
         owner = o.ok && o.value !== ZERO ? o.value : null;
       }
       return {
@@ -138,6 +145,7 @@ async function v2Entry(rd, labels) {
       };
     }
     const sub = await rd.one({ to: registry, abi: VIEWS.v2Registry, functionName: "getSubregistry", args: [label] });
+    if (unknown(sub)) return { registry, unavailable: sub.error };
     if (!sub.ok || sub.value === ZERO) return null;
     registry = sub.value;
   }
@@ -161,6 +169,7 @@ async function v1State(rd, node, labels) {
   }
   const [owner, resolver, exists, oldOwner, wrapped, leaseOwner, leaseExpires] = await rd.many(calls);
   for (const r of [owner, resolver, exists, wrapped]) if (!r.ok) return { unavailable: r.error };
+  for (const r of [oldOwner, leaseOwner, leaseExpires]) if (unknown(r)) return { unavailable: r.error };
   const w = wrapped.value;
   return {
     registryOwner: owner.value !== ZERO ? owner.value : null,
@@ -350,6 +359,7 @@ export async function registryEntry(rd, registry, labelHash) {
   let owner = null;
   if (st.status === 2) {
     const o = await rd.one({ to: registry, abi: VIEWS.v2Registry, functionName: "ownerOf", args: [st.tokenId] });
+    if (unknown(o)) return { unavailable: o.error };
     owner = o.ok && o.value !== ZERO ? o.value : null;
   }
   return { status: V2_STATUS[st.status] ?? String(st.status), expiry: st.expiry === MAX_U64 ? null : st.expiry, owner };

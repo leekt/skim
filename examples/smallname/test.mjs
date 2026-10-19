@@ -8,7 +8,8 @@ import { encodeEventTopics, encodeAbiParameters, keccak256, toHex, namehash, lab
 import { Store } from "./store.mjs";
 import { Ingest } from "./ingest.mjs";
 import { applyResponse } from "./sync.mjs";
-import { EVENTS, V1 } from "./contracts.mjs";
+import { EVENTS, V1, V2 } from "./contracts.mjs";
+import { nameState } from "./live.mjs";
 
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
@@ -147,6 +148,38 @@ test("index files with the old one-row-per-key inventory are migrated on open", 
   const store = new Store(path);
   assert.deepEqual(store.all("SELECT key, block FROM record_key_writes").map((r) => [r.key, r.block]), [["text:email", 90]]);
   assert.equal(store.get("SELECT count(*) c FROM sqlite_master WHERE name = 'record_keys'").c, 0);
+});
+
+/** A reader whose calls answer from `answers[functionName]` (a value, or a failure object). */
+function fakeReader(answers) {
+  const ZERO = "0x0000000000000000000000000000000000000000";
+  const defaults = {
+    getSubregistry: V2.ethRegistry, getState: { status: 0, expiry: 0n, tokenId: 0n }, getResolver: ZERO,
+    owner: ZERO, resolver: ZERO, recordExists: true, getData: [ZERO, 0n, 0n],
+    ownerOf: "0x00000000000000000000000000000000000000a1", nameExpires: 1_900_000_000n,
+  };
+  const answer = (c) => {
+    // The current registry's owner(node) holds the name; the old registry's doesn't.
+    if (c.functionName === "owner" && c.to === V1.registry) return { ok: true, value: "0x00000000000000000000000000000000000000a1" };
+    const a = c.functionName in answers ? answers[c.functionName] : defaults[c.functionName];
+    return a && typeof a === "object" && "fail" in a ? { ok: false, error: a.fail, code: a.code } : { ok: true, value: a };
+  };
+  return { head: { timestamp: "1800000000" }, many: async (cs) => cs.map(answer), one: async (c) => answer(c) };
+}
+
+test("a read skim couldn't answer is unavailable, never an absent value; a revert still is absent", async () => {
+  const name = "alice.eth";
+  const ok = await nameState(fakeReader({}), name);
+  assert.equal(ok.authority, "ens_v1");
+  assert.equal(ok.expires_at, "1900000000");
+  // getSubregistry unanswered: the ENSv2 walk can't conclude, so no ENSv1 fallback answer.
+  assert.ok((await nameState(fakeReader({ getSubregistry: { fail: "state unavailable", code: -32002 } }), name)).unavailable);
+  // nameExpires unanswered: not "no expiry".
+  assert.ok((await nameState(fakeReader({ nameExpires: { fail: "timeout", code: -32002 } }), name)).unavailable);
+  // ownerOf reverting (an expired lease) is a chain fact: answered, with no lease owner.
+  const reverted = await nameState(fakeReader({ ownerOf: { fail: "execution reverted", code: 3 } }), name);
+  assert.equal(reverted.unavailable, undefined);
+  assert.equal(reverted.v1.leaseOwner, null);
 });
 
 let failed = 0;

@@ -1919,7 +1919,7 @@ mod tests {
         let sent_hash = keccak256(sent.encoded_2718());
         let now = Instant::now();
         cd.inner.write().sent.insert(sent_hash, Sent { tx: sent.clone(), from: to, first: now, last: now });
-        let (hash20, h) = note_txs(&cd, 20, &[sent.clone()], vec![]);
+        let (hash20, h) = note_txs(&cd, 20, std::slice::from_ref(&sent), vec![]);
         assert_eq!(h[0], sent_hash);
         assert!(cd.inner.read().sent.is_empty(), "included: no longer pending (no rebroadcast, not in the pending nonce)");
         // The index window and the header window both drop block 20.
