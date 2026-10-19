@@ -679,7 +679,7 @@ impl Rpc {
                 let hash: B256 = need(params, 0)?;
                 let opts: alloy_rpc_types_trace::geth::GethDebugTracingOptions = param(params, 1)?.unwrap_or_default();
                 let chain = self.chain()?;
-                let (n, bh, _, i) = chain.locate_tx(&hash).ok_or_else(|| RpcError::unavailable("transaction not found in recent blocks"))?;
+                let (n, bh, _, i) = chain.locate_tx(&hash).await?.ok_or_else(|| RpcError::unavailable("transaction not found in recent blocks"))?;
                 Ok(self.replay(n, bh, Some(i as usize), opts).await?.into_iter().next().map(|(_, t)| t).unwrap_or(Value::Null))
             }
             "debug_traceBlockByNumber" | "debug_traceBlockByHash" => {

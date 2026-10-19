@@ -33,7 +33,17 @@ The measured Linux deployment uses two aarch64 cores. These are sizing recommend
 
 - **Plateaued within about an hour:** block caches (receipts ~10-11 MB, bodies ~8 MB, envelopes served ~7 MB, raw BALs ~3 MB), recent-BAL writes (~16-18 MB), EL peers (~38).
 - **Still growing, as designed:** the transaction index, transaction hashes and BAL addresses, ~1.5 MB per 15 minutes together until 2,048 blocks (~7 h; about 19 MB more), and headers until ~27 h (a few MB).
-- **Not yet explained:** the gap between RSS and the counted structures (allocator overhead, code pages, network buffers, anything uncounted) grew from ~200 MB to ~210 MB over the last 75 minutes. Slow, but not flat: whether memory levels off is settled only by a run longer than the slowest cache's fill time (7 h; then 27 h).
+- **Not yet explained after three hours:** the gap between RSS and the counted structures grew from ~200 MB to ~210 MB over the last 75 minutes.
+
+**Over nine hours** (same deployment, build `4b99013`, which indexed every transaction), RSS in MB:
+
+| Hours | 0 | 3 | 6 | 7 | 8 | 9 |
+|---|---|---|---|---|---|---|
+| RSS | 147 | 281 | 335 | 343 | 344 | 346 |
+
+- **It levels off with the caches.** The counted structures reached ~91 MB by ~6-7 h and stopped growing; RSS went flat with them (+3 MB over the last two hours). Over the run RSS grew about 2.3 MB per MB of counted payload: the counters count keys and values, not hash-table slots, spare capacity or allocator rounding, so the "uncounted" part grows with the caches rather than on its own.
+- **Where it is:** 305 of 339 MB was mimalloc's heap (skim's own allocations), 22 MB the binary, nothing else of note.
+- **The largest growing group was the transaction index** (index, per-block hash lists and BAL addresses: ~36 MB of payload). From the next build, transactions are indexed only if they change a pinned address (`--tx-index pinned`, the default), the index stores 8-byte hash prefixes, and per-block hash lists are no longer kept. Headers still fill until ~27 h (a few MB).
 
 ### What holds memory
 
@@ -47,7 +57,8 @@ How to trade memory for latency, knob by knob, and why the defaults are what the
 | Envelopes and raw BALs kept to serve peers (`cl.envelopes_served`, `chain.bals_raw`) | 64 blocks each | ~13 min |
 | Bodies, receipts, withdrawals (`chain.bodies`, `chain.receipts`, `chain.withdrawals`) | 128 blocks each | ~26 min |
 | Recent-BAL writes (`state.recent_bal_writes`) | `--window` blocks (256) | ~51 min; ~19.5 MB when full |
-| Transaction hashes and index, BAL addresses (`chain.tx_hashes`, `chain.tx_index`, `chain.touched`) | 2,048 blocks | ~7 h |
+| Transaction index (`chain.tx_index`, `chain.tx_blocks`): pinned transactions only by default | `--tx-index-blocks` (2,048) | ~7 h; small unless `--tx-index all` |
+| BAL addresses per block, an `eth_getLogs` pre-filter (`chain.touched`) | 2,048 blocks | ~7 h |
 | Headers (`chain.headers`) | 8,192 blocks | ~27 h |
 | Call results (`rpc.call_cache`) | clear triggers: 20,000 entries or estimated 32 MiB | cleared before the next insertion once a trigger is reached; one large entry can exceed 32 MiB |
 | EL peers (`el.peers`) | 40 outbound + 15 inbound | minutes |
@@ -55,7 +66,8 @@ How to trade memory for latency, knob by knob, and why the defaults are what the
 
 Fill times assume empty caches and 12 s blocks. Startup seeding and historical requests can fill some caches sooner; missed slots delay them. Other networks' slot durations change the time horizons.
 
-So memory rises for the first hour as the block caches and the window fill, then slowly for many hours (transaction index, headers). Ways to lower it:
+So memory rises for the first hour as the block caches and the window fill, then slowly until ~7 h (BAL addresses, and the transaction index with `--tx-index all`) and a little until ~27 h (headers). Ways to lower it:
+- **`--tx-index-blocks 0`:** no transaction lookups by hash except transactions sent through skim (an indexer that only reads logs and state needs none).
 - **`--window 32`:** recent-BAL writes and versions shrink with it. Short macOS soaks had ~100 MB medians, with frequent restarts; this is not a Linux or long-run RSS guarantee. Reads at older blocks and reorg depth shrink too.
 - **Fewer subscriptions, or a lower `max_subscribed_keys`.**
 - **Allocator:** on Linux skim uses mimalloc, which returns memory after a long catch-up (glibc kept 2.4x the live heap). Transparent huge pages are off for the process; `MIMALLOC_ALLOW_THP=1` turns them back on.

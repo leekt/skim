@@ -601,6 +601,18 @@ impl Store {
         *e = (*e).max(until);
     }
 
+    /// Addresses with any subscribed key (an account field, a slot, or whole storage): what the
+    /// dashboard calls pinned.
+    pub fn pinned_addresses(&self) -> HashSet<Address> {
+        let st = self.inner.read();
+        let mut out = st.watched_addresses.clone();
+        out.extend(st.complete.keys().copied());
+        out.extend(st.watched_keys.iter().map(|k| match k {
+            StateKey::Balance(a) | StateKey::Nonce(a) | StateKey::CodeHash(a) | StateKey::Storage(a, _) => *a,
+        }));
+        out
+    }
+
     pub fn is_subscribed(&self, k: &StateKey) -> bool {
         let st = self.inner.read();
         st.watched_keys.contains(k) || st.tracked_by_address(k)

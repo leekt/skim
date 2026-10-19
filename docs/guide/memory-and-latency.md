@@ -34,10 +34,10 @@ So the trade is almost always: memory spent keeping something, against network r
 |---|---|---|
 | **Call result cache** (on by default; `--no-call-cache` turns it off; clear triggers: 20,000 entries or estimated 32 MiB) | an identical `eth_call` at the same block answers without executing | every call executes (still from memory if its state is warm; CPU, not network) |
 | **Block caches** (bodies, receipts, withdrawals: 128 blocks; decoded BALs: 32; raw BALs and envelopes kept to serve peers: 64) | `eth_getLogs`, receipts, transaction replay and log scans over recent blocks need no fetch; peers syncing from skim get answers | requests for older blocks fetch from peers (verified against the header) |
-| **Transaction index** (2,048 blocks, ~7 h) | `eth_getTransactionByHash` / `eth_getTransactionReceipt` find transactions from the last ~7 hours | older transactions aren't found (skim keeps no on-disk transaction index) |
+| **Transaction index** (`--tx-index pinned`, `--tx-index-blocks 2048`) | `--tx-index all`: `eth_getTransactionByHash` / `eth_getTransactionReceipt` find any transaction from the last ~7 hours | by default only transactions changing a pinned address (and ones sent through skim) are found; a shorter window loses older ones. Entries are 8-byte hash prefixes, confirmed against the transaction on lookup |
 | **`--history local`** | linked post-fork headers and fetched matching logs on disk, so covered queries can outlive peer receipt retention | disk (140 MB measured) plus a 16 MiB database page-cache budget; unfetched coverage still needs peers |
 
-The block-cache and index sizes are compile-time constants today; `skim_status.memory` shows what they hold.
+The block-cache sizes are compile-time constants today (the transaction index has its flags); `skim_status.memory` shows what they hold.
 
 The call cache checks its triggers before insertion. A single large result can push estimated bytes over 32 MiB; the next insertion clears it. Cached values include the result/revert and a list of read addresses, not a list of every storage key. Restarts clear this cache, so aggregate call counts across a soak are not simultaneous cache occupancy.
 
@@ -76,7 +76,8 @@ Each default below records what was chosen, the evidence, and what was turned do
 | **Call result cache** | 20,000 entries or estimated 32 MiB trigger a clear before the next insertion; a single result can overshoot | entries are keyed by block hash; the count alone didn't bound variable-size results | no cache: repeat calls re-execute; an entry-count-only bound |
 | **EL peer limits** | 40 outbound + 15 inbound | skim reached 30-42 sessions; reth's larger defaults (100 + 30) permit more session buffers and peer state | reth's defaults; a tighter cap risks fewer SNAP peers, which is what slow restarts waited for |
 | **Fetch order** | completion order (each account's code requested as soon as the account arrives) | no measurable latency difference from the older wave order on 40 cold calls (peer variance dominated, 6-53 s); about 15% more code requests | the wave order; batching codes that arrive close together, if code requests start to matter |
-| **Block caches and transaction index** | 128 / 64 / 32 blocks; transaction index 2,048 | not tuned yet: the per-structure counters now measure what each costs | shortening the transaction index, which would make older transaction lookups fail |
+| **Block caches** | 128 / 64 / 32 blocks | not tuned yet: the per-structure counters now measure what each costs | shorter caches, which would make more recent-block requests fetch from peers |
+| **Transaction index** | pinned transactions only, 2,048 blocks | at 9 h, indexing every transaction held ~21 MB of payload (hash index plus per-block hash lists), about 40-50 MB of RSS with allocator overhead, mostly for transactions no app asked about | `all` (explorers and wallet backends) |
 | **Peer history and dashboard tables** | bounded: 4,096 peer records, 1,024 dial cooldowns, 65,536 seen nodes, unknown RPC methods counted as `other` | each grew with every peer seen or every distinct method name (review findings) | unbounded |
 
-What isn't settled: whether memory levels off over long runs. Over three hours of production, the block caches and the window levelled off within an hour and the counted structures grew only as designed (the transaction index until ~7 h), but the uncounted part of RSS still rose ~10 MB in the last 75 minutes ([hardware](hardware.md#memory)). A run past 7 hours (then 27) settles it.
+Long runs: memory levels off once the ~7 h caches are full ([hardware](hardware.md#memory): 346 MB at 9 h with every transaction indexed, +3 MB over the last two hours). Headers keep filling slowly until ~27 h.

@@ -75,6 +75,16 @@ pub struct Args {
     /// either way.
     #[arg(long, value_enum, default_value_t = HistoryMode::Off)]
     history: HistoryMode,
+    /// Which transactions `eth_getTransactionByHash`, `eth_getTransactionReceipt` and
+    /// `debug_traceTransaction` can find by hash. `pinned`: only those touching a pinned
+    /// address (the `to`, or a state change in the BAL, which covers the sender), so nothing
+    /// is kept about unrelated transactions. `all`: every transaction (a wallet backend or
+    /// explorer looking up arbitrary hashes). Transactions sent through skim are always found.
+    #[arg(long, value_enum, default_value_t = TxIndexArg::Pinned)]
+    tx_index: TxIndexArg,
+    /// Recent blocks the transaction index covers (2048 is about 7 h of 12 s blocks; 0 = none).
+    #[arg(long, default_value_t = 2048)]
+    tx_index_blocks: usize,
     /// Consensus-layer gossip mesh degree (more = more eager-push paths for new payloads).
     #[arg(long, default_value_t = 8)]
     cl_mesh: usize,
@@ -129,6 +139,12 @@ pub struct Args {
     /// Disable the learned-set pattern tier (A/B measurements).
     #[arg(long)]
     no_learned_patterns: bool,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum TxIndexArg {
+    Pinned,
+    All,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -374,6 +390,16 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let light = crate::light::Light::new(cl.clone(), persist.clone());
     light.start(args.checkpoint, checkpoint_url);
     let chaindata = crate::chaindata::ChainData::new(net.clone(), args.max_logs_range, skim_sim::env::chain_id());
+    {
+        use crate::chaindata::{TxIndexConfig, TxIndexMode};
+        let mode = match args.tx_index {
+            TxIndexArg::Pinned => TxIndexMode::Pinned,
+            TxIndexArg::All => TxIndexMode::All,
+        };
+        let pinned_store = store.clone();
+        let pinned: crate::chaindata::PinnedFn = Arc::new(move || pinned_store.pinned_addresses().into_iter().collect());
+        chaindata.set_tx_index(TxIndexConfig { mode, blocks: args.tx_index_blocks }, Some(pinned));
+    }
     if args.history == HistoryMode::Local {
         anyhow::ensure!(!args.ephemeral, "--history local needs a data dir (not --ephemeral)");
         let dir = args.data_dir.clone().unwrap_or_else(|| default_dir.clone());

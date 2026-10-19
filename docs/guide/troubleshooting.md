@@ -38,7 +38,7 @@ Inspect `skim_status.light_client`: `trusted_from`, `period`, `verified_block`, 
 
 ### Memory rises after startup
 
-Compare RSS with `skim_status.memory.parts` or the Grafana retained-data panel. Block caches and the state window fill within about an hour on Sepolia; transaction indexes can fill for ~7 hours and headers for ~27. Counts, estimated payload bytes and reported capacities have different meanings, and peer buffer sizes/allocator slack are not fully counted. The [three-hour measurements](hardware.md#memory) still leave unexplained RSS growth. A rising RSS alone cannot identify a leak; note the process uptime and cache occupancy when reporting it.
+Compare RSS with `skim_status.memory.parts` or the Grafana retained-data panel. Block caches and the state window fill within about an hour on Sepolia; transaction indexes can fill for ~7 hours and headers for ~27. Counts, estimated payload bytes and reported capacities have different meanings, and peer buffer sizes/allocator slack are not fully counted. In [nine hours of production](hardware.md#memory) RSS levelled off once those caches were full. A rising RSS alone cannot identify a leak; note the process uptime and cache occupancy when reporting it.
 
 ### Every cold call takes seconds
 Fetches go through whichever peers are connected. With 1–2 peers, a wide fetch (hundreds of keys, e.g. a very large swap's tick range) queues on them. Remedies, in order:
