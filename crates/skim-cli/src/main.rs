@@ -70,6 +70,16 @@ enum Cmd {
     ProbeCl(probe_cl::Args),
 }
 
+/// `skim` alone, or with only `skim run`'s flags, runs the node: a zero-config start on the
+/// default network. `--help` and `--version` still describe the whole CLI.
+fn with_default_subcommand(mut argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let first = argv.get(1).and_then(|a| a.to_str()).map(str::to_owned);
+    if first.as_deref().is_none_or(|a| a.starts_with('-') && !matches!(a, "-h" | "--help" | "-V" | "--version")) {
+        argv.insert(1, "run".into());
+    }
+    argv
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // No transparent huge pages for skim: mimalloc asks for them, and a 2 MiB page that is only
@@ -87,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "info,reth_network=warn,discv5=warn,libp2p_gossipsub=warn".into()),
         )
         .init();
-    match Cli::parse().cmd {
+    match Cli::parse_from(with_default_subcommand(std::env::args_os().collect())).cmd {
         Cmd::ProbeEl(args) => probe_el::run(args).await,
         Cmd::ProbeClReq(args) => probe_clreq::run(args).await,
         Cmd::ProbeServe(args) => probe_serve::run(args).await,
@@ -99,5 +109,23 @@ async fn main() -> anyhow::Result<()> {
         Cmd::BenchNode(args) => bench_node::run(args).await,
         Cmd::ProbeWave(args) => probe_call::run_wave(args).await,
         Cmd::ProbeCl(args) => probe_cl::run(args).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        with_default_subcommand(a.iter().map(Into::into).collect()).into_iter().map(|s| s.into_string().unwrap()).collect()
+    }
+
+    #[test]
+    fn skim_alone_or_with_only_flags_runs_the_node() {
+        assert_eq!(args(&["skim"]), ["skim", "run"]);
+        assert_eq!(args(&["skim", "--rpc", "127.0.0.1:9"]), ["skim", "run", "--rpc", "127.0.0.1:9"]);
+        assert_eq!(args(&["skim", "probe-el"]), ["skim", "probe-el"]);
+        assert_eq!(args(&["skim", "--help"]), ["skim", "--help"]);
+        assert!(Cli::try_parse_from(args(&["skim"])).is_ok());
     }
 }

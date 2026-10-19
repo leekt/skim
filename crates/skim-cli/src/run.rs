@@ -25,6 +25,11 @@ pub struct Args {
     /// JSON-RPC listen address.
     #[arg(long, default_value = "127.0.0.1:8545")]
     rpc: SocketAddr,
+    /// `Access-Control-Allow-Origin` for browser dapps calling skim directly: an origin
+    /// (`https://app.example`), `*` (any page in this machine's browser may call it), or `none`.
+    /// skim holds no keys, and listens on localhost by default.
+    #[arg(long, default_value = "*")]
+    cors: String,
     /// The network: `sepolia` (built in), or a network-config directory, as consensus clients
     /// use (and ethereum-package / eth-clients publish): `config.yaml` (with its PRESET_BASE),
     /// `genesis.ssz` or `genesis_validators_root.txt`, `bootstrap_nodes.txt`, plus the execution
@@ -373,6 +378,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     store.set_max_subscribed(cfg.state.limits.max_subscribed_keys.0);
     store.set_max_on_demand(cfg.state.limits.max_on_demand_keys.0);
     tracing::info!(subscriptions = subs.status().len(), declared_keys = subs.total_keys(), "state subscriptions loaded");
+    if subs.status().is_empty() {
+        tracing::info!("no subscriptions: every state read is fetched on demand (verified) and kept current while it's used; pin hot addresses in a --config file for the lowest latency");
+    }
     let mut ncfg = NodeConfig::from_network(&cl_net, args.cl_port);
     ncfg.explicit_peers.extend(args.cl_peer.iter().cloned());
     ncfg.mesh_n = args.cl_mesh;
@@ -425,7 +433,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         cl_stats: Some(cl.stats.clone()),
         dash: dash.clone(),
     });
-    tokio::spawn(serve(rpc.clone(), args.rpc));
+    tokio::spawn(serve(rpc.clone(), args.rpc, (args.cors != "none").then(|| args.cors.clone())));
     if let (Some(addr), Some(handle)) = (args.metrics, metrics_handle) {
         let top = args.metrics_addresses;
         tokio::spawn(async move {

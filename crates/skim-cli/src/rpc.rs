@@ -439,6 +439,8 @@ impl Rpc {
             "eth_chainId" => Ok(hex_u64(skim_sim::env::chain_id())),
             "net_version" => Ok(json!(skim_sim::env::chain_id().to_string())),
             "net_listening" => Ok(json!(true)),
+            // skim holds no keys: wallets and libraries that ask get an empty list, not an error.
+            "eth_accounts" | "eth_requestAccounts" => Ok(json!([])),
             "eth_syncing" => Ok(json!(latest.is_none())),
             "eth_blockNumber" => Ok(hex_u64(self.resolve_block(None, latest)?.number)),
             "eth_getBlockByNumber" | "eth_getBlockByHash" => {
@@ -1119,11 +1121,28 @@ async fn handle(State(rpc): State<Arc<Rpc>>, Json(body): Json<Value>) -> Json<Va
     }
 }
 
-pub async fn serve(rpc: Arc<Rpc>, addr: std::net::SocketAddr) -> anyhow::Result<()> {
-    // HTTP POST and WebSocket on the same address.
-    let app = Router::new()
-        .route("/", post(handle).get(ws_upgrade))
+/// `cors`: the `Access-Control-Allow-Origin` to send (browser dapps calling skim directly), or
+/// `None` to send none.
+pub async fn serve(rpc: Arc<Rpc>, addr: std::net::SocketAddr, cors: Option<String>) -> anyhow::Result<()> {
+    use axum::http::{HeaderValue, header};
+    // HTTP POST and WebSocket on the same address; OPTIONS answers CORS preflights.
+    let mut app = Router::new()
+        .route("/", post(handle).get(ws_upgrade).options(|| async { axum::http::StatusCode::NO_CONTENT }))
         .with_state(rpc);
+    if let Some(origin) = cors {
+        let origin = HeaderValue::from_str(&origin)?;
+        app = app.layer(axum::middleware::map_response(move |mut r: axum::response::Response| {
+            let origin = origin.clone();
+            async move {
+                let h = r.headers_mut();
+                h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+                h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("POST, GET, OPTIONS"));
+                h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("content-type"));
+                h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+                r
+            }
+        }));
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "JSON-RPC listening (HTTP and WebSocket)");
     axum::serve(listener, app).await?;
