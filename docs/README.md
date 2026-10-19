@@ -67,8 +67,10 @@ Scripts used by these runs, in [`experiments/tools`](experiments/tools) (run wit
 |---|---|
 | [`archive_check.py`](experiments/tools/archive_check.py) | historical reads from the selective archive vs a reference archive node (M4) |
 | [`chaindata_check.py`](experiments/tools/chaindata_check.py) | transactions, receipts and logs vs a reference node |
+| [`cold_read_bench.py`](experiments/tools/cold_read_bench.py) | cold reads of never-read keys, warm repeats and a contract call against a running skim, with failures by `error.data.reason` |
 | [`chaos_soak.py`](experiments/tools/chaos_soak.py) | long correctness soak under restarts and key-set churn, compared at the same block hash |
 | [`cl_vs_lighthouse.py`](experiments/tools/cl_vs_lighthouse.py) | `probe-cl` per-slot arrival vs Lighthouse log arrival |
+| [`hedge_ab.py`](experiments/tools/hedge_ab.py) | adaptive vs fixed SNAP hedging on one node, interleaved per read (needs `--debug-rpc`) |
 | [`latency_bench.py`](experiments/tools/latency_bench.py) | warm-path latency and concurrent throughput of an endpoint |
 | [`learned_ab.py`](experiments/tools/learned_ab.py) | A/B of the same random Uniswap V3 quotes against two skim instances |
 | [`mem_ab.py`](experiments/tools/mem_ab.py) | memory A/B: several builds side by side under the same load |
