@@ -53,9 +53,11 @@ ENCLAVE=skim-bpo PARAMS=network_params.bpo.yaml SKIM_RPC_PORT=8601 \
 python3 -I devnet/check.py <EL rpc port> 8601 skim-bpo
 ```
 
-The digest/topic overlap is unit-tested, but a verified live crossing remains
-[TODO 24](../docs/TODO.md). The RPC comparison checks state at one block; also inspect light-client
-status and continuous head/peer progression across the fork before declaring that task complete.
+A live crossing was verified on 2026-10-19 (`162eb48`): all CL peers kept through the fork and after
+the old topics were left, head advancing, `check.py` all matching ([M7 log](../docs/experiments/m7-gates-and-acquisition.md)).
+New EL sessions after the fork need `a1ac222` or later (the fork id; see [state edge cases](#state-edge-cases)).
+The RPC comparison checks state at one block; for a crossing, also watch light-client status and
+head/peer progression.
 
 ## State edge cases
 `examples/devnet-edgecases.mjs` compares skim (applying BALs) with an executing node, key by key, at the same block hash, over the cases Nethermind's BAL catch-up tests ([PR 14157](https://github.com/NethermindEth/nethermind/pull/14157)): account creation, a touched missing account, create + selfdestruct in one transaction, slot clearing, EIP-7702 delegation set and cleared (with storage written through the delegation), and a reverted call with value. skim tracks every key before the transactions land, so its values come from BALs, not from a fetch afterwards.

@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="#quick-start"><img alt="status" src="https://img.shields.io/badge/status-experimental-7C5CFF"></a>
-  <a href="#"><img alt="network" src="https://img.shields.io/badge/network-Sepolia%20·%20Glamsterdam-3FA8FF"></a>
+  <a href="docs/guide/configuration.md#networks"><img alt="network" src="https://img.shields.io/badge/network-Glamsterdam-3FA8FF"></a>
   <a href="rust-toolchain.toml"><img alt="rust" src="https://img.shields.io/badge/rust-1.97-2EE6C5"></a>
   <a href="#license"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-9AA7C7"></a>
 </p>
@@ -22,7 +22,9 @@
 
 **skim** is an application-specific Ethereum state client. You declare the state your app cares about: accounts, storage slots, or whole simulations. skim keeps exactly that state current, straight from the Ethereum P2P network, and runs your `eth_call`s locally against it in milliseconds. Anything else is fetched on demand, with Merkle proofs verified, only when a request needs it.
 
-You don't need to run a full node or use an external Ethereum RPC provider. The state follows the chain without block re-execution, through Glamsterdam's [block-level access lists](https://eips.ethereum.org/EIPS/eip-7928) (BALs).
+skim never holds Ethereum's full state. It holds your app's working set and keeps it current block by block from Glamsterdam's [block-level access lists](https://eips.ethereum.org/EIPS/eip-7928) (BALs): the values each block wrote, committed in its header. Anything else is fetched when a request needs it, with Merkle proofs. No full node, no RPC provider.
+
+`skim run` defaults to Sepolia and also follows custom Glamsterdam networks with `--network <dir>`, using the `mainnet` or `minimal` consensus preset. See [network configuration](docs/guide/configuration.md#networks) and the verified [devnet example](devnet/README.md). The bundled app examples use Sepolia contracts.
 
 ```console
 $ skim run --config skim.yaml          # follows Sepolia, serves JSON-RPC on :8545
@@ -35,6 +37,8 @@ $ cast call 0xfFf9…6B14 "balanceOf(address)(uint256)" 0x3289…EfF1 --rpc-url 
 ## Why this is possible now
 
 Until Glamsterdam, knowing the latest state meant executing every block, or asking a node that did. [EIP-7928](https://eips.ethereum.org/EIPS/eip-7928) changes that. Every block now commits to a **block access list**: every account and slot it touched, with the **post-values** it wrote. With ePBS, that list travels in the execution payload gossiped on the consensus layer.
+
+Applying a block's BAL updates state without re-executing the block. skim applies it only to the keys it holds, so its cost follows your app's state, not the chain's.
 
 skim builds on that:
 
@@ -105,15 +109,15 @@ All numbers are from Sepolia, measured from one home connection over public peer
 | **Warm simulation** | Uniswap V3 quote over JSON-RPC: **0.25 ms** P50, 0.56 ms P99; ~8,500 calls/s at 50 in flight |
 | **Fetch reliability** | 298,084 SNAP jobs over public peers, **0 failed**, 126 disconnects absorbed ([soak](docs/experiments/m0-soak.md)) |
 | **Unseen inputs** | Background prefetch had **99.9%** of predicted keys ready at call time. Worst on-path fetch: 1.6 s ([P1](docs/experiments/m2-p0-miss-tail.md)). |
-| **Footprint** | ~180 MB RSS following the head on Linux with the default 256-block window (~100 MB with `--window 32`), 0.25-0.5 CPU core. On disk: a restart snapshot of subscribed state (~1 MB for 2,400 keys; `--ephemeral` for none). See [hardware requirements](docs/guide/hardware.md) |
+| **Footprint** | Linux with `--history local` and an indexer: 179 MB RSS at 26 min in one run; a three-hour run reached 276 MB. Short macOS soaks with `--window 32`: 99–105 MB median. Typical measured CPU: 0.25–0.5 core. Restart data is saved by default; optional history and archives add disk use. See [hardware requirements](docs/guide/hardware.md) for conditions and remaining memory questions. |
 
-What skim is **not**: faster than an in-process full node on raw execution, or a trustless light client (yet). It saves *resources* while keeping simulation quality close to a node's. Part of the saving is work that public SNAP peers do on skim's behalf.
+Warm execution and cold-fetch latency depend on the workload. skim saves resources by keeping a working set and asking SNAP peers for missing state. Its consensus light client authenticates `safe` / `finalized`; default `latest` remains optimistic, and `--require-verified` opts into signed heads. See the [trust model](#trust-model).
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  subgraph P2P["Ethereum P2P (Sepolia)"]
+  subgraph P2P["Ethereum P2P (configured Glamsterdam network)"]
     CL["CL gossip<br/>execution_payload + BAL"]
     EL["EL peers<br/>eth/71 BALs · snap/1 · snap/2"]
   end
@@ -133,11 +137,12 @@ flowchart LR
 | Crate | Role |
 |---|---|
 | `skim-bal` | EIP-7928 decoding, commitment checks, per-key normalization |
-| `skim-cl` | Minimal Gloas gossip listener: discv5, libp2p, envelope parsing, payload verification |
+| `skim-cl` | Gloas gossip and req/resp over discv5/libp2p (QUIC and TCP), network presets, payload verification and consensus light-client primitives |
 | `skim-el` | EL networking on reth: eth/71 BALs, snap/2 and a snap/1 client, head following |
 | `skim-snap` | Adaptive request scheduler and SNAP Merkle-proof verification |
 | `skim-state` | Per-key MVCC store (BAL application, base inserts with replay, reorg rollback, retention) and the selective on-disk archive |
 | `skim-sim` | revm over snapshots, state access predictor, subscriptions |
+| `skim-chain` | Verified headers, bodies, receipts, BALs, transaction lookup/sending, log scans and the post-fork history store |
 | `skim-cli` | `skim run` (JSON-RPC), `skim follow`, probes and benchmarks |
 
 ## Quick start
@@ -177,6 +182,7 @@ The dashboard shows:
 - block arrival and RPC latency per method
 - which addresses your calls read, and which of them aren't pinned by a subscription
 - what skim serves to other peers, and process CPU and memory
+- estimated retained payloads, entries and capacities by structure, compared with RSS
 
 <img src="assets/grafana-dashboard.png" alt="skim Grafana dashboard" width="100%">
 
@@ -200,6 +206,8 @@ The [documentation index](docs/README.md) lists the guides and experiment logs. 
 
 [Runnable examples](examples/README.md): Uniswap V3 and V4, WebSocket subscriptions, sending transactions, and ENS resolution with [bigname](examples/bigname) and [smallname](examples/smallname). For monitoring, see the [Prometheus and Grafana setup](metrics/README.md).
 
+For network development, see the [local devnet walkthrough](devnet/README.md). [PROJECT.md](PROJECT.md) describes the implemented architecture; [the contributor handoff](docs/HANDOFF.md) records current work and library boundaries.
+
 ## JSON-RPC
 
 **Supported methods:**
@@ -207,11 +215,11 @@ The [documentation index](docs/README.md) lists the guides and experiment logs. 
 - Transactions: `eth_sendRawTransaction` (gossiped straight to EL peers), `eth_getTransactionByHash`, `eth_getTransactionReceipt`
 - Logs: `eth_getLogs`. Receipts are fetched only for blocks whose bloom and BAL match, and checked against `receiptsRoot`.
 - Blocks and chain: `eth_getBlockByNumber` / `eth_getBlockByHash` (full transactions), `eth_getBlockReceipts`, `eth_feeHistory`, `eth_blockNumber`, `eth_chainId`, `net_version`, `eth_syncing`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `web3_clientVersion`
-- `skim_subscriptionStatus`, `skim_status`, `skim_dashboard`
+- `skim_subscriptionStatus`, `skim_status` (including per-structure memory estimates), `skim_dashboard`, `skim_archiveCoverage`, `skim_streamNext` (stateless block streams with log/BAL changes, reorg rewinds and gaps)
 - WebSocket on the same port: `eth_subscribe` for `newHeads`, `logs` and `skim_subscriptions`
 
 **Errors:**
-- Out-of-scope methods (`eth_sendTransaction`, since skim holds no keys, and filters and subscriptions) return `-32004`.
+- Out-of-scope methods (`eth_sendTransaction`, since skim holds no keys, and the explicitly unsupported HTTP filter/subscription methods) return `-32004`. WebSocket subscriptions are supported; unknown methods return `-32601`.
 - State or blocks skim can't serve return `-32002`. skim never returns a fabricated value.
 
 ## Correctness rules skim lives by
@@ -223,13 +231,15 @@ The [documentation index](docs/README.md) lists the guides and experiment logs. 
 
 ## Trust model
 
-| Checked | Not (yet) checked |
+| Check | Scope |
 |---|---|
-| BAL ↔ block hash (header rebuilt from the payload), block hash ↔ builder bid | Proof-of-stake fork choice and finality, BLS signatures |
-| Every SNAP value ↔ the block's state root (Merkle proofs) | Execution correctness of the block itself |
-| Header parent links, code hashes | |
+| BAL ↔ block hash (header rebuilt from the payload), block hash ↔ builder bid | Every accepted payload |
+| Every SNAP value ↔ the block's state root (Merkle proofs); code, body and receipt commitments | Every fetched value or block item served |
+| Sync-committee signatures and Merkle branches, including committee rotation | Light-client updates after a trusted-checkpoint bootstrap; used by `safe`, `finalized` and `--require-verified` |
 
-Consensus light-client verification is on the roadmap. Until then, skim trusts the gossiped head the way an optimistic client does.
+Default `latest` follows the newest state-ready gossiped block. Verified tags require usable light-client data and matching hashes on the selected chain; they return `-32002` until available. skim does not re-execute every block or implement full consensus fork choice.
+
+skim doesn't hold the full state, so it can't recompute a block's state root after applying its BAL. A BAL is committed in the header, so for `safe` and `finalized` blocks the values are as trustworthy as the header. On default `latest`, the risk is a gossiped block that consensus later rejects. See [trust and correctness](docs/guide/trust-and-correctness.md).
 
 ## Status and roadmap
 
@@ -239,7 +249,7 @@ Open work, with what "done" means for each item: [`docs/TODO.md`](docs/TODO.md).
 - [x] M1: BAL state follower with MVCC store
 - [x] M2: simulator, JSON-RPC adapter, verified state, state access predictor
 - [x] M3: subscriptions (subscribed vs on-demand state)
-- [ ] Resource benchmark vs a Nethermind full node (same workload, same block hashes)
+- [x] Resource baseline vs a Nethermind full node at the same block hashes ([P3](docs/experiments/p3-full-node-baseline.md)); conditions and limits are recorded with the measurements
 - [x] **M4: selective state archiving.** `retention: archive` keeps every BAL-written version of subscribed state on disk. `eth_getStorageAt` and `eth_call` then work at historical blocks for what you subscribed to, from the block each key became known (90/90 and 51/51 historical reads matched a reference archive node, restart gaps healed from eth/71; see [M4](docs/experiments/m4-archive.md)). *Sync and archive only what you need.*
 - [x] **M4.2: backfill from retained BALs.** `--archive-backfill N` targets N blocks before the archive's first block, subject to [BAL availability and per-key coverage](#state-age-history-and-backfill-limits). Unchanged keys can be covered for the whole scan; written keys are covered from their earliest recovered write. Live: 102 historical reads matched a reference archive node, 3 were correctly refused, 0 were wrong.
 - [x] **M5:** generalized learned patterns (exact args + amount buckets) with key/byte bounds. The V3 predictor is configurable in `skim run`: calls that needed the network fell from 51 to 19 out of 400. Added `eth_sendRawTransaction`, receipts and `eth_getLogs`, all identical to a reference node in every check ([M5](docs/experiments/m5-predictors-and-chain-data.md)).
@@ -247,8 +257,9 @@ Open work, with what "done" means for each item: [`docs/TODO.md`](docs/TODO.md).
 - [x] **M6: correctness and bounds.** Review fixes with regression tests. 2 h chaos soak (kills, restarts, key-set switches): 3,465 matches, 23 refusals, 0 wrong. Verified restart snapshots, warm `eth_call` 3× faster ([M6](docs/experiments/m6-correctness-and-bounds.md))
 - [x] Serving the network: recent headers, bodies, receipts and BALs (eth/69–71, snap/2), bytecode, and payload envelopes by range/root (consensus), each re-checked against its header before it is sent ([M6](docs/experiments/m6-correctness-and-bounds.md#serving-the-network))
 - [x] **M7: regression gates.** Review findings each have a deterministic test, in CI on every push. A soak gates on availability and recovery as well as wrong answers, and exercises storage-mode transitions on purpose. Also: peer-acquisition tracking with a ranked saved-peer list, parallel restart catch-up (655 blocks in ~9 s), Grafana alerts, release binaries and a container image ([M7](docs/experiments/m7-gates-and-acquisition.md))
-- [ ] Consensus light-client verification: implemented and unit-tested, waiting on consensus clients to serve Gloas light-client data
-- [ ] Mainnet once Glamsterdam ships there
+- [x] Consensus light-client verification and committee rotation for both presets; verified end to end on a minimal-preset devnet. Availability on public networks depends on peers serving Gloas light-client data
+- [x] Configured Glamsterdam networks (`--network <dir>`), including minimal-preset devnets, QUIC discovery and scheduled fork-digest topic changes
+- [ ] Live verification across a blob-parameter fork, remaining transport interoperability, and long-run RSS attribution (see [open work](docs/TODO.md))
 
 Design: [PROJECT.md](PROJECT.md). Guides and experiment logs: [docs/](docs).
 
