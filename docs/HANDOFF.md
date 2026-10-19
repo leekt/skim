@@ -72,7 +72,7 @@ Read first:
    - per-client quotas on block streams;
    - subscriptions registered per client over RPC, under one budget.
 
-Loose end: `memory_usage.md` (repo root, uncommitted) preserves an earlier memory audit with a current-status note. Its proposed counters, call-cache byte trigger and EL peer caps have since been implemented. The remaining investigation is long-run RSS attribution; the public evidence is in [hardware](guide/hardware.md#memory). The owner decides whether the local handoff gets committed.
+`memory_usage.md` (repo root) preserves an earlier memory audit; its proposals have since been implemented, and long-run RSS is tracked in TODO 6.
 
 ## The skim-hub boundary
 - **skim-hub** is a separate, private repo: a shared chain-data hub for several skim instances. It's a **trusted** setup; data from before Glamsterdam can't be verified by skim.

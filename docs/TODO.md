@@ -13,7 +13,7 @@ Items are removed from this file when they're done, and the commit that closes o
 6. **Whether RSS levels off.** Nine production hours: RSS levelled off with the counted
    structures at ~7 h (346 MB at 9 h, +3 MB over the last two hours; growth was ~2.3x the counted
    payload, i.e. allocator and table overhead), see [hardware](guide/hardware.md#memory). Done
-   when a 27 h run (headers full) is flat, measured on a build with `--tx-index pinned`. `memory_usage.md` (repo root, uncommitted) is a handoff on this for another agent.
+   when a 27 h run (headers full) is flat, measured on a build with `--tx-index pinned`.
 
 The last items closed: 22, restart recovery without a SNAP peer, and 23, archived call
 subscriptions growing without bound (sixth soak, M7 log); 26, diagnostic command scope:
