@@ -180,9 +180,27 @@ The dashboard shows:
 
 <img src="assets/grafana-dashboard.png" alt="skim Grafana dashboard" width="100%">
 
-**Next steps:**
-- **[Examples](examples):** Uniswap V3, Uniswap V4, sending transactions (all with viem), and ENS resolution for the [bigname](examples/bigname) indexer, and [smallname](examples/smallname): bigname, but small (skim serves current state, a small index handles discovery and history).
-- **[Docs](docs):** [what to set up for your app](docs/guide/use-cases.md), [getting started](docs/guide/getting-started.md), [how it works](docs/guide/how-it-works.md), [configuration](docs/guide/configuration.md), [JSON-RPC](docs/guide/json-rpc.md), [archive](docs/guide/archive.md), [trust](docs/guide/trust-and-correctness.md), [troubleshooting](docs/guide/troubleshooting.md), [hardware requirements](docs/guide/hardware.md), [memory and latency](docs/guide/memory-and-latency.md), [skim compared: Helios, full and archive nodes](docs/guide/compared.md).
+## Documentation
+
+The [documentation index](docs/README.md) lists the guides and experiment logs. Start with the comparison or app setup guide, then follow the references for your workload.
+
+| What you need | Guide |
+|---|---|
+| Choose between skim, Helios, a full node and an archive node | [skim compared](docs/guide/compared.md) |
+| Choose subscriptions, on-demand reads, history and simulations for your app | [What to set up for your app](docs/guide/use-cases.md) |
+| Build, run and make your first call | [Getting started](docs/guide/getting-started.md) |
+| Understand BALs, verified fetches and state prediction | [How skim works](docs/guide/how-it-works.md) |
+| Configure `skim.yaml` and `skim run` | [Configuration reference](docs/guide/configuration.md) |
+| Integrate RPC methods, subscriptions and block streams | [JSON-RPC reference](docs/guide/json-rpc.md) |
+| Keep selective state history and backfill it | [Archiving history for your state](docs/guide/archive.md) |
+| Size a machine and understand the measured footprint | [Hardware requirements](docs/guide/hardware.md) |
+| Tune memory and latency, with the reasons behind each default | [Memory and latency](docs/guide/memory-and-latency.md) |
+| Understand what is verified and what is trusted | [Trust and correctness](docs/guide/trust-and-correctness.md) |
+| Diagnose unavailable state, missing peers and other issues | [Troubleshooting](docs/guide/troubleshooting.md) |
+
+[Runnable examples](examples/README.md): Uniswap V3 and V4, WebSocket subscriptions, sending transactions, and ENS resolution with [bigname](examples/bigname) and [smallname](examples/smallname). For monitoring, see the [Prometheus and Grafana setup](metrics/README.md).
+
+## JSON-RPC
 
 **Supported methods:**
 - State and simulation: `eth_call` (with state overrides), `eth_simulateV1`, `debug_traceCall` / `debug_traceTransaction` / `debug_traceBlockBy*` (default, `callTracer`, `prestateTracer`, `4byteTracer`, `muxTracer`), `eth_createAccessList`, `eth_getProof`, `eth_estimateGas`, `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`, `eth_getTransactionCount` (including `pending`)
