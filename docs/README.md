@@ -1,19 +1,27 @@
 # skim documentation
 
 ## Guide
-1. [Getting started](guide/getting-started.md): build, run, first call, subscriptions
-2. [How skim works](guide/how-it-works.md): BALs, verified fetches, subscriptions, prediction
-3. [Configuration reference](guide/configuration.md): `skim.yaml` and `skim run` flags
-4. [JSON-RPC reference](guide/json-rpc.md): methods, block tags, errors
-5. [Archiving history for your state](guide/archive.md): `retention: archive`, backfill
-6. [Trust and correctness](guide/trust-and-correctness.md): what's verified, what isn't
-7. [Troubleshooting](guide/troubleshooting.md)
 
-**Examples:** [Uniswap V3, Uniswap V4 and sending transactions with viem](../examples)
+1. [skim compared](guide/compared.md): skim, Helios, a full node and an archive node; costs, resources and guarantees
+2. [What to set up for your app](guide/use-cases.md): choose subscriptions, on-demand reads, history and simulations for your workload
+3. [Getting started](guide/getting-started.md): build, run, first call, subscriptions
+4. [How skim works](guide/how-it-works.md): BALs, verified fetches, subscriptions, prediction
+5. [Configuration reference](guide/configuration.md): `skim.yaml` and `skim run` flags
+6. [JSON-RPC reference](guide/json-rpc.md): methods, block tags, subscriptions, block streams, errors
+7. [Archiving history for your state](guide/archive.md): `retention: archive`, backfill
+8. [Hardware requirements](guide/hardware.md): measured CPU, memory, disk and bandwidth; machine sizing
+9. [Memory and latency](guide/memory-and-latency.md): tuning, per-structure memory counters and the reasons behind defaults
+10. [Trust and correctness](guide/trust-and-correctness.md): what's verified, what isn't
+11. [Troubleshooting](guide/troubleshooting.md)
+
+**Examples:** [Uniswap V3 and V4, WebSocket subscriptions, sending transactions, bigname and smallname](../examples/README.md)
+
+**Monitoring:** [Prometheus and Grafana setup](../metrics/README.md)
 
 **Design:** [PROJECT.md](../PROJECT.md)
 
 ## Experiment logs
+
 Every result in the README comes from one of these runs, on Sepolia over public peers.
 
 | Doc | What was measured |
@@ -31,6 +39,7 @@ Every result in the README comes from one of these runs, on Sepolia over public 
 | [M4 archive](experiments/m4-archive.md) | selective archive, restart healing, BAL backfill |
 | [M5 predictors and chain data](experiments/m5-predictors-and-chain-data.md) | learned patterns, V3 predictor in `skim run`, transactions/receipts/logs |
 | [M6 correctness and bounds](experiments/m6-correctness-and-bounds.md) | review fixes, 2 h chaos soak (0 wrong), restart persistence, CL catch-up, light client status |
+| [M7 gates and acquisition](experiments/m7-gates-and-acquisition.md) | regression gates, peer acquisition, restart recovery, memory and throughput |
 | [P3 full-node baseline](experiments/p3-full-node-baseline.md) | same workload and block hashes as a full node: answers, latency, resources |
 
 Tools used by these runs live in [`experiments/tools`](experiments/tools).
