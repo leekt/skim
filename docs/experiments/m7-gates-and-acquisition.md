@@ -225,6 +225,13 @@ Metrics the review asked for: `skim_store_archive_base_writes_total` (expected ~
 
 Also from this review, tracked in [TODO](../TODO.md): the hedged-fetch A/B (cold-read p95/p99 and the extra requests per peer), a long zero-config soak, and signed release artifacts or provenance (the install script's SHA-256 check catches corrupted downloads, not a compromised release).
 
+## Eighteenth review: requests across a reorg
+| Finding | Fix | Regression test |
+|---|---|---|
+| P2 candidate: `on_rollback`, the store's rollback and the new block's apply aren't one atomic step, so a request running across them could read the old fork in one place and the new one in another | A reorg epoch in the store, bumped before anything is rolled back. Requests capture it with `latest` (once per batch); a request whose epoch moved gets `-32002 chain_changed` (retry) instead of its result. Exempt: methods that don't read the chain, `skim_streamNext` (its cursor rewinds) and `eth_sendRawTransaction` (already broadcast) | `a_request_spanning_a_reorg_is_refused_never_answered`; the reorg-order test checks the epoch moved before `on_rollback` (fails without the early bump) |
+
+The review's two measurement items: hedging under injected faults (below, "Hedged fetch") and the zero-config long run (TODO 6, a 30-hour soak running).
+
 ## Peer requests: coalescing and fetch order
 Measured on the aarch64 Linux deployment host (2 cores), each run on a fresh instance with its own ports and data directory, counted with `skim_status.peer_requests`.
 
