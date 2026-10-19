@@ -109,6 +109,6 @@ Anything that doesn't check out (a reorg while skim was down, a gap over 8,192 b
   - **Contract code:** freed with its accounts.
   - **The recent-BAL index:** every write of the last `--window` blocks, needed to replay fetched values to the head. This part scales with chain activity, not with your keys. `skim_status.store.recent_bal_bytes` shows it; lower `--window` to shrink it.
 
-  There is no single "total memory" cap. Measured: ~180 MB RSS following Sepolia on Linux with the default 256-block `--window` (~100 MB with `--window 32`). `skim_status.memory` shows what each structure holds; [hardware requirements](hardware.md) has the details.
+  There is no single "total memory" cap. Measured: ~180 MB RSS following Sepolia on Linux with the default 256-block `--window` (~100 MB with `--window 32`). `skim_status.memory` shows what each structure holds; [hardware requirements](hardware.md) has the details, and [memory and latency](memory-and-latency.md) what each setting trades.
 - **Network and CPU:** skim receives and checks every block's full payload and BAL, so this part follows the whole chain's activity, not just your keys. What scales with your app is the state it keeps and the fetches it makes.
 - **Disk:** none, unless `--archive`.

@@ -28,6 +28,8 @@ An Oracle Cloud Ampere A1 (2 cores, 12 GB) runs the whole right-hand column with
 
 ### What holds memory
 
+How to trade memory for latency, knob by knob, and why the defaults are what they are: [memory and latency](memory-and-latency.md).
+
 `skim_status.memory` (and the Grafana panel "Retained data by structure vs RSS") reports, for every retained structure, its entries, an estimate of the payload bytes it holds, and its allocated capacity. Payload only: allocator overhead and code pages aren't counted, so the sum explains part of RSS, never all of it. On Linux, roughly 30-60 MB of RSS is the binary's code and shared libraries.
 
 | Structure | Bound | Filled after (12 s blocks) |
