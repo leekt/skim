@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS versions (node TEXT NOT NULL, resolver TEXT NOT NULL,
   PRIMARY KEY (node, resolver, block, log_index));
 -- ENSv2: registries (and the node they hold names under), token -> node, record-id links.
 CREATE TABLE IF NOT EXISTS registries (address TEXT PRIMARY KEY, parent_node TEXT, block INTEGER NOT NULL);
+-- What a mount overwrote in place (a registry's place, its tokens' nodes), under the mount's
+-- block: a rollback past that block puts the earlier values back (newest first).
+CREATE TABLE IF NOT EXISTS mount_undo (seq INTEGER PRIMARY KEY AUTOINCREMENT, block INTEGER NOT NULL, kind TEXT NOT NULL,
+  address TEXT NOT NULL, label_id TEXT, parent_node TEXT, fixed INTEGER);
 CREATE TABLE IF NOT EXISTS v2_tokens (registry TEXT NOT NULL, label_id TEXT NOT NULL, labelhash TEXT NOT NULL, node TEXT, block INTEGER NOT NULL,
   PRIMARY KEY (registry, label_id));
 CREATE TABLE IF NOT EXISTS v2_resolvers (address TEXT PRIMARY KEY, block INTEGER NOT NULL);
@@ -53,7 +57,7 @@ CREATE TABLE IF NOT EXISTS v2_links (resolver TEXT NOT NULL, record_id TEXT NOT 
   PRIMARY KEY (resolver, node, block, log_index));
 `;
 
-const REORG_TABLES = ["blocks", "events", "names", "rel", "expiry", "record_key_writes", "versions", "registries", "v2_tokens", "v2_resolvers", "v2_links", "v2_resources", "migrations"];
+const REORG_TABLES = ["mount_undo", "blocks", "events", "names", "rel", "expiry", "record_key_writes", "versions", "registries", "v2_tokens", "v2_resolvers", "v2_links", "v2_resources", "migrations"];
 
 export class Store {
   constructor(path) {
@@ -131,6 +135,11 @@ export class Store {
 
   /** `rollback`, inside a transaction the caller already holds (SQLite doesn't nest them). */
   rollbackInTx(n) {
+    // Undo in-place mount overwrites first, newest first, while the rows they restore still exist.
+    for (const u of this.all("SELECT * FROM mount_undo WHERE block > ? ORDER BY seq DESC", n)) {
+      if (u.kind === "registry") this.run("UPDATE registries SET parent_node = ?, fixed = ? WHERE address = ?", u.parent_node, u.fixed, u.address);
+      else this.run("UPDATE v2_tokens SET node = ? WHERE registry = ? AND label_id = ?", u.parent_node, u.address, u.label_id);
+    }
     for (const t of REORG_TABLES) this.run(`DELETE FROM ${t} WHERE ${t === "blocks" ? "number" : "block"} > ?`, n);
     this.meta("indexed_block", n);
     this.meta("indexed_hash", this.get("SELECT hash FROM blocks WHERE number = ?", n)?.hash ?? "");

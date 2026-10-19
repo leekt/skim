@@ -153,11 +153,18 @@ export class Ingest {
     const cur = this.s.get("SELECT parent_node, fixed FROM registries WHERE address = ?", r);
     if (cur?.fixed || (cur?.parent_node && !fix)) return;
     if (this.underRegistry(parentNode, r)) return;
+    // Rows from earlier blocks are overwritten in place: record what they held, so a reorg
+    // removing this block restores them (rollback only deletes rows newer than the fork).
+    const prev = this.s.get("SELECT parent_node, fixed, block FROM registries WHERE address = ?", r);
+    if (prev && prev.block <= block)
+      this.s.run("INSERT INTO mount_undo (block, kind, address, parent_node, fixed) VALUES (?, 'registry', ?, ?, ?)", block, r, prev.parent_node, prev.fixed);
     this.s.run(
       "INSERT INTO registries (address, parent_node, block, fixed) VALUES (?, ?, ?, ?) ON CONFLICT (address) DO UPDATE SET parent_node = excluded.parent_node, fixed = excluded.fixed",
       r, parentNode, block, fix ? 1 : 0);
-    for (const t of this.s.all("SELECT label_id, labelhash FROM v2_tokens WHERE registry = ?", lower(registry))) {
+    for (const t of this.s.all("SELECT label_id, labelhash, node, block FROM v2_tokens WHERE registry = ?", lower(registry))) {
       const node = child(parentNode, t.labelhash);
+      if (t.block <= block && t.node !== node)
+        this.s.run("INSERT INTO mount_undo (block, kind, address, label_id, parent_node) VALUES (?, 'token', ?, ?, ?)", block, lower(registry), t.label_id, t.node);
       this.s.run("UPDATE v2_tokens SET node = ? WHERE registry = ? AND label_id = ?", node, lower(registry), t.label_id);
       this.edge(node, parentNode, t.labelhash, block, null);
     }

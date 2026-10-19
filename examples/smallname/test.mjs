@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodeEventTopics, encodeAbiParameters, keccak256, toHex, namehash, labelhash, toEventSelector } from "viem";
 import { Store } from "./store.mjs";
-import { Ingest } from "./ingest.mjs";
+import { Ingest, child } from "./ingest.mjs";
 import { applyResponse } from "./sync.mjs";
 import { EVENTS, V1, V2 } from "./contracts.mjs";
 import { nameState } from "./live.mjs";
@@ -148,6 +148,23 @@ test("index files with the old one-row-per-key inventory are migrated on open", 
   const store = new Store(path);
   assert.deepEqual(store.all("SELECT key, block FROM record_key_writes").map((r) => [r.key, r.block]), [["text:email", 90]]);
   assert.equal(store.get("SELECT count(*) c FROM sqlite_master WHERE name = 'record_keys'").c, 0);
+});
+
+test("a reorg puts a re-mounted registry and its tokens back where they were", () => {
+  const { store, ingest } = fresh();
+  const R = "0x00000000000000000000000000000000000000b1";
+  const [A, B, lh] = [hash("parent A"), hash("parent B"), hash("label")];
+  store.run("INSERT INTO registries (address, parent_node, block) VALUES (?, NULL, 90)", R);
+  store.run("INSERT INTO v2_tokens (registry, label_id, labelhash, node, block) VALUES (?, '1', ?, NULL, 90)", R, lh);
+  const place = () => [{ ...store.get("SELECT parent_node p, fixed f FROM registries WHERE address = ?", R) }, store.get("SELECT node FROM v2_tokens WHERE registry = ?", R).node];
+  ingest.mount(R, A, 100);
+  ingest.mount(R, B, 105, true); // a confirmed claim moves it
+  assert.deepEqual(place(), [{ p: B, f: 1 }, child(B, lh)]);
+  store.rollback(102);
+  assert.deepEqual(place(), [{ p: A, f: 0 }, child(A, lh)], "block 105's re-mount undone");
+  store.rollback(95);
+  assert.deepEqual(place(), [{ p: null, f: 0 }, null], "block 100's first mount undone");
+  assert.equal(store.get("SELECT count(*) c FROM mount_undo").c, 0);
 });
 
 /** A reader whose calls answer from `answers[functionName]` (a value, or a failure object). */
