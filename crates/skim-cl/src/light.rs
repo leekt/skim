@@ -13,6 +13,7 @@ use alloy_primitives::B256;
 use blst::min_pk::{AggregatePublicKey, PublicKey, Signature};
 use sha2::{Digest, Sha256};
 
+/// Mainnet-preset sizes (Sepolia, mainnet). Other presets: [`LcConfig`].
 pub const SYNC_COMMITTEE_SIZE: usize = 512;
 pub const SLOTS_PER_PERIOD: u64 = 8192;
 pub const EXECUTION_BLOCK_HASH_GINDEX: u64 = 2856;
@@ -26,7 +27,48 @@ pub const SEPOLIA_GENESIS_VALIDATORS_ROOT: [u8; 32] =
     alloy_primitives::hex!("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078");
 const BLS_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
+/// What the light client needs to know about the network: the preset's sync committee size and
+/// period length, and the chain's `genesis_validators_root` (part of every signing domain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LcConfig {
+    pub committee_size: usize,
+    pub slots_per_period: u64,
+    pub genesis_validators_root: [u8; 32],
+}
+
+impl LcConfig {
+    pub const SEPOLIA: Self =
+        Self { committee_size: SYNC_COMMITTEE_SIZE, slots_per_period: SLOTS_PER_PERIOD, genesis_validators_root: SEPOLIA_GENESIS_VALIDATORS_ROOT };
+
+    fn agg_len(&self) -> usize {
+        self.committee_size / 8 + 96
+    }
+    fn committee_len(&self) -> usize {
+        self.committee_size * 48 + 48
+    }
+    pub fn optimistic_update_len(&self) -> usize {
+        HEADER_LEN + self.agg_len() + 8
+    }
+    pub fn finality_update_len(&self) -> usize {
+        HEADER_LEN * 2 + 32 * 9 + self.agg_len() + 8
+    }
+    pub fn bootstrap_len(&self) -> usize {
+        HEADER_LEN + self.committee_len() + 32 * 11
+    }
+    pub fn update_len(&self) -> usize {
+        HEADER_LEN + self.committee_len() + 32 * 11 + HEADER_LEN + 32 * 9 + self.agg_len() + 8
+    }
+    /// Supermajority of the committee (the spec's optimistic threshold is 1; skim asks for 2/3).
+    pub fn min_participants(&self) -> usize {
+        self.committee_size * 2 / 3 + 1
+    }
+    pub fn period(&self, slot: u64) -> u64 {
+        slot / self.slots_per_period
+    }
+}
+
 const HEADER_LEN: usize = 112 + 32 + 32 * 11; // beacon + execution_block_hash + branch
+// Mainnet-preset sizes; code paths use [`LcConfig`].
 const SYNC_AGGREGATE_LEN: usize = 64 + 96;
 pub const OPTIMISTIC_UPDATE_LEN: usize = HEADER_LEN + SYNC_AGGREGATE_LEN + 8;
 pub const FINALITY_UPDATE_LEN: usize = HEADER_LEN * 2 + 32 * 9 + SYNC_AGGREGATE_LEN + 8;
@@ -46,7 +88,7 @@ pub enum LcError {
     Checkpoint(B256, B256),
     #[error("sync committee for period {0} not known (have {1:?})")]
     Period(u64, Option<u64>),
-    #[error("only {0}/512 sync committee members signed (need {1})")]
+    #[error("only {0} sync committee members signed (need {1})")]
     Participation(usize, usize),
     #[error("bad BLS data: {0}")]
     Bls(String),
@@ -150,16 +192,16 @@ pub struct Committee {
 }
 
 impl Committee {
-    /// A committee from 512 validated public keys (tests, fuzzing).
-    pub fn from_pubkeys(period: u64, pubkeys: Vec<PublicKey>) -> Option<Self> {
-        (pubkeys.len() == SYNC_COMMITTEE_SIZE).then_some(Self { period, pubkeys })
+    /// A committee from validated public keys (tests, fuzzing): exactly the preset's size.
+    pub fn from_pubkeys(period: u64, pubkeys: Vec<PublicKey>, cfg: &LcConfig) -> Option<Self> {
+        (pubkeys.len() == cfg.committee_size).then_some(Self { period, pubkeys })
     }
 }
 
-/// A serialized `SyncCommittee` (512 pubkeys + aggregate): its hash tree root and the keys.
-fn parse_committee(b: &[u8]) -> Result<([u8; 32], Vec<PublicKey>), LcError> {
-    let pk_bytes = &b[..SYNC_COMMITTEE_SIZE * 48];
-    let agg = &b[SYNC_COMMITTEE_SIZE * 48..COMMITTEE_LEN];
+/// A serialized `SyncCommittee` (the preset's pubkeys + aggregate): its hash tree root and the keys.
+fn parse_committee(b: &[u8], cfg: &LcConfig) -> Result<([u8; 32], Vec<PublicKey>), LcError> {
+    let pk_bytes = &b[..cfg.committee_size * 48];
+    let agg = &b[cfg.committee_size * 48..cfg.committee_len()];
     let root = sha(&merkleize(pk_bytes.chunks(48).map(pubkey_root).collect()), &pubkey_root(agg));
     let keys = pk_bytes
         .chunks(48)
@@ -173,17 +215,18 @@ fn parse_committee(b: &[u8]) -> Result<([u8; 32], Vec<PublicKey>), LcError> {
 pub struct Committees {
     pub current: Committee,
     pub next: Option<Committee>,
+    pub cfg: LcConfig,
 }
 
 impl Committees {
-    pub fn new(current: Committee) -> Self {
-        Self { current, next: None }
+    pub fn new(current: Committee, cfg: LcConfig) -> Self {
+        Self { current, next: None, cfg }
     }
 
     /// The committee that signs at `signature_slot`: by the slot's own period (the `- 1` in the
     /// spec is for choosing the fork version, not the committee).
     pub fn for_signature_slot(&self, signature_slot: u64) -> Result<&Committee, LcError> {
-        let p = signature_slot / SLOTS_PER_PERIOD;
+        let p = self.cfg.period(signature_slot);
         if p == self.current.period {
             return Ok(&self.current);
         }
@@ -196,7 +239,7 @@ impl Committees {
     /// After a verified finalized header: once finality reaches the next period, its committee
     /// becomes current. True if it rotated.
     pub fn advance(&mut self, finalized_slot: u64) -> bool {
-        if finalized_slot / SLOTS_PER_PERIOD > self.current.period
+        if self.cfg.period(finalized_slot) > self.current.period
             && let Some(n) = self.next.take_if(|n| n.period == self.current.period + 1)
         {
             self.current = n;
@@ -208,21 +251,21 @@ impl Committees {
 
 /// Verifies a `LightClientBootstrap` against a trusted checkpoint block root and returns the
 /// checkpoint header and its sync committee.
-pub fn bootstrap(b: &[u8], trusted_root: B256) -> Result<(LcHeader, Committee), LcError> {
-    if b.len() != BOOTSTRAP_LEN {
-        return Err(LcError::Length(b.len(), BOOTSTRAP_LEN));
+pub fn bootstrap(b: &[u8], trusted_root: B256, cfg: &LcConfig) -> Result<(LcHeader, Committee), LcError> {
+    if b.len() != cfg.bootstrap_len() {
+        return Err(LcError::Length(b.len(), cfg.bootstrap_len()));
     }
     let header = parse_header(&b[..HEADER_LEN])?;
     let root = B256::from(header.beacon.root());
     if root != trusted_root {
         return Err(LcError::Checkpoint(root, trusted_root));
     }
-    let (committee_root, pubkeys) = parse_committee(&b[HEADER_LEN..HEADER_LEN + COMMITTEE_LEN])?;
-    let br = branch(&b[HEADER_LEN + COMMITTEE_LEN..], 11);
+    let (committee_root, pubkeys) = parse_committee(&b[HEADER_LEN..HEADER_LEN + cfg.committee_len()], cfg)?;
+    let br = branch(&b[HEADER_LEN + cfg.committee_len()..], 11);
     if !verify_branch(committee_root, &br, CURRENT_SYNC_COMMITTEE_GINDEX, header.beacon.state_root) {
         return Err(LcError::Branch("current_sync_committee"));
     }
-    Ok((header, Committee { period: header.beacon.slot / SLOTS_PER_PERIOD, pubkeys }))
+    Ok((header, Committee { period: cfg.period(header.beacon.slot), pubkeys }))
 }
 
 fn signing_root(object_root: [u8; 32], fork_version: [u8; 4], gvr: [u8; 32]) -> [u8; 32] {
@@ -246,42 +289,45 @@ fn verify_sync_aggregate(
     min: usize,
 ) -> Result<usize, LcError> {
     let c = cs.for_signature_slot(signature_slot)?;
-    let bits = &agg[..64];
+    let nbits = cs.cfg.committee_size / 8;
+    let bits = &agg[..nbits];
     let participants: Vec<&PublicKey> =
-        (0..SYNC_COMMITTEE_SIZE).filter(|i| bits[i / 8] >> (i % 8) & 1 == 1).map(|i| &c.pubkeys[i]).collect();
+        (0..cs.cfg.committee_size).filter(|i| bits[i / 8] >> (i % 8) & 1 == 1).map(|i| &c.pubkeys[i]).collect();
     if participants.len() < min {
         return Err(LcError::Participation(participants.len(), min));
     }
     let apk = AggregatePublicKey::aggregate(&participants, false).map_err(|e| LcError::Bls(format!("{e:?}")))?;
-    let sig = Signature::sig_validate(&agg[64..160], true).map_err(|e| LcError::Bls(format!("{e:?}")))?;
-    let msg = signing_root(attested.root(), fork_version, SEPOLIA_GENESIS_VALIDATORS_ROOT);
+    let sig = Signature::sig_validate(&agg[nbits..nbits + 96], true).map_err(|e| LcError::Bls(format!("{e:?}")))?;
+    let msg = signing_root(attested.root(), fork_version, cs.cfg.genesis_validators_root);
     match sig.verify(true, &msg, BLS_DST, &[], &apk.to_public_key(), false) {
         blst::BLST_ERROR::BLST_SUCCESS => Ok(participants.len()),
         _ => Err(LcError::Signature),
     }
 }
 
-/// Supermajority of the committee (the spec's optimistic threshold is 1; skim asks for 2/3).
+/// Supermajority of a mainnet-preset committee (see [`LcConfig::min_participants`]).
 pub const MIN_PARTICIPANTS: usize = SYNC_COMMITTEE_SIZE * 2 / 3 + 1;
 
 /// Verifies a `LightClientOptimisticUpdate`: returns the attested header (with its execution
 /// block hash proven) and how many members signed.
 pub fn optimistic_update(c: &Committees, b: &[u8], fork_version: [u8; 4]) -> Result<(LcHeader, usize), LcError> {
-    if b.len() != OPTIMISTIC_UPDATE_LEN {
-        return Err(LcError::Length(b.len(), OPTIMISTIC_UPDATE_LEN));
+    let (want, agg_len) = (c.cfg.optimistic_update_len(), c.cfg.agg_len());
+    if b.len() != want {
+        return Err(LcError::Length(b.len(), want));
     }
     let attested = parse_header(&b[..HEADER_LEN])?;
-    let agg = &b[HEADER_LEN..HEADER_LEN + SYNC_AGGREGATE_LEN];
-    let signature_slot = u64::from_le_bytes(b[HEADER_LEN + SYNC_AGGREGATE_LEN..].try_into().unwrap());
-    let n = verify_sync_aggregate(c, &attested.beacon, agg, signature_slot, fork_version, MIN_PARTICIPANTS)?;
+    let agg = &b[HEADER_LEN..HEADER_LEN + agg_len];
+    let signature_slot = u64::from_le_bytes(b[HEADER_LEN + agg_len..].try_into().unwrap());
+    let n = verify_sync_aggregate(c, &attested.beacon, agg, signature_slot, fork_version, c.cfg.min_participants())?;
     Ok((attested, n))
 }
 
 /// Verifies a `LightClientFinalityUpdate`: the attested header is signed, and its state commits
 /// to the finalized header. Returns `(attested, finalized)`.
 pub fn finality_update(c: &Committees, b: &[u8], fork_version: [u8; 4]) -> Result<(LcHeader, LcHeader), LcError> {
-    if b.len() != FINALITY_UPDATE_LEN {
-        return Err(LcError::Length(b.len(), FINALITY_UPDATE_LEN));
+    let (want, agg_len) = (c.cfg.finality_update_len(), c.cfg.agg_len());
+    if b.len() != want {
+        return Err(LcError::Length(b.len(), want));
     }
     let attested = parse_header(&b[..HEADER_LEN])?;
     let finalized = parse_header(&b[HEADER_LEN..2 * HEADER_LEN])?;
@@ -290,9 +336,9 @@ pub fn finality_update(c: &Committees, b: &[u8], fork_version: [u8; 4]) -> Resul
         return Err(LcError::Branch("finalized_root"));
     }
     let o = 2 * HEADER_LEN + 32 * 9;
-    let agg = &b[o..o + SYNC_AGGREGATE_LEN];
-    let signature_slot = u64::from_le_bytes(b[o + SYNC_AGGREGATE_LEN..].try_into().unwrap());
-    verify_sync_aggregate(c, &attested.beacon, agg, signature_slot, fork_version, MIN_PARTICIPANTS)?;
+    let agg = &b[o..o + agg_len];
+    let signature_slot = u64::from_le_bytes(b[o + agg_len..].try_into().unwrap());
+    verify_sync_aggregate(c, &attested.beacon, agg, signature_slot, fork_version, c.cfg.min_participants())?;
     Ok((attested, finalized))
 }
 
@@ -310,13 +356,14 @@ pub struct FullUpdate {
 /// its signature slot; the next sync committee and the finalized header proven against the
 /// attested state root.
 pub fn full_update(cs: &Committees, b: &[u8], fork_version: [u8; 4]) -> Result<FullUpdate, LcError> {
-    if b.len() != UPDATE_LEN {
-        return Err(LcError::Length(b.len(), UPDATE_LEN));
+    let (want, agg_len, committee_len) = (cs.cfg.update_len(), cs.cfg.agg_len(), cs.cfg.committee_len());
+    if b.len() != want {
+        return Err(LcError::Length(b.len(), want));
     }
     let attested = parse_header(&b[..HEADER_LEN])?;
     let mut o = HEADER_LEN;
-    let (next_root, next_keys) = parse_committee(&b[o..o + COMMITTEE_LEN])?;
-    o += COMMITTEE_LEN;
+    let (next_root, next_keys) = parse_committee(&b[o..o + committee_len], &cs.cfg)?;
+    o += committee_len;
     let next_branch = branch(&b[o..o + 32 * 11], 11);
     o += 32 * 11;
     if !verify_branch(next_root, &next_branch, NEXT_SYNC_COMMITTEE_GINDEX, attested.beacon.state_root) {
@@ -335,10 +382,10 @@ pub fn full_update(cs: &Committees, b: &[u8], fork_version: [u8; 4]) -> Result<F
         }
         Some(f)
     };
-    let agg = &b[o..o + SYNC_AGGREGATE_LEN];
-    let signature_slot = u64::from_le_bytes(b[o + SYNC_AGGREGATE_LEN..].try_into().unwrap());
-    verify_sync_aggregate(cs, &attested.beacon, agg, signature_slot, fork_version, MIN_PARTICIPANTS)?;
-    let attested_period = attested.beacon.slot / SLOTS_PER_PERIOD;
+    let agg = &b[o..o + agg_len];
+    let signature_slot = u64::from_le_bytes(b[o + agg_len..].try_into().unwrap());
+    verify_sync_aggregate(cs, &attested.beacon, agg, signature_slot, fork_version, cs.cfg.min_participants())?;
+    let attested_period = cs.cfg.period(attested.beacon.slot);
     let next = (attested_period == cs.current.period).then(|| Committee { period: attested_period + 1, pubkeys: next_keys });
     Ok(FullUpdate { attested, finalized, next })
 }
@@ -490,9 +537,9 @@ pub mod testkit {
         let mut b = hb;
         b.extend_from_slice(&cb);
         br.iter().for_each(|n| b.extend_from_slice(n));
-        let (header, c) = bootstrap(&b, B256::from(h.root())).unwrap();
+        let (header, c) = bootstrap(&b, B256::from(h.root()), &LcConfig::SEPOLIA).unwrap();
         assert_eq!((header.beacon.slot, c.period), (BOUNDARY - 100, P));
-        Committees::new(c)
+        Committees::new(c, LcConfig::SEPOLIA)
     }
 
     /// A `LightClientUpdate` attested at `attested_slot` (no finalized header), carrying
@@ -602,7 +649,7 @@ mod tests {
         // A 512-member committee where members 0..3 are our keys and everyone else is key 0.
         let mut pubkeys: Vec<PublicKey> = sks.iter().map(|s| s.sk_to_pk()).collect();
         pubkeys.resize(SYNC_COMMITTEE_SIZE, sks[0].sk_to_pk());
-        let c = Committees::new(Committee { period: 0, pubkeys });
+        let c = Committees::new(Committee { period: 0, pubkeys }, LcConfig::SEPOLIA);
         let mut agg_bytes = vec![0u8; SYNC_AGGREGATE_LEN];
         agg_bytes[0] = 0b111;
         agg_bytes[64..].copy_from_slice(&agg.to_bytes());

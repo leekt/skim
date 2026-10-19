@@ -8,6 +8,7 @@
 
 pub mod gossip;
 pub mod light;
+pub mod network;
 pub mod node;
 pub mod rpc;
 pub mod serve;
