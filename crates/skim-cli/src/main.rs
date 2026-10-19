@@ -25,6 +25,7 @@ mod probe_clreq;
 mod probe_call;
 mod probe_catchup;
 mod probe_el;
+mod probe_retention;
 mod probe_serve;
 mod rpc;
 mod run;
@@ -49,6 +50,8 @@ enum Cmd {
     ProbeClReq(probe_clreq::Args),
     /// Check what a skim node serves to peers (EL and CL), verifying every answer (Sepolia only).
     ProbeServe(probe_serve::Args),
+    /// How far back public EL peers serve BALs, bodies and receipts, by block age (Sepolia only).
+    ProbeRetention(probe_retention::Args),
     /// Time the restart catch-up walk over consensus peers (where the time goes; Sepolia only).
     ProbeCatchup(probe_catchup::Args),
     /// M0 Spike C (Sepolia only): cold-call SNAP rounds and latency against a reference node.
@@ -88,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::ProbeEl(args) => probe_el::run(args).await,
         Cmd::ProbeClReq(args) => probe_clreq::run(args).await,
         Cmd::ProbeServe(args) => probe_serve::run(args).await,
+        Cmd::ProbeRetention(args) => probe_retention::run(args).await,
         Cmd::ProbeCatchup(args) => probe_catchup::run(args).await,
         Cmd::ProbeCall(args) => probe_call::run(args).await,
         Cmd::Follow(args) => follow::run(args).await,
