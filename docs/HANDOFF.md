@@ -48,7 +48,7 @@ Read first:
 **Any Glamsterdam network by config** (`ec5ced9` and after):
 - **The flag:** `--network <sepolia|dir>` reads a standard network-config directory: `config.yaml` with `PRESET_BASE`, `genesis.ssz` or `genesis_validators_root.txt`, `bootstrap_nodes.txt`, plus the EL `genesis.json` (with `amsterdamTime`) and optional `enodes.txt`.
 - **Presets:** `mainnet` and `minimal` (`skim_cl::network::Preset`); the light client follows the preset (`LcConfig`). Minimal-preset light-client tests are in (`6fd23e3`).
-- **Fork digest:** computed (Fulu+: fork data root XOR the blob-parameter hash); Sepolia's matches the digest its peers use. It follows scheduled blob-parameter forks while running (`25c2d2e`), subscribes to the next topics two epochs early and retires the previous topics two epochs later (`0fcf9d1`). A live crossing remains TODO 24.
+- **Fork digest:** computed (Fulu+: fork data root XOR the blob-parameter hash); Sepolia's matches the digest its peers use. It follows scheduled blob-parameter forks while running (`25c2d2e`), subscribes to the next topics two epochs early and retires the previous topics two epochs later (`0fcf9d1`). Status carries the digest in force (`162eb48`). A live fork was crossed on the BPO devnet without losing peers (M7).
 - **Discovery:** QUIC-only peers are discovered and dialed. QUIC is tried first when announced, TCP as the fallback (`82131c4`).
 - **Process-wide network and chain id:** `skim_cl::network::current()` and `skim_sim::env::chain_id()`, Sepolia by default.
 - **Flags:** `--el-bootnode`, `--cl-peer` (failures are logged), `--hub` (refuses to start).
@@ -62,7 +62,6 @@ Read first:
 
 ## Next tasks (in order)
 1. **Open items in [`docs/TODO.md`](TODO.md):**
-   - 24: a live blob-parameter fork on a devnet;
    - 25: TCP peers without yamux;
    - 6: memory past 7 h.
 2. **Pending measurements:**
