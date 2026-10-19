@@ -2,7 +2,7 @@
 
 skim answers fast when the data is already in memory, and slower when it has to fetch it from peers. Most settings move that line: keep more in memory and fewer requests wait on the network, or keep less and pay for it on the misses. This page lists each knob, what it costs and what it buys, then the defaults skim ships with and why.
 
-[Hardware requirements](hardware.md) has the measured footprint; `skim_status.memory` (and the Grafana panel "Retained data by structure vs RSS") shows what each structure holds on a running node.
+[Hardware requirements](hardware.md) has the measured footprint; `skim_status.memory.parts` (and the Grafana panel "Retained data by structure (stacked) vs RSS") estimates instrumented structures on a running node. Peer buffers and several other allocations are not counted; `capacity` can mean an allocated capacity, limit or current count depending on the part.
 
 ## Where latency comes from
 
@@ -25,19 +25,21 @@ So the trade is almost always: memory spent keeping something, against network r
 | **`limits.max_subscribed_keys`** (default 100,000) | room for every key your calls need | keys over the limit stay on demand (fetched, kept briefly), and a call subscription that's cut short reports `truncated` and isn't ready |
 | **`on_demand.cache_ttl_blocks`** (default 4) | unsubscribed state stays current longer after use, so repeated reads stay warm | a key read again after it expired is fetched again |
 | **`limits.max_on_demand_keys`** (default 200,000) | more on-demand keys kept at once | the soonest-expiring are evicted first and fetched again on the next read |
-| **`--window`** (default 256 blocks) | reads at older recent blocks; deeper reorgs handled in memory; keys written within the window resolve from BALs without a fetch (also right after a restart: the last 32 blocks' BALs are loaded at start) | ~19.5 MB of recent-BAL writes at 256 blocks, plus versions of tracked keys. `--window 32` keeps head-only RSS near 100 MB, but older reads need a fetch or the archive |
+| **`--window`** (default 256 blocks) | reads at older recent blocks; deeper reorgs handled in memory; keys written within the window resolve from BALs without a fetch (also right after a restart: up to 32 blocks' BALs are seeded) | ~16–19.5 MB of recent-BAL writes in the recorded 256-block workloads, plus versions. Short macOS soaks with `--window 32` had ~100 MB medians; older reads need a fetch or the archive |
 | **Predictors** (`predictors.uniswap_v3.prefetch_budget`, `window_ttl_blocks`) | ticks near the current price are warm before anyone asks | quotes that cross into cold ticks fetch them on demand |
 
 ### Results and block data
 
 | Knob | More memory buys | Less memory costs |
 |---|---|---|
-| **Call result cache** (on by default; `--no-call-cache` turns it off; bounded at 20,000 entries and 32 MiB) | an identical `eth_call` at the same block answers without executing | every call executes (still from memory if its state is warm; CPU, not network) |
+| **Call result cache** (on by default; `--no-call-cache` turns it off; clear triggers: 20,000 entries or estimated 32 MiB) | an identical `eth_call` at the same block answers without executing | every call executes (still from memory if its state is warm; CPU, not network) |
 | **Block caches** (bodies, receipts, withdrawals: 128 blocks; decoded BALs: 32; raw BALs and envelopes kept to serve peers: 64) | `eth_getLogs`, receipts, transaction replay and log scans over recent blocks need no fetch; peers syncing from skim get answers | requests for older blocks fetch from peers (verified against the header) |
 | **Transaction index** (2,048 blocks, ~7 h) | `eth_getTransactionByHash` / `eth_getTransactionReceipt` find transactions from the last ~7 hours | older transactions aren't found (skim keeps no on-disk transaction index) |
-| **`--history local`** | logs and block streams back to Glamsterdam, and matches stored on disk so they outlive peers' history expiry | disk (140 MB on the deployment measured), not memory |
+| **`--history local`** | linked post-fork headers and fetched matching logs on disk, so covered queries can outlive peer receipt retention | disk (140 MB measured) plus a 16 MiB database page-cache budget; unfetched coverage still needs peers |
 
 The block-cache and index sizes are compile-time constants today; `skim_status.memory` shows what they hold.
+
+The call cache checks its triggers before insertion. A single large result can push estimated bytes over 32 MiB; the next insertion clears it. Cached values include the result/revert and a list of read addresses, not a list of every storage key. Restarts clear this cache, so aggregate call counts across a soak are not simultaneous cache occupancy.
 
 ### Network
 
@@ -57,7 +59,7 @@ The block-cache and index sizes are compile-time constants today; `skim_status.m
 
 - **Small machine (512 MB-1 GB):** `--window 32`, subscriptions only for what you read every block, defaults otherwise. Expect cold reads to wait on peers.
 - **Lowest latency for a known workload:** subscribe what your calls read (the dashboard's "Addresses your calls read" lists what isn't pinned yet, with a ready-made `skim.yaml` block), keep the default window and call cache. Subscribed state is small next to the block caches (about 100 bytes per key plus a version per change within the window): watch `state.versions` in `skim_status.memory` as you add keys.
-- **History and an indexer:** `--history local` costs disk, not memory. Run the indexer on the same machine so its block stream stays local.
+- **History and an indexer:** `--history local` stores headers and fetched matching logs on disk with a bounded 16 MiB page cache. Run the indexer on the same machine so its block stream stays local.
 - **A deployment that must restart fast:** keep `--data-dir`, and subscribe rather than rely on on-demand keys. A key that's new after a restart, and not in a recent BAL, needs a SNAP peer, and those can take minutes to appear.
 
 ## Defaults, and why
@@ -71,8 +73,8 @@ Each default below records what was chosen, the evidence, and what was turned do
 | **Allocator tuning** | none besides huge pages | eager arena commit off plus purge delay 0: no change (241 against 238-251 MB at 20 min) | |
 | **`--window`** | 256 blocks | covers about 51 minutes of reads and reorgs; its recent-BAL writes are ~19.5 MB when full | 32 for everyone: halves head-only RSS, but reads at older recent blocks then need a fetch or the archive |
 | **Startup BAL seeding** | the last 32 blocks before the first applied one | a key subscribed at restart for an account that just transacted resolved without SNAP; 31 blocks load in 1.7-3.7 s. The whole 256-block window took 32 MB of payloads to fetch and parse at once (RSS 245 MB within 5 min) | the full window |
-| **Call result cache** | 20,000 entries and 32 MiB, cleared when either is reached | entries are keyed by block hash, so only recent blocks' entries are ever hit; the count alone didn't bound bytes (results vary in size) | no cache: repeat calls re-execute; an entry-count-only bound |
-| **EL peer limits** | 40 outbound + 15 inbound | skim reached 30-42 sessions; reth's full-node defaults (100 + 30) leave per-session memory unbounded in practice | reth's defaults; a tighter cap risks fewer SNAP peers, which is what slow restarts waited for |
+| **Call result cache** | 20,000 entries or estimated 32 MiB trigger a clear before the next insertion; a single result can overshoot | entries are keyed by block hash; the count alone didn't bound variable-size results | no cache: repeat calls re-execute; an entry-count-only bound |
+| **EL peer limits** | 40 outbound + 15 inbound | skim reached 30-42 sessions; reth's larger defaults (100 + 30) permit more session buffers and peer state | reth's defaults; a tighter cap risks fewer SNAP peers, which is what slow restarts waited for |
 | **Fetch order** | completion order (each account's code requested as soon as the account arrives) | no measurable latency difference from the older wave order on 40 cold calls (peer variance dominated, 6-53 s); about 15% more code requests | the wave order; batching codes that arrive close together, if code requests start to matter |
 | **Block caches and transaction index** | 128 / 64 / 32 blocks; transaction index 2,048 | not tuned yet: the per-structure counters now measure what each costs | shortening the transaction index, which would make older transaction lookups fail |
 | **Peer history and dashboard tables** | bounded: 4,096 peer records, 1,024 dial cooldowns, 65,536 seen nodes, unknown RPC methods counted as `other` | each grew with every peer seen or every distinct method name (review findings) | unbounded |

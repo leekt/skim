@@ -7,7 +7,7 @@ Four ways to read Ethereum without taking a third party's word for it:
 - **A full node** (an execution client such as geth, reth or Nethermind, plus a consensus client such as Lighthouse): it downloads and executes every block itself and holds the whole current state, plus recent states (pruned).
 - **An archive node:** a full node that also keeps every historical state, so any account or slot can be read at any past block.
 
-All four verify what they serve. A full or archive node goes furthest: it re-executes every block itself rather than checking proofs or commitments.
+The verification scopes differ. skim always checks fetched state proofs and block commitments; its default `latest` follows optimistic gossip, while `safe`, `finalized` and `--require-verified` need a bootstrapped light client and usable signed updates. A full or archive node also re-executes every block. See [trust and correctness](trust-and-correctness.md).
 
 **Where the numbers come from:**
 - **skim:** measured (the [M7 experiment log](../experiments/m7-gates-and-acquisition.md), [hardware requirements](hardware.md)).
@@ -17,7 +17,7 @@ All four verify what they serve. A full or archive node goes furthest: it re-exe
 
 Use them as orders of magnitude, and measure your own workload.
 
-**Networks today:** skim needs Glamsterdam (BALs, eth/71, payload envelopes), so it runs on **Sepolia only** until mainnet forks. Helios and full or archive nodes run on mainnet and the testnets now (Helios also on OP Stack chains and Linea).
+**Network scope:** skim needs Glamsterdam (BALs, eth/71, Gloas payload envelopes). Sepolia is built in; `skim run --network <dir>` also accepts compatible configured networks using the `mainnet` or `minimal` consensus preset, with a minimal-preset devnet verified end to end. A preset is not a built-in mainnet configuration. See [network configuration](configuration.md#networks). Helios and full/archive clients have their own supported-network lists; the comparisons below use the cited versions and measurements.
 
 ## At a glance
 
@@ -26,7 +26,7 @@ Use them as orders of magnitude, and measure your own workload.
 | Who serves data | your provider and a beacon light-client endpoint | Ethereum peers | itself | itself |
 | Request cost | per request: an access list plus a proof per account for each `eth_call` | none | none | none |
 | CPU | low | 0.25-0.5 core | 4 cores recommended (geth); Nethermind ran ~8.5 cores of background load on Sepolia here | similar, more during sync |
-| Memory | small | ~100-180 MB | 8-16 GB+ | 16 GB+ |
+| Memory | small | short macOS soaks ~100 MB median; Linux 179 MB at 26 min, 276 MB at 3 h with an indexer | 8-16 GB+ | 16 GB+ |
 | Disk | none | ~1 MB head-only; ~140 MB with `--history local` | Sepolia: 345 GB measured (332 EL + 13 CL). Mainnet: 1.2 TB+ (reth), 650 GB+ growing ~14 GB/week (geth), 2 TB SSD recommended | mainnet: 2.8 TB+ (reth); 12 TB+ for geth's full archive |
 | Bandwidth | proportional to requests | ~0.3 MB/s in, ~0.1 MB/s out, steady | 24-25 Mbit/s+ recommended; the whole chain on first sync | the same |
 | Startup | seconds (from a checkpoint) | following in ~15 s; new keys wait on peers | sync: hours to days | longer (all history) |
@@ -48,7 +48,7 @@ Use them as orders of magnitude, and measure your own workload.
 
 **skim:** no per-request cost; a small machine and its bandwidth.
 - **Machine:** 1 core / 512 MB for skim alone; 2 cores / 2 GB with an indexer and Grafana ([hardware](hardware.md)).
-- **Traffic:** ~33 GB/day (in and out), steady, whatever the call volume.
+- **Traffic:** the measured background traffic was ~33 GB/day (in and out). Additional cold reads, scans and serving traffic can increase it.
 
 **Full node:** no per-request cost; a much bigger machine.
 - **Machine:** 4+ cores, 16 GB RAM and a 2 TB NVMe SSD for mainnet (geth's recommendation, consensus client included), or 1.2 TB+ and 8 GB+ (reth). Fast storage matters: slow SSDs and HDDs struggle to keep up.
@@ -67,7 +67,7 @@ Use them as orders of magnitude, and measure your own workload.
 | | Helios | skim | Full node | Archive node |
 |---|---|---|---|---|
 | CPU | per request (proof checks, local execution) | 0.25-0.5 core steady (verifying blocks, keeping subscribed state current, serving peers); bursts during catch-up | executes every block; several cores, heavy during sync | the same, more during sync |
-| Memory | small | ~100 MB (`--window 32`) to ~180 MB (default window, Linux); `skim_status.memory` shows what each structure holds | 8-16 GB+ (more helps caching under RPC load) | 16 GB+ |
+| Memory | small | workload/uptime dependent: ~100 MB median in short macOS soaks, up to 276 MB over a measured 3 h Linux run; counters explain part of RSS | 8-16 GB+ (more helps caching under RPC load) | 16 GB+ |
 | Bandwidth | proofs per request plus sync-committee updates | ~0.3 MB/s in, ~0.1 MB/s out | 24-25 Mbit/s+; the whole chain first, then block and transaction gossip | the same |
 | Storage | none | restart snapshot ~1 MB; history ~140 MB on Sepolia | Sepolia 345 GB; mainnet 650 GB-2 TB, NVMe | mainnet 2.8-12 TB+, NVMe |
 
@@ -103,7 +103,7 @@ Use them as orders of magnitude, and measure your own workload.
 
 **Maturity:**
 - **Helios:** its README notes it hasn't been audited.
-- **skim:** experimental, Sepolia-only.
+- **skim:** experimental; Sepolia plus configured Glamsterdam networks, including a verified minimal-preset devnet. Public-peer verification and data availability must be checked per deployment.
 - **Full and archive nodes:** the mature, battle-tested option.
 
 ## Wallet or user, or app developer

@@ -1,7 +1,7 @@
 # Troubleshooting
 
 ### Slow first calls, or `-32002` "no SNAP state peers connected"
-SNAP-serving EL peers take **1–4 minutes** to connect on public Sepolia after a cold start. Consensus gossip makes the head ready within seconds, so skim already answers from subscribed state.
+SNAP-serving EL peers have taken **1–4 minutes** to connect on public Sepolia after a cold start. Consensus gossip can make the head state-ready within seconds, but subscriptions can still be missing keys; a ready head does not mean all subscribed state has been fetched.
 
 State skim hasn't seen comes only from SNAP peers: gossip carries each block's writes, not untouched state. A request that needs such state **waits for a SNAP peer** (up to `--state-wait`, default 60 s), then fetches and answers. It fails with this error only if no peer arrives in time.
 
@@ -30,6 +30,15 @@ skim isn't receiving consensus gossip. Check:
 - **Outbound UDP and TCP to the CL port range.** Some networks block discv5 (UDP).
 - **The clock.** Gossip validation is slot-based, so a skewed clock drops messages.
 - **Two skims on the same ports.** Pass a different `--cl-port`/`--el-port` per instance.
+- **Custom networks:** check the config/genesis and bootnodes selected by `--network`. Peers must match the Gloas/blob-parameter fork digest. Discovery accepts QUIC peers as well as TCP; TCP requires yamux. Use `--cl-peer` to add a known peer directly. See [network configuration](configuration.md#networks) and the [devnet walkthrough](../../devnet/README.md).
+
+### `safe`, `finalized` or `--require-verified` stays unavailable
+
+Inspect `skim_status.light_client`: `trusted_from`, `period`, `verified_block`, `finalized_block`, `updates_rejected` and `last_error`. The default checkpoint URL exists only for built-in Sepolia. Other networks need an explicit `--checkpoint`, a saved verified finalized root, or a reachable `--checkpoint-url`. The checkpoint must belong to that network and peers must serve compatible light-client data. Default gossip following can work while bootstrap fails; `--require-verified` keeps `latest` unavailable until an authenticated selected-chain block exists.
+
+### Memory rises after startup
+
+Compare RSS with `skim_status.memory.parts` or the Grafana retained-data panel. Block caches and the state window fill within about an hour on Sepolia; transaction indexes can fill for ~7 hours and headers for ~27. Counts, estimated payload bytes and reported capacities have different meanings, and peer buffer sizes/allocator slack are not fully counted. The [three-hour measurements](hardware.md#memory) still leave unexplained RSS growth. A rising RSS alone cannot identify a leak; note the process uptime and cache occupancy when reporting it.
 
 ### Every cold call takes seconds
 Fetches go through whichever peers are connected. With 1–2 peers, a wide fetch (hundreds of keys, e.g. a very large swap's tick range) queues on them. Remedies, in order:
@@ -52,6 +61,6 @@ Some tools call methods skim doesn't serve, such as filters (`eth_newFilter`) or
 
 ### Collecting a useful report
 ```bash
-RUST_LOG=info,skim::rpc=debug,skim::chaindata=debug skim run --config skim.yaml 2> skim.log
+RUST_LOG=info,skim::rpc=debug,skim_chain::chaindata=debug skim run --config skim.yaml 2> skim.log
 ```
 `eth_call fetches` lines show predicted keys, rounds and wall time per call. `SNAP answers rejected by verification` counts proofs that failed (expected to stay at 0 or near it).

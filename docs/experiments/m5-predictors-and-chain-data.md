@@ -1,5 +1,7 @@
 # M5: generalized learned sets, the V3 predictor in `skim run`, transactions, receipts and logs
 
+> Historical experiment record. Measurements, commands and implementation details below describe the builds tested, not necessarily the current release. For current behavior, see the [configuration](../guide/configuration.md), [RPC reference](../guide/json-rpc.md) and [architecture](../../PROJECT.md).
+
 Runs: 2026-10-15, Sepolia, one home connection, public peers.
 
 ## 1. Learned sets: a pattern tier, with bounds

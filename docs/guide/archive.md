@@ -15,6 +15,7 @@ state:
       retention: { mode: archive }
 ```
 ```bash
+mkdir -p data
 skim run --config skim.yaml --archive data/my-app.redb --archive-backfill 1000
 ```
 
@@ -37,7 +38,9 @@ A historical `eth_call` runs entirely on archived keys, with that block's header
 - **A key not written anywhere in that range:** its value was the same for the whole range, because a BAL lists every write. It is covered from the start of the range.
 - **A key written in the range:** it is covered from its **first write** onward. The value *before* that write appears in no BAL, so skim can't know it and refuses (`-32002`) rather than guess.
 
-The limit is BAL retention (~2 weeks, ≈100k blocks). Each scanned block costs one BAL download, so start with a few thousand blocks. Verified live: 300 blocks backfilled, 102 historical reads matched Infura, 3 were correctly refused, 0 were wrong.
+Backfill depends on a complete verified chain of headers and BALs still served by peers. At Sepolia's 12 s slots, roughly two weeks is on the order of 100k blocks; other networks have different slot durations. `--archive-backfill N` is a target, not a guarantee or an automatic clamp to the fork/retention boundary. Unavailable ranges can keep retrying. Start with a few thousand blocks. Verified live: 300 blocks backfilled, 102 historical reads matched Infura, 3 were correctly refused, 0 were wrong.
+
+Inspect the per-address coverage-start summary with `skim_archiveCoverage([address])`. It reports `key`, `from` and `starts_at_write`; it does not enumerate every segment or healed gap. A successful historical read still requires coverage at that exact block. `--history local` stores headers and log matches separately and does not replace the selective state archive.
 
 ## What's covered, exactly
 | Read at block B of key K | Answer |

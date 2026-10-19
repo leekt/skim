@@ -1,5 +1,7 @@
 # M1: BAL state follower, end to end (`skim follow`)
 
+> Historical experiment record. Measurements, commands and implementation details below describe the builds tested, not necessarily the current release. For current behavior, see the [configuration](../guide/configuration.md), [RPC reference](../guide/json-rpc.md) and [architecture](../../PROJECT.md).
+
 Runs on 2026-10-15 (KST), same home connection (Korea). Each run followed 100 consecutive Sepolia blocks after bootstrap. Raw data is in `data/follow-1.*` and `data/follow-2.*`; numbers below are from run 2.
 
 ## Pipeline

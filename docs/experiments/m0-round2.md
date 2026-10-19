@@ -1,9 +1,11 @@
 # M0 round 2: learned-set hygiene, peer-count sweep, local-peer control, CL gossip timing
 
+> Historical experiment record. Measurements, commands and implementation details below describe the builds tested, not necessarily the current release. For current behavior, see the [configuration](../guide/configuration.md), [RPC reference](../guide/json-rpc.md) and [architecture](../../PROJECT.md).
+
 Runs on 2026-10-15 (KST), same home connection as before. A local Nethermind 2.1.0 + Lighthouse v8.3.0-rc.0 node shared the same public IP for most of these runs, so it competed for per-IP peer slots. Raw data is in `data/probe-call-6.*`, `data/probe-wave-1.*`, `data/probe-call-local.*`, `data/cl-sse-lag.jsonl` and `data/node/lighthouse.log`.
 
 ## 1. Learned-set hygiene (`probe-call-6`)
-Policy (`skim-cli/src/learned.rs`):
+Policy (then `skim-cli/src/learned.rs`; the current implementation is in [`skim-sim/src/learned.rs`](../../crates/skim-sim/src/learned.rs)):
 - **exact:** the last access set for identical calldata
 - **core:** for a new input of a known shape, keys seen in ≥ 50% of the shape's last 8 runs, capped at 256
 

@@ -1,5 +1,7 @@
 # M0 Spike B: EL P2P feasibility (first results)
 
+> Historical experiment record. Measurements, commands and implementation details below describe the builds tested, not necessarily the current release. For current behavior, see the [configuration](../guide/configuration.md), [RPC reference](../guide/json-rpc.md) and [architecture](../../PROJECT.md).
+
 Runs: 2026-10-14, about 30 minutes in total. Run from one home connection (Korea). Command: `skim probe-el` (reth v2.7.0 networking, eth/71 + snap/2 client, DNS and discv4 discovery). Raw samples are in `data/probe-el-*.jsonl`.
 
 **Self-check:** the EIP-2935 history contract stores the parent hash of block n in slot `(n-1) % 8191`. Every value read from a BAL or from SNAP was compared against `header(n).parent_hash`, so no reference node was needed.

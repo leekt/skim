@@ -1,5 +1,7 @@
 # M0 Spike C: cold-call economics vs Infura (first results)
 
+> Historical experiment record. Measurements, commands and implementation details below describe the builds tested, not necessarily the current release. For current behavior, see the [configuration](../guide/configuration.md), [RPC reference](../guide/json-rpc.md) and [architecture](../../PROJECT.md).
+
 Run: 2026-10-14, from the same home connection as Spike B (Korea). Command: `skim probe-call`. skim and Infura are compared on the same calldata at the same block (`eth_call` with EIP-1898 `{blockHash}`). Raw data is in `data/probe-call-*.json|log`.
 
 ## Method

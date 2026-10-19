@@ -1,5 +1,7 @@
 # M0 Spike A: skim's own CL gossip listener (`skim probe-cl`)
 
+> Historical experiment record. Measurements, commands and implementation details below describe the builds tested, not necessarily the current release. For current behavior, see the [configuration](../guide/configuration.md), [RPC reference](../guide/json-rpc.md) and [architecture](../../PROJECT.md).
+
 Runs on 2026-10-15 (KST) from the same home connection as round 2, with the local Lighthouse v8.3.0-rc.0 + Nethermind node running alongside (same public IP). Sepolia is on Glamsterdam (Gloas fork digest `0x669e6c11`).
 
 Raw data:

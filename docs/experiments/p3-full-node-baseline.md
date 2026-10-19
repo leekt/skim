@@ -1,5 +1,7 @@
 # P3: skim and a full node, same workload, same block hashes
 
+> Historical experiment record. Measurements, commands and implementation details below describe the builds tested, not necessarily the current release. For current behavior, see the [configuration](../guide/configuration.md), [RPC reference](../guide/json-rpc.md) and [architecture](../../PROJECT.md).
+
 Run on 2026-10-15 (KST), Sepolia, one machine (Apple Silicon, home connection).
 - **Full node:** Nethermind 2.1.0 (full, not archive) with Lighthouse, synced before the run.
 - **skim:** `skim run --config examples/uniswap-v3/skim.yaml`, excluding the local Nethermind as a SNAP peer, so every state fetch went to public peers.

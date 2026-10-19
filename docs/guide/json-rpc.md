@@ -2,6 +2,8 @@
 
 skim serves standard Ethereum JSON-RPC over HTTP and WebSocket on the same address (`--rpc`, default `127.0.0.1:8545`; `ws://` for WebSocket), with single and batch requests. Unmodified viem, ethers, web3.py and Foundry (`cast`, `forge script --rpc-url`) work against it.
 
+`eth_chainId` and `net_version` use the execution genesis selected by `--network`. The Sepolia block numbers and contract examples below apply to the built-in network; see [network configuration](configuration.md#networks) for custom Glamsterdam chains.
+
 ## Methods
 | Method | Notes |
 |---|---|
@@ -11,7 +13,7 @@ skim serves standard Ethereum JSON-RPC over HTTP and WebSocket on the same addre
 | `debug_traceTransaction`, `debug_traceBlockByNumber`, `debug_traceBlockByHash` | Replays mined transactions with the same tracers. Each runs on its exact pre-state: the parent block's state plus the block's access-list changes before it (no earlier transaction is re-executed). Every replay must reproduce the transaction's receipt (status and gas, verified against `receiptsRoot`), or the trace is refused. For blocks inside `--window`; transactions by hash must be in blocks skim indexed. |
 | `eth_createAccessList` | geth's algorithm (iterate until the list is stable; gas is measured with the final list). |
 | `eth_getProof` | EIP-1186 proofs assembled from SNAP answers and verified against the block's state root before they're returned. Only for recent blocks, because peers serve only recent state roots. |
-| `eth_feeHistory` | Base fees (including the next block's) and gas-used ratios from headers; reward percentiles with geth's algorithm, from verified bodies and receipts. Blob fee fields are omitted (the blob-parameter schedule isn't tracked yet). |
+| `eth_feeHistory` | Base fees (including the next block's) and gas-used ratios from headers; reward percentiles with geth's algorithm, from verified bodies and receipts. Blob fee fields are omitted; the CL blob schedule used for gossip fork digests does not add these RPC fields. |
 | `eth_getBlockReceipts`, `eth_getTransactionByBlock{Number,Hash}AndIndex`, `eth_getBlockTransactionCountBy{Number,Hash}`, `eth_getUncle*` | From verified bodies and receipts; uncles are always empty. |
 | `eth_estimateGas` | Binary search on local execution, once the first run made the state local. |
 | `eth_getBalance`, `eth_getCode`, `eth_getStorageAt` | Tracked: local. Untracked: one verified fetch. |
@@ -26,8 +28,9 @@ skim serves standard Ethereum JSON-RPC over HTTP and WebSocket on the same addre
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas` | Head base fee + 1 gwei tip, and the 1 gwei tip. |
 | `skim_dashboard` | One document with peers by client (with SNAP latency), block arrival, per-method RPC latency, the addresses `eth_call` read (pinned or not, keys fetched), and a suggested `skim.yaml` block. For history, use the Prometheus metrics (`--metrics`). |
 | `skim_subscriptionStatus` | Per subscription: `ready`, `block`, `required_keys`, `missing_keys`, `missing` (up to 8 of the missing keys, named), `truncated`, `calls_ok`, `error`, `results` (for `on_block` calls). |
-| `skim_status` | Head, real store sizes (subscribed / on-demand keys, bytecode, refused admissions), peer counts, light-client status, and `served`: what skim answered for other peers, per message type, plus the range it holds. |
-| `skim_streamNext` | A block stream for app modules (indexers): follow the chain through skim instead of re-implementing catch-up, retries and reorgs. Request `{cursor, recent, fromBlock, filters, maxBlocks, waitMs}`; response `{events, cursor, nextFrom, head, finalized, logsFrom}`. Events, in order: `rewind {to}` (undo everything above `to`: the newest of your `recent` blocks still on the chain), `gap {from, to, scope, reason}` (data skim can no longer serve: `scope: "logs"` when receipts expired, `"all"` when skim has no headers there), `apply {block, logs, stateChanges?, logsAvailable?}` (blocks with logs matching any filter, or, with `bal: {addresses}`, changes to those accounts from the block's access list, change by change with its `block_access_index`, kind (`balance`, `nonce`, `code`, `storage`), slot and value; others are skipped, and `cursor` says how far the scan went). Logs and state changes are separate channels: a block in a logs gap still gets an `apply` for its state changes, with `logsAvailable: false`. Everything in one response (logs, state changes, `cursor`) comes from one hash-linked range of blocks continuing your cursor. With `waitMs`, a request at the head returns as soon as skim applies the next block. State changes come from BALs skim has or peers serve (recent blocks); they aren't stored by `--history local` yet. Pull-based: skim keeps no per-module state or queue. Store `cursor` in the same transaction as your index changes, and a crash re-delivers instead of skipping. `finalized` is the light client's verified finalized block, for exports that can't be undone. See [`examples/smallname`](../../examples/smallname). |
+| `skim_status` | Head, store counts (subscribed/on-demand keys, bytecode, refused admissions), peer acquisition and request counts, light-client status, history availability, serving counters, and `memory.parts`: per-structure entries, estimated retained payload bytes and reported capacity. These estimates do not account for all heap/RSS. |
+| `skim_archiveCoverage` | Parameter `[address]`; returns tracked archived keys for that address with `key`, `from` and `starts_at_write`. This is a coverage-start summary, not a full list of segment boundaries or a guarantee that every subsequent block is covered. |
+| `skim_streamNext` | A block stream for app modules (indexers): follow the chain through skim instead of re-implementing catch-up, retries and reorgs. Request `{cursor, recent, fromBlock, filters, bal, maxBlocks, waitMs}`; response `{events, cursor, nextFrom, head, finalized, logsFrom}`. Events, in order: `rewind {to}` (undo everything above `to`: the newest of your `recent` blocks still on the chain), `gap {from, to, scope, reason}` (data skim can no longer serve: `scope: "logs"` when receipts expired, `"all"` when skim has no headers there), `apply {block, logs, stateChanges?, logsAvailable?}` (blocks with logs matching any filter, or, with `bal: {addresses}`, changes to those accounts from the block's access list, change by change with its `block_access_index`, kind (`balance`, `nonce`, `code`, `storage`), slot and value; others are skipped, and `cursor` says how far the scan went). Logs and state changes are separate channels: a block in a logs gap still gets an `apply` for its state changes, with `logsAvailable: false`. Everything in one response (logs, state changes, `cursor`) comes from one hash-linked range of blocks continuing your cursor. With `waitMs`, a request at the head returns as soon as skim applies the next block. State changes come from BALs skim has or peers serve (recent blocks); they aren't stored by `--history local` yet. Pull-based: skim keeps no per-module state or queue. Store `cursor` in the same transaction as your index changes, and a crash re-delivers instead of skipping. `finalized` is the light client's verified finalized block, for exports that can't be undone. See [`examples/smallname`](../../examples/smallname). |
 
 ## WebSocket subscriptions
 Every method works over WebSocket too. In addition, `eth_subscribe` / `eth_unsubscribe` support:
@@ -43,22 +46,22 @@ viem's `watch*` helpers use these automatically with `webSocket(...)`.
 ## Block parameters
 | Tag | Meaning |
 |---|---|
-| `latest` (or omitted) | The latest state-ready block. Pinned for a whole batch request. |
+| `latest` (or omitted) | The latest state-ready block; with `--require-verified`, the highest signed block available on the selected chain. Pinned for a whole batch request. |
 | a number, or `{blockNumber}` / `{blockHash}` (EIP-1898) | Inside the in-memory window: any block, for keys tracked at that block. Older: archived subscriptions only ([archive](archive.md)). |
 | `pending` | The latest state (skim keeps no mempool), except for `eth_getTransactionCount`. |
 | `safe` | The highest execution block a 2/3 supermajority of the sync committee signed off on (light client). `-32002` until verified. |
 | `finalized` | The execution block of the latest finalized beacon block skim verified. `-32002` until verified. |
 | `earliest` | Not tracked: `-32002`. |
 
-**Light-client status:** consensus clients on Sepolia don't serve Gloas light-client data yet, so `safe` and `finalized` currently answer `-32002`. `skim_status.light_client` shows the state.
+**Light-client status:** bootstrap and usable signed updates are required. `safe` and `finalized` return `-32002` until the corresponding execution hash is verified and available on the selected chain. The path has been verified on a minimal-preset devnet; earlier public Sepolia runs encountered missing light-client data. Check `skim_status.light_client` for the current node's result rather than assuming all peers serve it. See [trust and correctness](trust-and-correctness.md).
 
 ## Errors
 | Code | When |
 |---|---|
 | `-32002` | Resource unavailable: no peer could serve the state, receipts or headers right now, or the block is outside the window and not archived. **skim never substitutes a guess**, so retrying later is safe. |
-| `-32004` | Not supported: `eth_sendTransaction` (skim holds no keys; sign in your client), filters and subscriptions. |
+| `-32004` | Explicit unsupported methods: `eth_sendTransaction` (skim holds no keys; sign in your client), `eth_newFilter`, `eth_getFilterChanges`, and `eth_subscribe` over HTTP. WebSocket subscriptions are supported; other unknown methods return `-32601`. |
 | `-32005` | `eth_getLogs` range larger than `--max-logs-range`. |
-| `-32004` | History before Glamsterdam (`eth_getLogs` below the fork block): not served. |
+| `-32004` | History below the discovered Glamsterdam fork floor. Missing state outside retained/archived coverage instead returns `-32002`. |
 | `-32000` | Transaction rejected (`nonce too low`, `insufficient funds…`, invalid signature, wrong chain id), or EVM halt. |
 | `3` | Execution reverted. `data` carries the revert bytes, so viem/ethers decode custom errors as usual. |
 | `-32602` / `-32601` | Bad params / unknown method. |

@@ -1,5 +1,7 @@
 # M0 soak: 250 blocks of steady-state hinted calls on public peers
 
+> Historical experiment record. Measurements, commands and implementation details below describe the builds tested, not necessarily the current release. For current behavior, see the [configuration](../guide/configuration.md), [RPC reference](../guide/json-rpc.md) and [architecture](../../PROJECT.md).
+
 Run on 2026-10-15 (KST), `skim probe-call --soak --iterations 250 --infura-repeats 0 --min-snap-peers 2`. It ran for about 70 minutes, using public Sepolia peers only. The local node was running but never joined the pool. Raw data is in `data/soak-1.*`.
 
 For each new head, the 7 calls run **hinted** from a fresh state cache:

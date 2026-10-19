@@ -2,6 +2,8 @@
 
 Find the row closest to what your app does, then read its section: what to configure, what to expect, and example apps. Most apps combine two or three of these. Latency and memory figures are measured on Sepolia unless marked otherwise; [memory and latency](memory-and-latency.md) explains the trade-offs behind them, and [hardware requirements](hardware.md) the footprint.
 
+`skim run` also accepts configured Glamsterdam networks and both consensus presets ([networks](configuration.md#networks)); the bundled contract addresses and ~12 s/block timing estimates here are Sepolia-specific. Default `latest` is optimistic; use verified tags or `--require-verified` for consensus-authenticated reads ([trust](trust-and-correctness.md)).
+
 | Your app needs | Set up | Expect |
 |---|---|---|
 | [Latest state of a few contracts](#1-latest-state-of-a-few-contracts) | `account` / `storage` subscriptions | reads in ms, current ~0.9 s after each slot |
@@ -13,7 +15,7 @@ Find the row closest to what your app does, then read its section: what to confi
 | [React to state changes](#7-react-to-state-changes) | `skim_streamNext` with `bal`, or WebSocket subscriptions | every change, per transaction, each block |
 | [Send transactions and track them](#8-send-transactions-and-track-them) | `eth_sendRawTransaction` | gossiped to peers; receipts for ~7 h of blocks |
 | [Simulate and trace](#9-simulate-and-trace) | the state your transactions touch, subscribed | `eth_call` / `debug_traceCall` / `eth_estimateGas` in ms on warm state |
-| [Run on a small machine](#10-run-on-a-small-machine) | `--window 32`, few subscriptions | ~100 MB RSS |
+| [Run on a small machine](#10-run-on-a-small-machine) | `--window 32`, few subscriptions | short macOS soaks measured ~100 MB median; long-run RSS can grow |
 | [Not served (yet)](#what-skim-doesnt-serve) | another tool | history before the fork, mainnet until it forks, whole-chain analytics, the mempool |
 
 ## 1. Latest state of a few contracts
@@ -85,7 +87,7 @@ Read results from `skim_subscriptionStatus`, or get them pushed over WebSocket w
 
 **Expect:**
 - **Warm:** the first read fetches over SNAP with proofs, and verified values are cached for `cache_ttl_blocks`, so repeats answer in milliseconds.
-- **Cold:** seconds. With no SNAP peer connected (common right after start), `-32002`; retry, or answer from a provider meanwhile.
+- **Cold:** seconds. With no SNAP peer connected (common right after start), requests wait up to `--state-wait` (60 s by default), then return `-32002` if none arrives. A client may time out sooner. A provider fallback, if desired, belongs in your app; skim does not use one.
 - 40 warm calls in one batch took 34-58 ms.
 
 **Examples:** a wallet backend showing balances of arbitrary tokens, a block explorer's "read contract" tab, a generic contract UI.
@@ -126,7 +128,7 @@ skim run --config skim.yaml --archive data/my-app.redb --archive-backfill 1000
 - Reads at any block since the key was subscribed, from disk.
 - `--archive-backfill N` extends coverage up to ~2 weeks back (BAL retention). A key written within the backfilled range is covered from its first write. The value before that is unknowable from BALs, so it's refused, never guessed.
 - Gaps after a restart are healed from peers' BALs.
-- `skim_archiveCoverage` tells you where coverage starts.
+- `skim_archiveCoverage([address])` summarizes where each archived key's coverage starts; it does not enumerate later gaps or release boundaries.
 
 **Examples:** treasury accounting (balances at each month's end), TWAP or volume over your own pools, historical quotes for backtesting, proof-of-reserves snapshots.
 
@@ -192,8 +194,8 @@ skim run --config skim.yaml --archive data/my-app.redb --archive-backfill 1000
 **Limits:** reads at older recent blocks and deep reorgs need a fetch (or the archive). Cold reads still depend on peers.
 
 ## What skim doesn't serve
-- **History before Glamsterdam:** logs and state before the fork aren't served (`-32004`). Use an archive node or an indexer for genesis-to-now history.
-- **Mainnet, until Glamsterdam:** skim depends on BALs and the new protocols, so it runs on Sepolia only for now.
+- **History before Glamsterdam:** logs below the known fork floor return `-32004`; missing historical state returns `-32002`. Use an archive node or an indexer for genesis-to-now history.
+- **Pre-Glamsterdam networks:** skim needs BALs and Gloas payload envelopes. Sepolia is built in; other compatible networks use `--network <dir>`. There is no built-in `--network mainnet` shortcut.
 - **Whole-chain analytics:** skim keeps what you use, not the chain. Queries across every contract and every block need a full or archive node and a data warehouse.
 - **The mempool:** pending transactions aren't followed.
 - **Old transactions by hash:** only the last ~7 h of blocks are indexed in memory.

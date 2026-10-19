@@ -12,17 +12,24 @@ skim is built so that it can be **slow or unavailable, but not wrong** about the
 | Receipts | Rebuild `receiptsRoot` |
 | Bodies (older transactions) | Rebuild `transactionsRoot` |
 | Headers before skim started | Hash-linked to a known header |
+| Light-client bootstrap and updates | Trusted checkpoint root; sync-committee Merkle branches and BLS signatures, with committee size and period from the configured preset |
 
 ## Two different guarantees
 | Guarantee | Status |
 |---|---|
 | **A value matches the block it claims to be from** (state root, receipts root, block hash) | Checked, for every value skim serves |
-| **That block is on the canonical chain** | Implemented through the consensus light client (sync-committee signatures, served as `safe` / `finalized`), but **not active yet**: Sepolia's consensus clients don't serve Gloas light-client data. Until they do, skim trusts the gossiped head. |
+| **Consensus authentication of the selected block** | `safe` and `finalized` resolve only verified execution hashes on skim's selected chain. `--require-verified` also requires the signed block for `latest`. The light client must have bootstrapped and received usable updates. |
 
-A Merkle proof shows that a value belongs to a root. It doesn't show that the root belongs to the right chain. Until consensus verification lands, a network that feeds skim a well-formed but non-canonical block can make it serve that block's (correctly proven) state.
+A Merkle proof shows that a value belongs to a root. It doesn't show that the root belongs to the right chain. Default `latest` is the newest state-ready gossiped block, so it can be served before consensus authentication. Use `safe`, `finalized`, or `--require-verified` when that distinction matters; these return `-32002` until the relevant verified block is available on the selected chain.
+
+## Bootstrap and availability
+
+The checkpoint source is, in order: `--checkpoint`, the last verified finalized root saved in the data dir, or `--checkpoint-url`. Sepolia has a default checkpoint-sync URL; a custom network needs an explicit or saved root, or its own URL. The starting root is a trusted weak-subjectivity checkpoint. State and light-client updates are then fetched over P2P and checked; there is no external Ethereum JSON-RPC fallback for state reads.
+
+The light client supports both `mainnet` and `minimal` consensus presets and catches up across committee periods. End-to-end bootstrap, updates and rotation have been verified on the [minimal-preset devnet](../../devnet/README.md). Earlier Sepolia runs encountered unavailable Gloas light-client data; this is a peer-availability observation, not a permanent network restriction. `skim_status.light_client` reports `period`, `verified_block`, `finalized_block`, accepted/rejected updates, checkpoint provenance and `last_error`.
 
 ## What skim does not verify (yet)
-- **Consensus.** skim trusts that the gossiped head is the canonical chain. Proof-of-stake fork choice, finality and BLS signatures are not checked, as in an optimistic light client. A consensus light-client sync is on the roadmap.
+- **Full validator consensus and fork choice.** skim uses a sync-committee light client rather than validating every proposer/attestation and running a full consensus client. Default `latest` remains optimistic; authenticated tags require verified updates and a matching selected-chain block.
 - **Execution of the block itself.** skim takes the BAL's post-values as given, because they are committed by the block hash. A block that is valid by hash but whose BAL disagrees with its own execution would be invalid under consensus, and is out of scope here.
 
 ## Rules that hold everywhere
@@ -32,7 +39,7 @@ A Merkle proof shows that a value belongs to a root. It doesn't show that the ro
 4. **Errors instead of guesses.** If a read can't be proven, the RPC answers `-32002`.
 
 ## How it was tested
-Every claim above was measured on Sepolia against Infura at the same block hashes. See [`docs/experiments`](../experiments):
+State and RPC behavior were compared on Sepolia against reference nodes at the same block hashes. Consensus verification also has unit tests for both presets and the devnet check above. See [`docs/experiments`](../experiments):
 
 | Experiment | Result |
 |---|---|

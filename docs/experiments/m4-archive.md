@@ -1,5 +1,7 @@
 # M4: selective state archiving (first results)
 
+> Historical experiment record. Measurements, commands and implementation details below describe the builds tested, not necessarily the current release. For current behavior, see the [configuration](../guide/configuration.md), [RPC reference](../guide/json-rpc.md) and [architecture](../../PROJECT.md).
+
 Run on 2026-10-15 (KST): `skim run --window 16 --archive … --config data/m4/skim.archive-test.yaml` on public Sepolia peers. Two archived subscriptions:
 - a Uniswap V3 pool (account + slots 0, 1, 2, 4)
 - a QuoterV2 call, whose learned access set (39 keys) is archived

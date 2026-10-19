@@ -6,7 +6,7 @@
 2. [What to set up for your app](guide/use-cases.md): choose subscriptions, on-demand reads, history and simulations for your workload
 3. [Getting started](guide/getting-started.md): build, run, first call, subscriptions
 4. [How skim works](guide/how-it-works.md): BALs, verified fetches, subscriptions, prediction
-5. [Configuration reference](guide/configuration.md): `skim.yaml` and `skim run` flags
+5. [Configuration reference](guide/configuration.md): `skim.yaml`, `skim run` flags, configured Glamsterdam networks and consensus presets
 6. [JSON-RPC reference](guide/json-rpc.md): methods, block tags, subscriptions, block streams, errors
 7. [Archiving history for your state](guide/archive.md): `retention: archive`, backfill
 8. [Hardware requirements](guide/hardware.md): measured CPU, memory, disk and bandwidth; machine sizing
@@ -18,11 +18,13 @@
 
 **Monitoring:** [Prometheus and Grafana setup](../metrics/README.md)
 
-**Design:** [PROJECT.md](../PROJECT.md)
+**Network testing:** [Devnet walkthrough](../devnet/README.md), including the minimal preset and a differential check against its EL node
+
+**Development:** [Implemented architecture](../PROJECT.md), [contributor handoff](HANDOFF.md), [open work](TODO.md) and [fuzzing](../fuzz/README.md)
 
 ## Experiment logs
 
-Every result in the README comes from one of these runs, on Sepolia over public peers.
+These are historical measurements of the builds and workloads named in each log, primarily on Sepolia over public peers. Old commands, APIs and limitations belong to those runs; use the guides above and `skim run --help` for current behavior. The devnet's results are recorded separately in its walkthrough, and the later production memory curve is in [hardware requirements](guide/hardware.md#memory).
 
 | Doc | What was measured |
 |---|---|

@@ -1,6 +1,8 @@
 # M7: regression gates, a stricter soak, and peer acquisition
 
-Runs: 2026-10-17 (KST), Sepolia.
+> Historical experiment record. Measurements, commands and implementation details below describe the builds tested, not necessarily the current release. For current behavior, see the [configuration](../guide/configuration.md), [RPC reference](../guide/json-rpc.md) and [architecture](../../PROJECT.md).
+
+Runs and follow-ups: 2026-10-17–19 (KST), Sepolia.
 
 Order of work, as agreed after the fourth review:
 1. close the known correctness findings with deterministic regression tests, in CI
@@ -290,3 +292,16 @@ All 7 succeeded with the fix. When no EL peer serves headers at all, which can l
 - **Key limit:** never exceeded; subscribed keys peaked at 55 of 60. The archive keys reloaded at each start no longer take slots. The 64-block release still never elapsed between restarts, and doesn't need to.
 - **Freshness:** stale 0.0%; longest gap between heads 24.7 s. **RSS max:** 168 MB.
 - **Answers: mostly unchecked.** The reference node was rate-limiting this account (HTTP 429), so only 1,977 answers could be compared: 0 wrong, 2 refused. 7,433 were unavailable from the reference. The fifth soak, the same day, compared 7,294 with 0 wrong.
+
+## A live blob-parameter fork on a devnet (TODO 24)
+Devnet: `devnet/network_params.bpo.yaml` (three Nethermind + Lodestar, minimal preset, Gloas at epoch 4, a blob-parameter fork at epoch 12). skim started at epoch 6 from a finalized checkpoint, with CL peers from discovery only.
+
+| Run | Binary | What happened |
+|---|---|---|
+| 1 | `25c2d2e` (swap topics at the fork) | Digest switched at epoch 12 (48875651 to 544789fd, matching Lodestar's ENR). All three CL peers dropped about a minute later and never came back; the head stopped. |
+| 2 | `0fcf9d1` (topics overlap: next digest subscribed 2 epochs ahead, old one left 2 epochs after) | The overlap ran as planned, but the peers again dropped 60 s after the fork, 30 s *before* the old topics were left. So topic churn wasn't the cause. |
+| 3 | `162eb48` (Status carries the current digest) | Peers kept (3 of 3) through the fork and after the old topics were left; the head kept advancing (block 137+, fork at ~96); `devnet/check.py`: all match. |
+
+**Cause:** skim answered Status with the best status it had learned from peers, and that still carried the pre-fork digest. Peers re-check Status after a fork and dropped skim as being on another network. `status_to_send` stamps the digest in force (`our_status_carries_the_digest_in_force_after_a_fork`, mutation-checked). The overlap is kept: it is what the other clients do, and it avoids losing gossip at the boundary.
+
+Also fixed on the way: light-client gossip updates were size-checked with mainnet constants; they now use the network's preset.

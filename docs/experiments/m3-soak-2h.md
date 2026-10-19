@@ -1,5 +1,7 @@
 # Instrumented soak (2 h, randomized workload)
 
+> Historical experiment record. Measurements, commands and implementation details below describe the builds tested, not necessarily the current release. For current behavior, see the [configuration](../guide/configuration.md), [RPC reference](../guide/json-rpc.md) and [architecture](../../PROJECT.md).
+
 Run on 2026-10-15 (KST) with the configuration of run G: predictor, adaptive window, prefetch budget 256, 8 random V3 quotes per block across 3 fee tiers. It covered 587 blocks (#11918222–11918808) on public peers; Infura was compared every 4th block. Raw data is in `data/soak24/` (health every 10 blocks, slow-call records, per-process samples).
 
 | | Result |

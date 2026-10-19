@@ -4,13 +4,11 @@ What's known to be missing or unproven, as of 2026-10-19. Each item says what "d
 Items are removed from this file when they're done, and the commit that closes one says so.
 
 ## Networks other than Sepolia
-24. **A live blob-parameter fork while running.** skim switches its fork digest on schedule
-    (`25c2d2e`, unit-tested), but no run has crossed one yet. Done when a devnet with a
-    `BLOB_SCHEDULE` entry after Gloas is followed across it without losing peers.
 25. **TCP peers that don't take yamux.** skim offers only yamux over TCP; a client that requires
     another muxer and announces no QUIC can't be peered with (Lodestar's devnet build refuses
     yamux; it announces QUIC, so skim uses that). Done when such a peer is either supported or
     shown not to exist on the networks skim targets.
+
 ## Memory
 6. **Whether RSS levels off.** Three production hours: block caches and the window level off within
    an hour, the transaction index grows as designed until ~7 h, and the uncounted part of RSS still
@@ -19,4 +17,6 @@ Items are removed from this file when they're done, and the commit that closes o
    attributed. `memory_usage.md` (repo root, uncommitted) is a handoff on this for another agent.
 
 The last items closed: 22, restart recovery without a SNAP peer, and 23, archived call
-subscriptions growing without bound (sixth soak, M7 log).
+subscriptions growing without bound (sixth soak, M7 log); 26, diagnostic command scope:
+`run` is network-configurable and the other diagnostic workloads are explicitly Sepolia-only
+(`959adcf`).

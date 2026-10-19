@@ -1,5 +1,7 @@
 # M0: adaptive SNAP scheduler, snap/1, head advertising (results)
 
+> Historical experiment record. Measurements, commands and implementation details below describe the builds tested, not necessarily the current release. For current behavior, see the [configuration](../guide/configuration.md), [RPC reference](../guide/json-rpc.md) and [architecture](../../PROJECT.md).
+
 Runs on 2026-10-15 (KST), from the same home connection as earlier spikes. Raw data is in `data/ab-*.jsonl`, `data/snap1-check.*` and `data/probe-call-5.*`.
 
 ## 1. Head advertising (A/B, 15 min each, run concurrently)

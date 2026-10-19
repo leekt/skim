@@ -1,6 +1,8 @@
 # How skim works
 
-skim answers Ethereum JSON-RPC for **the state your app uses**, without executing or storing the chain. Four ideas make that work.
+skim answers Ethereum JSON-RPC for **the state your app uses**, without re-executing every block or storing the full chain state. It combines BAL following, verified fetches, subscriptions and local simulation.
+
+`skim run` defaults to Sepolia and accepts other Glamsterdam networks through `--network <dir>` ([configuration](configuration.md#networks)). Chain id, consensus preset, slot duration, genesis and peer discovery come from that network's configuration.
 
 ## 1. Every block tells skim what changed
 Since Glamsterdam, each block carries a **block-level access list** ([EIP-7928](https://eips.ethereum.org/EIPS/eip-7928)): every account and storage slot the block touched, with the **value after** each write. With ePBS, that list travels inside the execution payload gossiped on the consensus layer.
@@ -95,7 +97,12 @@ skim answers other peers' requests from recent data it has already verified agai
 | Contract code | memory, only for tracked accounts | per contract |
 | Headers, tx hashes, BAL addresses | memory, last 2,048–8,192 blocks | tens of MB once full (hours) |
 | Recent blocks and envelopes for serving | memory: BALs of the last 64 blocks, bodies of 128, envelopes of 64 slots | ~10–25 MB |
-| Restart snapshot | `redb` file in `--data-dir` (default `~/.skim/sepolia`): subscribed values, node key, peers | ~1 MB for 2,400 keys |
+| Restart snapshot | `restart.redb` in `--data-dir` (default `~/.skim/<network>`): subscribed values, node key, peers, verified finalized root | ~1 MB for 2,400 keys |
+| Chain-data history (optional) | `history.redb` with `--history local`: post-fork headers and fetched matching logs | grows with headers and requested log coverage |
 | Archived history (optional) | `redb` file, only for `retention: archive` subscriptions | versions only on change |
 
-Measured: ~180 MB RSS following the head on Linux with the default 256-block window, 0.25-0.5 CPU core; `--window 32` keeps it near 100 MB. What each structure holds is in `skim_status.memory`; see [hardware requirements](hardware.md). On disk: the restart snapshot (about 1 MB), plus the archive if you enable one. `--ephemeral` keeps nothing on disk.
+Measured on Sepolia: 179 MB RSS at 26 minutes on Linux, rising to 276 MB over three hours with an indexer; short macOS soaks with `--window 32` had 99–105 MB medians. These are workload-specific observations, not memory ceilings. `skim_status.memory.parts` estimates retained payloads but omits network-buffer sizes and allocator overhead; see [hardware requirements](hardware.md). `--ephemeral` disables restart persistence and rejects `--history local`; an explicit `--archive` still writes its file.
+
+## Consensus verification
+
+The light client bootstraps a sync committee from a trusted checkpoint, verifies BLS-signed updates and their Merkle branches, and follows committee rotations using the configured consensus preset. `safe` names a supermajority-signed execution block; `finalized` names a verified finalized block, each checked against the chain skim follows. `--require-verified` uses the signed block for `latest` too. Default `latest` remains the newest state-ready gossip block. Verification depends on peers serving the required light-client data; inspect `skim_status.light_client` rather than assuming it has bootstrapped. This path has been verified on the minimal-preset [devnet](../../devnet/README.md).

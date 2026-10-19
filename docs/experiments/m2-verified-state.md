@@ -1,5 +1,7 @@
 # P0: verified SNAP lookups (nothing unverified becomes state)
 
+> Historical experiment record. Measurements, commands and implementation details below describe the builds tested, not necessarily the current release. For current behavior, see the [configuration](../guide/configuration.md), [RPC reference](../guide/json-rpc.md) and [architecture](../../PROJECT.md).
+
 Commit `5d65e4a`, follow-ups `04af043`. This replaces the earlier rule, which re-asked the same peer for the account and took zero if its storage root was empty. That rule wasn't a proof: it couldn't show that a given slot is absent from a **non-empty** storage trie.
 
 ## The rule now

@@ -1,5 +1,7 @@
 # M6: correctness and bounds under restarts, reorgs and churn
 
+> Historical experiment record. Measurements, commands and implementation details below describe the builds tested, not necessarily the current release. For current behavior, see the [configuration](../guide/configuration.md), [RPC reference](../guide/json-rpc.md) and [architecture](../../PROJECT.md).
+
 Runs: 2026-10-15 (KST), Sepolia.
 
 **Goal:** after an external review, prove that long runs on small resources never return a wrong value, instead of adding RPC methods.
