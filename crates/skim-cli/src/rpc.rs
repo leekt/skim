@@ -26,7 +26,7 @@ use revm::{
 use serde_json::{Value, json};
 use skim_bal::StateKey;
 use skim_sim::{Mode, SimError, Simulator};
-use skim_state::BlockRef;
+use skim_state::{BlockRef, StateError};
 
 use crate::chaindata::{ChainData, DataError};
 
@@ -43,8 +43,13 @@ impl RpcError {
     fn new(code: i64, message: impl Into<String>) -> Self {
         Self { code, message: message.into(), data: None }
     }
+    /// `-32002` with `data: {reason, retry}`: why the request can't be answered now, and whether
+    /// asking again (shortly, unchanged) can succeed. Reasons are stable identifiers.
+    fn unavailable_because(m: impl Into<String>, reason: &'static str, retry: bool) -> Self {
+        Self { code: -32002, message: m.into(), data: Some(json!({"reason": reason, "retry": retry})) }
+    }
     fn unavailable(m: impl Into<String>) -> Self {
-        Self::new(-32002, m)
+        Self::unavailable_because(m, "unavailable", true)
     }
     fn unsupported(method: &str) -> Self {
         Self::new(-32004, format!("{method} is not supported: skim is a simulation client"))
@@ -60,7 +65,20 @@ impl From<SimError> for RpcError {
             SimError::Evm(m) => Self::new(-32000, m),
             SimError::Unsupported(m) => Self::params(format!("not supported: {m}")),
             SimError::Invalid { code, message } => Self::new(code, message),
-            other => Self::unavailable(other.to_string()),
+            other => {
+                let (reason, retry) = match &other {
+                    SimError::NoStatePeers(_) => ("no_state_peers", true),
+                    SimError::Incomplete(_) => ("state_incomplete", true),
+                    SimError::StateUnavailable(_) => ("not_held", false),
+                    SimError::NotArchived { .. } => ("not_archived", false),
+                    SimError::NoHeader(_) => ("no_header", true),
+                    SimError::State(StateError::OutOfWindow(_)) => ("outside_window", false),
+                    SimError::State(StateError::Reorged { .. }) => ("reorged", true),
+                    SimError::State(StateError::LimitReached(_)) => ("key_limit", false),
+                    _ => ("unavailable", true),
+                };
+                Self::unavailable_because(other.to_string(), reason, retry)
+            }
         }
     }
 }
@@ -250,7 +268,9 @@ pub enum WsEvent {
 impl From<DataError> for RpcError {
     fn from(e: DataError) -> Self {
         match e {
-            DataError::Unavailable(m) => Self::unavailable(m),
+            DataError::Unavailable(m) => Self::unavailable_because(m, "not_served", true),
+            DataError::Expired(m) => Self::unavailable_because(m, "outside_retention", false),
+            DataError::ChainChanged(m) => Self::unavailable_because(m, "chain_changed", true),
             DataError::Invalid(m) => Self::new(-32000, m),
             DataError::RangeTooLarge(n) => Self::new(-32005, format!("block range too large: at most {n} blocks per eth_getLogs")),
             DataError::Unsupported(m) => Self::new(-32004, m),
@@ -261,13 +281,13 @@ impl From<DataError> for RpcError {
 impl Rpc {
     fn resolve_block(&self, id: Option<BlockId>, latest: &Option<BlockRef>) -> Result<BlockRef, RpcError> {
         let store = &self.sim.store;
-        let latest = || latest.ok_or_else(|| RpcError::unavailable("not following the chain yet"));
+        let latest = || latest.ok_or_else(|| RpcError::unavailable_because("not following the chain yet", "starting", true));
         match id.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest)) {
             BlockId::Number(BlockNumberOrTag::Latest) => latest(),
             BlockId::Number(BlockNumberOrTag::Number(n)) => store
                 .block(n)
                 .or_else(|| store.archived_block(n).map(|(b, _)| b))
-                .ok_or_else(|| RpcError::unavailable(format!("block {n} is outside the retained window and not archived"))),
+                .ok_or_else(|| RpcError::unavailable_because(format!("block {n} is outside the retained window and not archived"), "outside_window", false)),
             // Pending state = latest state (skim keeps no mempool); see eth_getTransactionCount.
             BlockId::Number(BlockNumberOrTag::Pending) => latest(),
             BlockId::Number(t @ (BlockNumberOrTag::Safe | BlockNumberOrTag::Finalized)) => {
@@ -275,10 +295,10 @@ impl Rpc {
                 // beacon block's execution block. Both from the light client.
                 let st = self.light.as_ref().map(|l| l.status()).unwrap_or_default();
                 let v = if t == BlockNumberOrTag::Safe { st.verified_block } else { st.finalized_block };
-                let v = v.ok_or_else(|| RpcError::unavailable(format!("no {t} block verified yet")))?;
+                let v = v.ok_or_else(|| RpcError::unavailable_because(format!("no {t} block verified yet"), "not_verified", true))?;
                 // The verified hash, at its height: never whichever block holds that height now.
                 crate::light::resolve(store, &v).ok_or_else(|| {
-                    RpcError::unavailable(format!("{t} block {} ({}) is not on the selected chain or outside the retained window", v.number, v.hash))
+                    RpcError::unavailable_because(format!("{t} block {} ({}) is not on the selected chain or outside the retained window", v.number, v.hash), "not_verified", true)
                 })
             }
             BlockId::Number(t) => Err(RpcError::unavailable(format!("block tag {t} is not tracked yet"))),
@@ -289,7 +309,7 @@ impl Rpc {
                     .filter_map(|n| store.block(n))
                     .find(|b| b.hash == h.block_hash)
                     .or_else(|| store.archived_number(&h.block_hash).and_then(|n| store.archived_block(n)).map(|(b, _)| b))
-                    .ok_or_else(|| RpcError::unavailable(format!("block {} is not in the window or the archive", h.block_hash)))
+                    .ok_or_else(|| RpcError::unavailable_because(format!("block {} is not in the window or the archive", h.block_hash), "outside_window", false))
             }
         }
     }
@@ -301,8 +321,8 @@ impl Rpc {
     async fn replay(&self, n: u64, bh: B256, only: Option<usize>, opts: alloy_rpc_types_trace::geth::GethDebugTracingOptions) -> Result<Vec<(B256, Value)>, RpcError> {
         let store = &self.sim.store;
         let chain = self.chain()?;
-        let block = store.block(n).filter(|b| b.hash == bh).ok_or_else(|| RpcError::unavailable(format!("block {n} is outside the retained window")))?;
-        let parent = store.block(n - 1).ok_or_else(|| RpcError::unavailable(format!("parent of block {n} is outside the retained window")))?;
+        let block = store.block(n).filter(|b| b.hash == bh).ok_or_else(|| RpcError::unavailable_because(format!("block {n} is outside the retained window"), "outside_window", false))?;
+        let parent = store.block(n - 1).ok_or_else(|| RpcError::unavailable_because(format!("parent of block {n} is outside the retained window"), "outside_window", false))?;
         let header = self.sim.header_arc(&block).ok_or_else(|| RpcError::unavailable(format!("no header for block {n}")))?;
         let bal = chain.block_bal(bh, &header).await?;
         let (raw, receipts) = chain.block_txs_and_receipts(bh, &header).await?;
@@ -661,7 +681,7 @@ impl Rpc {
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt + 1))).await;
                 }
-                Err(RpcError::unavailable(format!("no peer served a proof for block {} (peers keep only recent state roots)", b.number)))
+                Err(RpcError::unavailable_because(format!("no peer served a proof for block {} (peers keep only recent state roots)", b.number), "outside_retention", false))
             }
             "eth_createAccessList" => {
                 let req: TransactionRequest = need(params, 0)?;
@@ -681,7 +701,7 @@ impl Rpc {
                 let hash: B256 = need(params, 0)?;
                 let opts: alloy_rpc_types_trace::geth::GethDebugTracingOptions = param(params, 1)?.unwrap_or_default();
                 let chain = self.chain()?;
-                let (n, bh, _, i) = chain.locate_tx(&hash).await?.ok_or_else(|| RpcError::unavailable("transaction not found in recent blocks"))?;
+                let (n, bh, _, i) = chain.locate_tx(&hash).await?.ok_or_else(|| RpcError::unavailable_because("transaction not indexed (see --tx-index)", "not_indexed", false))?;
                 Ok(self.replay(n, bh, Some(i as usize), opts).await?.into_iter().next().map(|(_, t)| t).unwrap_or(Value::Null))
             }
             "debug_traceBlockByNumber" | "debug_traceBlockByHash" => {
@@ -1311,5 +1331,18 @@ mod tests {
         let reverted: R = Err(RpcError::new(3, "execution reverted".to_string()));
         assert_eq!(method_label("eth_call", &reverted), "eth_call");
         assert_eq!(method_label("eth_blockNumber", &Ok(json!("0x1"))), "eth_blockNumber");
+    }
+
+    #[test]
+    fn unavailable_errors_say_why_and_whether_to_retry() {
+        let data = |e: RpcError| (e.code, e.data.unwrap());
+        let r = |reason: &str, retry: bool| (-32002, json!({"reason": reason, "retry": retry}));
+        assert_eq!(data(SimError::NoStatePeers(60).into()), r("no_state_peers", true));
+        assert_eq!(data(SimError::Incomplete(8).into()), r("state_incomplete", true));
+        assert_eq!(data(SimError::State(StateError::OutOfWindow(5)).into()), r("outside_window", false));
+        assert_eq!(data(SimError::NotArchived { block: 5, keys: 1 }.into()), r("not_archived", false));
+        assert_eq!(data(DataError::Expired("old".into()).into()), r("outside_retention", false));
+        assert_eq!(data(DataError::ChainChanged("reorg".into()).into()), r("chain_changed", true));
+        assert_eq!(data(DataError::Unavailable("busy".into()).into()), r("not_served", true));
     }
 }

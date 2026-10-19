@@ -147,7 +147,7 @@ pub async fn next(
             if events.is_empty() && req.cursor.is_some_and(|c| c.number == pos) {
                 (pos, anchor) = locate(&mut events)?;
             } else {
-                return Err(DataError::Unavailable("the chain reorganized during the request; retry".into()));
+                return Err(DataError::ChainChanged("the chain reorganized during the request; retry".into()));
             }
         }
     }
@@ -167,7 +167,7 @@ pub async fn next(
         if let Some(a) = anchor
             && headers.first().is_none_or(|(_, _, h)| h.parent_hash != a)
         {
-            return Err(DataError::Unavailable("the chain reorganized during the request; retry".into()));
+            return Err(DataError::ChainChanged("the chain reorganized during the request; retry".into()));
         }
         let scan = if req.filters.is_empty() { None } else { Some(chain.scan_headers(&req.filters, &headers, true).await?) };
         #[cfg(test)]
@@ -194,7 +194,7 @@ pub async fn next(
         }
         for (n, bh, h, changes) in bal {
             if hash_at.get(&n) != Some(&bh) {
-                return Err(DataError::Unavailable("the chain reorganized during the request; retry".into()));
+                return Err(DataError::ChainChanged("the chain reorganized during the request; retry".into()));
             }
             let e = applies.entry(n).or_insert_with(|| json!({"type": "apply", "block": block_json(n, bh, &h), "logs": []}));
             e["stateChanges"] = Value::Array(changes);
@@ -500,7 +500,7 @@ mod tests {
         assert_eq!(cd.logs(&f, n, n, Some(a[5])).await.unwrap().as_array().unwrap().len(), 1);
         extend(&cd, 104, 112, a[3], 0xb);
         let after = cd.logs(&f, n, n, Some(a[5])).await;
-        assert!(matches!(after, Err(DataError::Unavailable(ref m)) if m.contains("no longer on the chain")), "{after:?}");
+        assert!(matches!(after, Err(DataError::ChainChanged(ref m)) if m.contains("no longer on the chain")), "{after:?}");
     }
 
     const WATCHED: Address = Address::repeat_byte(0xba);
@@ -570,7 +570,7 @@ mod tests {
             cd2.note_bal(b[1], bal(0xb));
         }));
         let r = next(&cd, || Some(101), tokio::sync::broadcast::channel(1).1, None, req_bal(Some(id(100, a[1])), vec![id(99, a[0])], false)).await;
-        assert!(matches!(r, Err(DataError::Unavailable(_))), "{:?}", r.map(|v| v.to_string()));
+        assert!(matches!(r, Err(DataError::ChainChanged(_))), "{:?}", r.map(|v| v.to_string()));
         // Retried: rewinds to 99, then B101's changes.
         let r = next(&cd, || Some(101), tokio::sync::broadcast::channel(1).1, None, req_bal(Some(id(100, a[1])), vec![id(99, a[0])], false)).await.unwrap();
         assert_eq!(r["events"][0]["type"], "rewind", "{r}");

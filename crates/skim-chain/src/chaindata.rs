@@ -68,6 +68,10 @@ pub enum DataError {
     RangeTooLarge(u64),
     /// Outside what skim serves at all (history before Amsterdam): `-32004`.
     Unsupported(String),
+    /// Older than every connected peer still serves (history expiry): retrying won't help.
+    Expired(String),
+    /// The chain changed under a request (a reorg mid-scan): retry now.
+    ChainChanged(String),
 }
 
 /// Which transactions get a hash -> location entry (`eth_getTransactionByHash`/`Receipt`,
@@ -1493,7 +1497,7 @@ impl ChainData {
                 (Some(s), Some((mem_low, parent))) if from < mem_low => s
                     .linked_range(from, to.min(mem_low - 1), mem_low, parent)
                     .map_err(|e| DataError::Unavailable(e.to_string()))?
-                    .ok_or_else(|| DataError::Unavailable(format!("headers below {mem_low} changed (reorg); retry")))?
+                    .ok_or_else(|| DataError::ChainChanged(format!("headers below {mem_low} changed (reorg); retry")))?
                     .into_iter()
                     .map(|(hash, h)| (h.number, (hash, Arc::new(h))))
                     .collect(),
@@ -1508,7 +1512,7 @@ impl ChainData {
                 return Err(DataError::Unavailable(format!("no header for block {n}")));
             };
             if prev.is_some_and(|p| p != h.parent_hash) {
-                return Err(DataError::Unavailable(format!("chain changed at block {n} during the scan; retry")));
+                return Err(DataError::ChainChanged(format!("chain changed at block {n} during the scan; retry")));
             }
             prev = Some(bh);
             out.push((n, bh, h));
@@ -1541,7 +1545,7 @@ impl ChainData {
         if let Some(want) = at
             && headers.iter().any(|(_, bh, _)| *bh != want)
         {
-            return Err(DataError::Unavailable(format!("block {want} is no longer on the chain")));
+            return Err(DataError::ChainChanged(format!("block {want} is no longer on the chain")));
         }
         self.scan_headers(filters, &headers, persist).await
     }
@@ -1649,7 +1653,7 @@ impl ChainData {
             // as a gap; eth_getLogs refuses (what's stored was used above either way).
             if need.iter().any(|(n, _, _)| *n < peers_from) {
                 if !persist {
-                    return Err(DataError::Unavailable(format!("block {} is older than connected peers serve (earliest {peers_from}); receipts before it have expired", need[0].0)));
+                    return Err(DataError::Expired(format!("block {} is older than connected peers serve (earliest {peers_from}); receipts before it have expired", need[0].0)));
                 }
                 expired.extend(need.iter().filter(|(n, _, _)| *n < peers_from).map(|(n, _, _)| *n));
                 need.retain(|(n, _, _)| *n >= peers_from);
