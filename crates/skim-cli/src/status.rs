@@ -35,7 +35,17 @@ pub fn assess(status: &Value, subs: &Value, head_ts: Option<u64>, now: u64) -> V
     let n = |v: &Value| v.as_u64();
 
     let lag = head_ts.map(|t| now.saturating_sub(t));
+    let fork = n(&status["network"]["glamsterdam_at"]).filter(|t| *t > now);
     out.push(match (n(&status["head"]), lag) {
+        _ if fork.is_some() => {
+            let left = fork.unwrap() - now;
+            Check {
+                what: "chain",
+                level: Level::Warn,
+                detail: format!("waiting for Glamsterdam on {}: in {}d {}h", status["network"]["name"].as_str().unwrap_or("this network"), left / 86400, left % 86400 / 3600),
+                hint: Some("skim follows a network from its Glamsterdam fork on (no BALs before it); it picks the chain up at activation"),
+            }
+        }
         (Some(h), Some(l)) if l <= 60 => Check { what: "chain", level: Level::Ok, detail: format!("following: head {h}, {l} s old"), hint: None },
         (Some(h), Some(l)) => Check {
             what: "chain",
@@ -182,5 +192,12 @@ mod tests {
         assert!(by("execution peers").hint.unwrap().contains("--el-port"));
         assert_eq!(by("light client").level, Level::Warn);
         assert!(by("state").detail.contains("waiting: pool"));
+    }
+
+    #[test]
+    fn before_glamsterdam_the_chain_check_says_when() {
+        let status = json!({"head": null, "el_peers": 2, "snap_peers": 2, "light_client": {}, "history": {"mode": "off"}, "network": {"name": "hoodi", "glamsterdam_at": 1_000 + 6 * 86400 + 3 * 3600}});
+        let c = assess(&status, &json!([]), None, 1_000);
+        assert_eq!(c[0].detail, "waiting for Glamsterdam on hoodi: in 6d 3h");
     }
 }

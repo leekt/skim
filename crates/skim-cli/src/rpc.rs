@@ -771,6 +771,10 @@ impl Rpc {
                         "recent_index": {"blocks": z.recent_bals, "writes": z.recent_writes, "reads": z.recent_reads, "touched": z.recent_touched, "code_bytes": z.recent_code_bytes},
                     },
                     "light_client": self.light.as_ref().map(|l| l.status()),
+                    "network": {
+                        "name": skim_cl::network::current().name,
+                        "glamsterdam_at": skim_cl::network::current().gloas_time(),
+                    },
                     "el_peers": peers.len(),
                     "snap_peers": peers.iter().filter(|(_, p)| p.snap1 || p.snap2).count(),
                     "peer_acquisition": acquisition,

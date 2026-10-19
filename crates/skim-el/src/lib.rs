@@ -115,13 +115,24 @@ impl ElNetwork {
         Self { spec: SEPOLIA.clone(), bootnodes: reth_network_peers::sepolia_nodes(), dns: Some(SEPOLIA_DNS.to_string()) }
     }
 
+    /// Hoodi (built in), from its published `genesis.json` (with `amsterdamTime`) and enodes.
+    pub fn hoodi() -> Self {
+        let genesis: alloy_genesis::Genesis = serde_json::from_str(include_str!("../networks/hoodi/genesis.json")).expect("built-in Hoodi genesis parses");
+        let spec = Self::spec_from_genesis(genesis).expect("built-in Hoodi genesis is a Glamsterdam network");
+        let bootnodes = enode_lines(include_str!("../networks/hoodi/enodes.yaml")).iter().filter_map(|l| l.parse().ok()).collect();
+        Self { spec: Arc::new(spec), bootnodes, dns: None }
+    }
+
     /// `genesis.json` in `dir`, plus `enodes.txt` (one `enode://` per line) if present, plus
     /// `extra_bootnodes`.
     pub fn from_dir(dir: &std::path::Path, extra_bootnodes: &[String]) -> Result<Self, Box<dyn std::error::Error>> {
         let raw = std::fs::read(dir.join("genesis.json")).map_err(|e| format!("{}: {e}", dir.join("genesis.json").display()))?;
         let genesis: alloy_genesis::Genesis = serde_json::from_slice(&raw)?;
         let spec = Self::spec_from_genesis(genesis)?;
-        let mut lines: Vec<String> = std::fs::read_to_string(dir.join("enodes.txt")).map(|t| t.lines().map(|l| l.trim().to_string()).collect()).unwrap_or_default();
+        let mut lines: Vec<String> = std::fs::read_to_string(dir.join("enodes.txt"))
+            .or_else(|_| std::fs::read_to_string(dir.join("enodes.yaml")))
+            .map(|t| enode_lines(&t))
+            .unwrap_or_default();
         lines.extend(extra_bootnodes.iter().cloned());
         let bootnodes = lines
             .iter()
@@ -150,6 +161,14 @@ impl ElNetwork {
     pub fn chain_id(&self) -> u64 {
         self.spec.chain.id()
     }
+}
+
+/// Enodes from an `enodes.txt` (one per line) or `.yaml` (`- enode://…` items, comments).
+fn enode_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.split(" #").next().unwrap_or("").trim().trim_start_matches("- ").trim_matches('"').to_string())
+        .filter(|l| l.starts_with("enode://"))
+        .collect()
 }
 
 /// reth lists a genesis's timestamp forks in mainnet's order and folds them into the fork id
@@ -814,5 +833,19 @@ mod tests {
         assert!(ElNetwork::spec_from_genesis(genesis(100, None, None)).is_err());
         assert!(ElNetwork::spec_from_genesis(genesis(100, None, Some(150))).is_err());
         assert!(ElNetwork::spec_from_genesis(genesis(100, None, Some(100))).is_ok());
+    }
+
+    #[test]
+    fn built_in_hoodi_matches_reths_genesis_and_fork_ids() {
+        let h = ElNetwork::hoodi();
+        assert_eq!(h.chain_id(), 560048);
+        assert_eq!(h.spec.genesis_hash(), reth_chainspec::HOODI.genesis_hash(), "the embedded genesis is Hoodi's");
+        assert_eq!(h.bootnodes.len(), 6);
+        // Before Glamsterdam, the fork id is reth's own Hoodi one (BPO1/BPO2 included).
+        let at = |t: u64| Head { timestamp: t, ..Default::default() };
+        let pre = 1_790_000_000;
+        assert_eq!(h.spec.fork_id(&at(pre)).hash, reth_chainspec::HOODI.fork_id(&at(pre)).hash);
+        assert_eq!(h.spec.fork_id(&at(pre)).next, 1_793_036_568, "Amsterdam is next");
+        assert_eq!(h.spec.fork_id(&at(1_793_036_568)).next, 0);
     }
 }

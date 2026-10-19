@@ -1,0 +1,14 @@
+# hoodi execution layer bootnodes
+# ---------------------------------------
+# 1. Tag nodes with maintainer
+# 2. Keep nodes updated
+# 3. Review PRs: check ENR duplicates, fork-digest, connection.
+
+# EF
+- enode://70bab91175f9bbcebbfbf155644f46c03ed44ef4927d816e3601ba5fd32f7a240ffb8953e737dd8595cf3773a62230ca27dd5390d268570f980f7d47a40dd1a3@212.99.218.66:0?discport=20153 # nodeops-bootnode-dcl1-01
+- enode://afd50407db4562c5049f3af489743a24b732cba6af2195e62205be59ae645aa0a4179da81515bfcfd20d3fd1f12ffdfcf5d4853ff1ad39189c3bb97132cd0986@129.212.166.61:0?discport=30503 # nodeops-bootnode-sfo3-01
+- enode://f787af01c154fb0fe82798d5c72ca81e3f2a789798a476a6c93da7acbb3f58002e7494c916680035a5beed158092c10bb08b10917bbc3ac41784e7b01017b4a4@144.126.252.24:0?discport=30503 # nodeops-bootnode-blr1-01
+- enode://71c400e99baa31e91d8ea7bda5850ef143b9da94b07413dbd4c1c84c4b5fc474806234c123bc5e1a97b7ae3162115cad9ccdf290319b0710f9d40d81b967153e@178.156.215.140:0?discport=30503 # nodeops-bootnode-ash-01
+- enode://81aabd7223f345e713b7f355cc76680ba8ec3a7b098f100655a467e4049113586fb5ce052a6ef90033ec62b91ed63457c87aa49dd0f1338af963b85522176db7@5.223.94.81:0?discport=30503 # nodeops-bootnode-sin-01
+# Lodestar
+- enode://e9e62e53861ee404eaca33e5d3f110e6f6d45c34229ec8e83060b1b35959df8412267f1d73f0a37597b4e5c5c5cf1f69da8631c62d38da290139a7120ee15e37@65.21.201.146:30303

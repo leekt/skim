@@ -37,7 +37,7 @@ pub struct Args {
     /// Enable diagnostic RPC methods for measurements (`skim_debugSetSnapHedge`).
     #[arg(long, hide = true)]
     debug_rpc: bool,
-    /// The network: `sepolia` (built in), or a network-config directory, as consensus clients
+    /// The network: `sepolia` or `hoodi` (built in), or a network-config directory, as consensus clients
     /// use (and ethereum-package / eth-clients publish): `config.yaml` (with its PRESET_BASE),
     /// `genesis.ssz` or `genesis_validators_root.txt`, `bootstrap_nodes.txt`, plus the execution
     /// `genesis.json` (with `amsterdamTime`) and optionally `enodes.txt`.
@@ -279,15 +279,15 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     }
     // Which network: everything chain-specific (chain id, fork schedule, preset, bootnodes,
     // genesis) comes from here.
-    let (cl_net, el_net) = if args.network == "sepolia" {
-        let mut el = skim_el::ElNetwork::sepolia();
+    let (cl_net, el_net) = if let Some(cl) = skim_cl::network::ClNetwork::built_in(&args.network) {
+        let mut el = if args.network == "hoodi" { skim_el::ElNetwork::hoodi() } else { skim_el::ElNetwork::sepolia() };
         for b in &args.el_bootnode {
             el.bootnodes.push(b.parse().map_err(|e| anyhow::anyhow!("--el-bootnode {b}: {e}"))?);
         }
-        (skim_cl::network::ClNetwork::sepolia(), el)
+        (cl, el)
     } else {
         let dir = std::path::PathBuf::from(&args.network);
-        anyhow::ensure!(dir.is_dir(), "--network: `sepolia` or a network-config directory ({} isn't one)", dir.display());
+        anyhow::ensure!(dir.is_dir(), "--network: `sepolia`, `hoodi` or a network-config directory ({} isn't one)", dir.display());
         let cl = skim_cl::network::ClNetwork::from_dir(&dir)?;
         let el = skim_el::ElNetwork::from_dir(&dir, &args.el_bootnode).map_err(|e| anyhow::anyhow!("{e}"))?;
         (cl, el)
@@ -296,7 +296,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         gloas_epoch = cl_net.gloas_fork_epoch, cl_bootnodes = cl_net.bootnodes.len(), el_bootnodes = el_net.bootnodes.len(), "network");
     skim_sim::env::set_chain_id(el_net.chain_id());
     skim_cl::network::set_current(cl_net.clone());
-    let checkpoint_url = args.checkpoint_url.clone().or_else(|| (cl_net.name == "sepolia").then(|| "https://checkpoint-sync.sepolia.ethpandaops.io".to_string()));
+    let checkpoint_url = args.checkpoint_url.clone().or_else(|| cl_net.default_checkpoint_url().map(str::to_string));
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    if now < cl_net.gloas_time() {
+        let left = cl_net.gloas_time() - now;
+        tracing::warn!(network = %cl_net.name, gloas_epoch = cl_net.gloas_fork_epoch, in_hours = left / 3600,
+            "Glamsterdam isn't active on this network yet: skim follows it from the fork on (no BALs before it); until then nothing is applied and state reads wait");
+    }
     let default_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".skim").join(&cl_net.name);
     let persist = if args.ephemeral {
         None

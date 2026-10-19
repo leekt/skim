@@ -64,6 +64,18 @@ pub enum NetworkError {
 
 /// Sepolia's published consensus config (eth-clients/sepolia `metadata/config.yaml`).
 const SEPOLIA_CONFIG: &str = include_str!("../networks/sepolia/config.yaml");
+/// Hoodi's published metadata (eth-clients/hoodi `metadata/`; Glamsterdam scheduled on 2026-10-09).
+const HOODI_CONFIG: &str = include_str!("../networks/hoodi/config.yaml");
+const HOODI_GVR: &str = include_str!("../networks/hoodi/genesis_validators_root.txt");
+const HOODI_BOOTNODES: &str = include_str!("../networks/hoodi/bootstrap_nodes.yaml");
+
+/// ENRs from a `bootstrap_nodes.txt` (one per line) or `.yaml` (`- enr:…` items, comments).
+fn enr_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.split(" #").next().unwrap_or("").trim().trim_start_matches("- ").trim_matches('"').to_string())
+        .filter(|l| l.starts_with("enr:"))
+        .collect()
+}
 
 impl ClNetwork {
     pub fn sepolia() -> Self {
@@ -81,8 +93,40 @@ impl ClNetwork {
         n
     }
 
+    /// Hoodi (built in): mainnet preset, Glamsterdam at epoch 132352 (2026-10-26 17:42:48 UTC).
+    pub fn hoodi() -> Self {
+        let gvr = parse_hex32(HOODI_GVR.trim()).expect("built-in Hoodi root");
+        let mut n = Self::from_config("hoodi", HOODI_CONFIG, gvr, None, enr_lines(HOODI_BOOTNODES)).expect("built-in Hoodi config parses");
+        n.name = "hoodi".into();
+        n
+    }
+
+    /// A built-in network by name (`sepolia`, `hoodi`).
+    pub fn built_in(name: &str) -> Option<Self> {
+        match name {
+            "sepolia" => Some(Self::sepolia()),
+            "hoodi" => Some(Self::hoodi()),
+            _ => None,
+        }
+    }
+
+    /// The default checkpoint-sync URL of a built-in network.
+    pub fn default_checkpoint_url(&self) -> Option<&'static str> {
+        match self.name.as_str() {
+            "sepolia" => Some("https://checkpoint-sync.sepolia.ethpandaops.io"),
+            "hoodi" => Some("https://checkpoint-sync.hoodi.ethpandaops.io"),
+            _ => None,
+        }
+    }
+
+    /// When Gloas (Glamsterdam) activates, in Unix seconds.
+    pub fn gloas_time(&self) -> u64 {
+        self.genesis_time + self.gloas_fork_epoch * self.preset.slots_per_epoch * self.slot_ms / 1000
+    }
+
     /// A network-config directory: `config.yaml`; `genesis_validators_root.txt` (or the root and
-    /// genesis time from `genesis.ssz`); `bootstrap_nodes.txt` (ENRs, one per line), optional.
+    /// genesis time from `genesis.ssz`); `bootstrap_nodes.txt` or `bootstrap_nodes.yaml` (as
+    /// eth-clients publishes them), optional.
     pub fn from_dir(dir: &Path) -> Result<Self, NetworkError> {
         let read = |f: &str| std::fs::read(dir.join(f)).map_err(|e| NetworkError::File(dir.join(f).display().to_string(), e.to_string()));
         let config = String::from_utf8_lossy(&read("config.yaml")?).into_owned();
@@ -96,15 +140,7 @@ impl ClNetwork {
             },
         };
         let genesis_time = state.as_ref().filter(|s| s.len() >= 8).map(|s| u64::from_le_bytes(s[..8].try_into().unwrap()));
-        let bootnodes = read("bootstrap_nodes.txt")
-            .map(|b| {
-                String::from_utf8_lossy(&b)
-                    .lines()
-                    .map(|l| l.trim().trim_start_matches("- ").trim_matches('"').to_string())
-                    .filter(|l| l.starts_with("enr:"))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let bootnodes = read("bootstrap_nodes.txt").or_else(|_| read("bootstrap_nodes.yaml")).map(|b| enr_lines(&String::from_utf8_lossy(&b))).unwrap_or_default();
         let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "custom".into());
         Self::from_config(&name, &config, gvr, genesis_time, bootnodes)
     }
@@ -312,5 +348,18 @@ mod tests {
     #[test]
     fn a_config_without_gloas_is_refused() {
         assert!(ClNetwork::from_config("x", "PRESET_BASE: mainnet\nSECONDS_PER_SLOT: 12\nMIN_GENESIS_TIME: 1\n", [0; 32], None, vec![]).is_err());
+    }
+
+    #[test]
+    fn built_in_hoodi() {
+        let h = ClNetwork::hoodi();
+        assert_eq!((h.name.as_str(), h.preset.name), ("hoodi", "mainnet"));
+        assert_eq!(h.genesis_time, 1_742_213_400);
+        assert_eq!(h.gloas_fork_epoch, 132_352);
+        assert_eq!(h.gloas_time(), 1_793_036_568, "2026-10-26 17:42:48 UTC");
+        assert_eq!(h.bootnodes.len(), 8);
+        assert_eq!(h.default_checkpoint_url(), Some("https://checkpoint-sync.hoodi.ethpandaops.io"));
+        assert_eq!(ClNetwork::built_in("sepolia").unwrap().gloas_time(), ClNetwork::sepolia().gloas_time());
+        assert!(ClNetwork::built_in("mainnet").is_none());
     }
 }
