@@ -628,6 +628,32 @@ impl ChainData {
             let Some((&n, _)) = g.headers.first_key_value() else { break };
             g.drop_header(n);
         }
+        drop(g);
+        // After the reorg cleanup above: the new fork's block is indexed on top of it.
+        self.index_if_canonical(h.number, hash);
+    }
+
+    /// Indexes a block's transactions and records sent ones in it as included, once the block
+    /// is canonical (its header noted by the chain placer) and its body is cached, whichever
+    /// comes second. A payload alone only fills the caches: a block skim hasn't adopted (its
+    /// placement deferred, or another fork) never makes a transaction included.
+    fn index_if_canonical(&self, number: u64, hash: B256) {
+        let canonical = |g: &Inner| g.headers.get(&number).filter(|(x, _)| *x == hash).map(|(_, h)| h.clone());
+        let indexed = {
+            let g = self.inner.read();
+            if canonical(&g).is_none() {
+                return;
+            }
+            g.txs.get(&number).is_some_and(|(x, _)| *x == hash)
+        };
+        let Some(raw) = self.bodies.lock().get(&hash) else { return };
+        let hashes = tx_hashes(&raw);
+        // Outside the lock: the pinned set comes from the store.
+        let keep = if indexed { None } else { self.select_txs(self.bals.lock().get(&hash).as_deref(), raw.len()) };
+        let mut g = self.inner.write();
+        let Some(header) = canonical(&g) else { return };
+        g.note_inclusions(&header, hash, &hashes);
+        self.index_txs(&mut g, number, hash, &hashes, keep.as_deref());
     }
 
     /// Transactions, withdrawals, BAL (decoded and raw) and BAL addresses of a verified gossiped
@@ -644,19 +670,19 @@ impl ChainData {
         bal_raw: Bytes,
     ) {
         let number = header.number;
-        let hashes = tx_hashes(&raw_txs);
-        let keep = self.select_txs(Some(&bal), raw_txs.len());
         self.bodies.lock().put(hash, Arc::new(raw_txs));
         self.withdrawals.lock().put(hash, Arc::new(withdrawals));
         self.bals.lock().put(hash, bal);
         self.bal_raw.lock().put(hash, bal_raw);
-        let mut g = self.inner.write();
-        g.note_inclusions(&header, hash, &hashes);
-        self.index_txs(&mut g, number, hash, &hashes, keep.as_deref());
-        g.touched.insert(number, (hash, Arc::new(touched)));
-        while g.touched.len() > TOUCHED_BLOCKS {
-            g.touched.pop_first();
+        {
+            let mut g = self.inner.write();
+            g.touched.insert(number, (hash, Arc::new(touched)));
+            while g.touched.len() > TOUCHED_BLOCKS {
+                g.touched.pop_first();
+            }
         }
+        // Indexed now only if the block is already canonical; otherwise when its header is noted.
+        self.index_if_canonical(number, hash);
     }
 
     /// Indexes the `keep` transactions of a block, replacing what was indexed at its height.
@@ -1037,18 +1063,11 @@ impl ChainData {
         Err(DataError::Unavailable(format!("block {} body not served by peers", header.number)))
     }
 
-    /// A verified body fetched for a canonical block: sent transactions in it become included,
-    /// and the block is indexed unless it already is (same hash). A refetch must never shrink
-    /// the index: without the block's BAL, pinned mode leaves it as it was.
-    fn accept_body(&self, hash: B256, header: &Header, raw: &[Bytes]) {
-        let hashes = tx_hashes(raw);
-        let indexed = self.inner.read().txs.get(&header.number).is_some_and(|(h, _)| *h == hash);
-        let keep = if indexed { None } else { self.select_txs(self.bals.lock().get(&hash).as_deref(), raw.len()) };
-        let mut g = self.inner.write();
-        if g.headers.get(&header.number).is_some_and(|(h, _)| *h == hash) {
-            g.note_inclusions(&Arc::new(header.clone()), hash, &hashes);
-        }
-        self.index_txs(&mut g, header.number, hash, &hashes, keep.as_deref());
+    /// A verified body fetched (and cached) for a block: indexed if the block is canonical,
+    /// unless it already is under the same hash. A refetch must never shrink the index: without
+    /// the block's BAL, pinned mode leaves it as it was.
+    fn accept_body(&self, hash: B256, header: &Header, _raw: &[Bytes]) {
+        self.index_if_canonical(header.number, hash);
     }
 
     /// Tests: a body as a peer would serve it (verified like a fetched one).
@@ -1840,11 +1859,20 @@ mod tests {
         note_txs(cd, number, &txs, bal)
     }
 
+    /// In `skim run`'s order: the gossiped payload first, then (once the chain placer adopts the
+    /// block) its header.
     fn note_txs(cd: &ChainData, number: u64, txs: &[SignedTx], bal: skim_bal::BlockAccessList) -> (B256, Vec<B256>) {
         let (h, hash, raw, hashes) = block(number, txs);
+        cd.note_payload(Arc::new(h.clone()), hash, raw, vec![], HashSet::new(), Arc::new(bal), Bytes::new());
         cd.note_header(&h);
-        cd.note_payload(Arc::new(h), hash, raw, vec![], HashSet::new(), Arc::new(bal), Bytes::new());
         (hash, hashes)
+    }
+
+    fn sent(cd: &ChainData, tx: &SignedTx) -> B256 {
+        let now = Instant::now();
+        let h = keccak256(tx.encoded_2718());
+        cd.inner.write().sent.insert(h, Sent { tx: tx.clone(), from: Address::ZERO, first: now, last: now });
+        h
     }
 
     fn found(cd: &ChainData, tx: &B256) -> Option<(u64, u32)> {
@@ -1898,8 +1926,8 @@ mod tests {
             .with_nonce_change(NonceChange::new(BlockAccessIndex(1), 1))
             .with_nonce_change(NonceChange::new(BlockAccessIndex(2), 2))];
         let (h, hash, raw, hashes) = block(100, &txs);
-        cd.note_header(&h);
         cd.note_payload(Arc::new(h.clone()), hash, raw.clone(), vec![], HashSet::new(), Arc::new(bal), Bytes::new());
+        cd.note_header(&h);
         // Body and BAL leave their caches; the index window still covers the block.
         cd.bodies.lock().map.remove(&hash);
         cd.bals.lock().map.remove(&hash);
@@ -1945,5 +1973,41 @@ mod tests {
         }
         cd.rebroadcast();
         assert_eq!(cd.inner.read().included.len(), INCLUDED_MAX);
+    }
+
+    /// Review: a payload marked a sent transaction included before the chain placer decided on
+    /// its block. A block that was never adopted (its parent missing: placement deferred) made
+    /// the transaction "included" and stopped its re-broadcast.
+    #[tokio::test]
+    async fn a_payload_skim_hasnt_adopted_never_makes_a_transaction_included() {
+        let cd = ChainData::offline(100);
+        let tx = legacy_tx(5, Address::repeat_byte(3));
+        let t = sent(&cd, &tx);
+        note_txs(&cd, 100, &[legacy_tx(1, Address::repeat_byte(4))], vec![]); // A100: the head
+        // B102 carries T, but its parent is missing: placement is deferred, no header is noted.
+        let (h, hash, raw, _) = block(102, std::slice::from_ref(&tx));
+        cd.note_payload(Arc::new(h.clone()), hash, raw, vec![], HashSet::new(), Arc::new(vec![]), Bytes::new());
+        assert!(cd.inner.read().sent.contains_key(&t), "still pending: re-broadcast continues");
+        assert_eq!(cd.transaction(t).await.unwrap()["blockNumber"], Value::Null);
+        // Once adopted (header noted), it's included.
+        cd.note_header(&h);
+        assert_eq!(cd.transaction(t).await.unwrap()["blockNumber"], json!("0x66"));
+    }
+
+    /// Review: in a same-height reorg the new fork's payload arrived first, and noting its header
+    /// then cleaned up the old fork's block, wiping the inclusion just recorded.
+    #[tokio::test]
+    async fn a_same_height_reorg_includes_the_new_forks_transaction() {
+        let cd = ChainData::offline(100);
+        cd.set_tx_index(TxIndexConfig { mode: TxIndexMode::All, blocks: 16 }, None);
+        note_txs(&cd, 100, &[legacy_tx(1, Address::repeat_byte(4))], vec![]); // A100
+        let tx = legacy_tx(9, Address::repeat_byte(3));
+        let t = sent(&cd, &tx);
+        // B100 replaces A100: payload, then the placer notes its header.
+        let (_, h) = note_txs(&cd, 100, &[legacy_tx(2, Address::repeat_byte(5)), tx.clone()], vec![]);
+        assert!(!cd.inner.read().sent.contains_key(&t), "included in B100, not pending");
+        assert_eq!(found(&cd, &t), Some((100, 1)));
+        assert_eq!(found(&cd, &h[0]), Some((100, 0)), "B100 indexed");
+        assert_eq!(cd.transaction(t).await.unwrap()["blockNumber"], json!("0x64"));
     }
 }
