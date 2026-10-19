@@ -270,7 +270,19 @@ const MAX_ENVELOPE_RESPONSE_BYTES: u64 = 256 << 20;
 /// from the current fork).
 #[derive(Clone, Default)]
 pub struct EnvelopesCodec {
-    pub digest: [u8; 4],
+    /// The current fork digest, shared with the node so a fork that activates while running
+    /// (e.g. a blob-parameter fork) changes what responses carry.
+    pub digest: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl EnvelopesCodec {
+    pub fn new(digest: [u8; 4]) -> Self {
+        Self { digest: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(u32::from_be_bytes(digest))) }
+    }
+
+    pub fn digest(&self) -> [u8; 4] {
+        self.digest.load(std::sync::atomic::Ordering::Relaxed).to_be_bytes()
+    }
 }
 
 /// Decodes one `varint(len) ++ snappy_frames` payload from the start of `b`, returning it and
@@ -347,7 +359,7 @@ impl request_response::Codec for EnvelopesCodec {
     {
         for ssz in res {
             let mut b = vec![0u8];
-            b.extend_from_slice(&self.digest);
+            b.extend_from_slice(&self.digest());
             b.extend_from_slice(&encode_payload(&ssz));
             io.write_all(&b).await?;
         }
@@ -402,7 +414,7 @@ mod tests {
     fn served_envelopes_roundtrip_through_the_codec() {
         use request_response::Codec as _;
         let p = StreamProtocol::new(ENVELOPES_BY_RANGE);
-        let mut c = EnvelopesCodec { digest: [0x66, 0x9e, 0x6c, 0x11] };
+        let mut c = EnvelopesCodec::new([0x66, 0x9e, 0x6c, 0x11]);
         futures::executor::block_on(async {
             let mut wire = futures::io::Cursor::new(Vec::new());
             let req = [5u64.to_le_bytes(), 3u64.to_le_bytes()].concat();

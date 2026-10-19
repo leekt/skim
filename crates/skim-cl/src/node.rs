@@ -58,6 +58,9 @@ pub const SEPOLIA_BOOTNODES: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     pub fork_digest: [u8; 4],
+    /// `(activation epoch, digest)` for every digest the network may switch to while running
+    /// (blob-parameter forks after Gloas). Empty: the digest never changes.
+    pub digest_schedule: Vec<(u64, [u8; 4])>,
     /// The fork version advertised in the ENR (`ENRForkID.next_fork_version`, no later fork).
     pub fork_version: [u8; 4],
     pub genesis_time: u64,
@@ -96,6 +99,7 @@ impl NodeConfig {
     pub fn from_network(n: &crate::network::ClNetwork, port: u16) -> Self {
         Self {
             fork_digest: n.current_fork_digest(),
+            digest_schedule: n.digest_schedule(),
             fork_version: n.gloas_fork_version,
             genesis_time: n.genesis_time,
             slot_ms: n.slot_ms,
@@ -117,6 +121,12 @@ impl NodeConfig {
             explicit_peers: Vec::new(),
             attestation_subnets: 2,
         }
+    }
+
+    /// The digest in force at `slot` per [`Self::digest_schedule`] (else [`Self::fork_digest`]).
+    pub fn digest_at_slot(&self, slot: u64) -> [u8; 4] {
+        let epoch = slot / self.slots_per_epoch.max(1);
+        self.digest_schedule.iter().rev().find(|(e, _)| epoch >= *e).map(|(_, d)| *d).unwrap_or(self.fork_digest)
     }
 
     pub fn current_slot(&self) -> u64 {
@@ -437,10 +447,11 @@ impl ClNode {
         // eth2 peers announce hundreds of topics (attestation, sync, column subnets) in one RPC;
         // the default filter (max 100) would drop those RPCs, including their subscriptions to
         // our topics. Track only our topics, but accept large subscription batches.
-        let ours = cfg
-            .topics
+        // Every digest the schedule may switch to, so the switch needs no new filter.
+        let digests: Vec<[u8; 4]> = std::iter::once(cfg.fork_digest).chain(cfg.digest_schedule.iter().map(|(_, d)| *d)).collect();
+        let ours = digests
             .iter()
-            .map(|t| gossipsub::IdentTopic::new(gossip::topic(cfg.fork_digest, t)).hash())
+            .flat_map(|d| cfg.topics.iter().map(move |t| gossipsub::IdentTopic::new(gossip::topic(*d, t)).hash()))
             .collect();
         let filter = gossipsub::MaxCountSubscriptionFilter {
             filter: gossipsub::WhitelistSubscriptionFilter(ours),
@@ -458,6 +469,7 @@ impl ClNode {
             gs.subscribe(&gossipsub::IdentTopic::new(gossip::topic(cfg.fork_digest, t)))?;
         }
 
+        let envelopes_codec = rpc::EnvelopesCodec::new(cfg.fork_digest);
         let empty: Vec<&'static str> = rpc::EMPTY_SERVED.to_vec();
         let behaviour = Behaviour {
             gossipsub: gs,
@@ -472,12 +484,12 @@ impl ClNode {
             empty: rr(&empty),
             // Both directions: skim requests ranges on catch-up and answers from `served`.
             envelopes: request_response::Behaviour::with_codec(
-                rpc::EnvelopesCodec { digest: cfg.fork_digest },
+                envelopes_codec.clone(),
                 [(StreamProtocol::new(rpc::ENVELOPES_BY_RANGE), ProtocolSupport::Full)],
                 request_response::Config::default().with_request_timeout(Duration::from_secs(15)),
             ),
             envelopes_by_root: request_response::Behaviour::with_codec(
-                rpc::EnvelopesCodec { digest: cfg.fork_digest },
+                envelopes_codec.clone(),
                 [(StreamProtocol::new(rpc::ENVELOPES_BY_ROOT), ProtocolSupport::Full)],
                 rr_config(),
             ),
@@ -537,6 +549,7 @@ impl ClNode {
             },
             pending_disconnect: Vec::new(),
             seen_nodes: HashSet::new(),
+            envelopes_codec,
         };
         tokio::spawn(runner.run());
         Ok((Self { stats, local_peer_id, cmd: cmd_tx }, rx))
@@ -560,6 +573,8 @@ struct Runner {
     metadata: MetaData,
     pending_disconnect: Vec<(PeerId, Instant)>,
     seen_nodes: HashSet<NodeId>,
+    /// Shares the current fork digest with the envelope codecs (see [`Self::follow_digest_schedule`]).
+    envelopes_codec: rpc::EnvelopesCodec,
 }
 
 impl Runner {
@@ -646,6 +661,7 @@ impl Runner {
                 }
                 _ = tick.tick() => {
                     self.refresh_stats();
+                    self.follow_digest_schedule();
                     self.dial_explicit();
                     let due: Vec<PeerId> = self.pending_disconnect.iter()
                         .filter(|(_, t)| t.elapsed() > Duration::from_secs(1)).map(|(p, _)| *p).collect();
@@ -788,6 +804,29 @@ impl Runner {
                 self.stats.lock().unwrap().dials += 1;
             }
         }
+    }
+
+    /// A blob-parameter fork that activates while running changes the fork digest: move the
+    /// topic subscriptions, the Status skim sends, the envelope codecs and the ENR to the new one.
+    fn follow_digest_schedule(&mut self) {
+        let d = self.cfg.digest_at_slot(self.cfg.current_slot());
+        if d == self.cfg.fork_digest {
+            return;
+        }
+        let old = self.cfg.fork_digest;
+        let gs = &mut self.swarm.behaviour_mut().gossipsub;
+        for t in &self.cfg.topics {
+            let _ = gs.unsubscribe(&gossipsub::IdentTopic::new(gossip::topic(old, t)));
+            if let Err(e) = gs.subscribe(&gossipsub::IdentTopic::new(gossip::topic(d, t))) {
+                tracing::warn!(topic = %t, "subscribing after the fork digest changed: {e:?}");
+            }
+        }
+        self.cfg.fork_digest = d;
+        self.envelopes_codec.digest.store(u32::from_be_bytes(d), std::sync::atomic::Ordering::Relaxed);
+        if let Err(e) = self.discv5.enr_insert("eth2", &Bytes::copy_from_slice(&enr_fork_id(d, self.cfg.fork_version))) {
+            tracing::warn!("updating the ENR's fork id: {e:?}");
+        }
+        tracing::info!(old = %alloy_primitives::hex::encode(old), new = %alloy_primitives::hex::encode(d), "fork digest changed (a scheduled fork activated); topics, status and ENR moved over");
     }
 
     fn is_explicit(&self, peer: &PeerId) -> bool {
@@ -1120,5 +1159,24 @@ impl Runner {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_digest_follows_the_schedule_by_epoch() {
+        let mut c = NodeConfig::sepolia(0);
+        c.slots_per_epoch = 8;
+        c.fork_digest = [0, 0, 0, 1];
+        c.digest_schedule = vec![(4, [0, 0, 0, 1]), (10, [0, 0, 0, 2]), (20, [0, 0, 0, 3])];
+        assert_eq!(c.digest_at_slot(0), [0, 0, 0, 1], "before the schedule: the startup digest");
+        assert_eq!(c.digest_at_slot(79), [0, 0, 0, 1]);
+        assert_eq!(c.digest_at_slot(80), [0, 0, 0, 2], "epoch 10 starts at slot 80");
+        assert_eq!(c.digest_at_slot(10_000), [0, 0, 0, 3]);
+        c.digest_schedule.clear();
+        assert_eq!(c.digest_at_slot(10_000), [0, 0, 0, 1], "no schedule: never changes");
     }
 }

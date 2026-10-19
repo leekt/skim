@@ -180,6 +180,17 @@ impl ClNetwork {
         d
     }
 
+    /// Every digest skim may see on this network: `(activation epoch, digest)` from the Gloas
+    /// fork on, one more for each blob-parameter fork after it. Ascending.
+    pub fn digest_schedule(&self) -> Vec<(u64, [u8; 4])> {
+        let mut epochs: Vec<u64> = std::iter::once(self.gloas_fork_epoch)
+            .chain(self.blob_schedule.iter().map(|(e, _)| *e).filter(|e| *e > self.gloas_fork_epoch))
+            .collect();
+        epochs.sort();
+        epochs.dedup();
+        epochs.into_iter().map(|e| (e, self.fork_digest_at(e))).collect()
+    }
+
     /// The fork digest now (or at the Gloas fork, if that's later).
     pub fn current_fork_digest(&self) -> [u8; 4] {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -284,6 +295,18 @@ mod tests {
         assert_eq!(n.slot_at(1792377300 + 61), 10);
         let lc = n.light_client();
         assert_eq!((lc.committee_size, lc.slots_per_period), (32, 64));
+    }
+
+    #[test]
+    fn blob_parameter_forks_after_gloas_get_their_own_digests() {
+        let cfg = "PRESET_BASE: 'minimal'\nMIN_GENESIS_TIME: 0\nGLOAS_FORK_VERSION: 0x80000038\nGLOAS_FORK_EPOCH: 4\nSLOT_DURATION_MS: 6000\nBLOB_SCHEDULE:\n  - EPOCH: 0\n    MAX_BLOBS_PER_BLOCK: 9\n  - EPOCH: 10\n    MAX_BLOBS_PER_BLOCK: 15\n  - EPOCH: 20\n    MAX_BLOBS_PER_BLOCK: 21\n";
+        let n = ClNetwork::from_config("devnet", cfg, [1; 32], Some(0), vec![]).unwrap();
+        let s = n.digest_schedule();
+        assert_eq!(s.iter().map(|(e, _)| *e).collect::<Vec<_>>(), vec![4, 10, 20]);
+        assert!(s[0].1 != s[1].1 && s[1].1 != s[2].1, "each blob-parameter fork changes the digest");
+        assert_eq!(s[1].1, n.fork_digest_at(15));
+        // Sepolia: its blob-parameter forks were before Gloas, so one digest.
+        assert_eq!(ClNetwork::sepolia().digest_schedule().len(), 1);
     }
 
     #[test]
