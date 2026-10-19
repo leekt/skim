@@ -364,12 +364,24 @@ pub fn enr_dial(enr: &Enr) -> Option<(PeerId, Multiaddr)> {
     let CombinedPublicKey::Secp256k1(_) = enr.public_key() else { return None };
     let pk = identity::secp256k1::PublicKey::try_from_bytes(&enr.public_key().encode()).ok()?;
     let peer = identity::PublicKey::from(pk).to_peer_id();
-    let sock = enr.tcp4_socket()?;
     let mut ma = Multiaddr::empty();
-    ma.push(Protocol::Ip4(*sock.ip()));
-    ma.push(Protocol::Tcp(sock.port()));
+    // TCP when the node announces it; else QUIC (the ENR's `quic` port): some clients, e.g.
+    // Lodestar on devnets, listen on QUIC only.
+    if let Some(sock) = enr.tcp4_socket() {
+        ma.push(Protocol::Ip4(*sock.ip()));
+        ma.push(Protocol::Tcp(sock.port()));
+    } else {
+        ma.push(Protocol::Ip4(enr.ip4()?));
+        ma.push(Protocol::Udp(enr_quic_port(enr)?));
+        ma.push(Protocol::QuicV1);
+    }
     ma.push(Protocol::P2p(peer));
     Some((peer, ma))
+}
+
+/// The ENR's `quic` port (IPv4), if it announces one.
+fn enr_quic_port(enr: &Enr) -> Option<u16> {
+    enr.get_decodable::<u16>("quic").and_then(Result::ok)
 }
 
 impl ClNode {
@@ -674,7 +686,7 @@ impl Runner {
                         let digest = self.cfg.fork_digest;
                         let fut = self.discv5.find_node_predicate(
                             NodeId::random(),
-                            Box::new(move |e: &Enr| enr_digest(e) == Some(digest) && e.tcp4().is_some()),
+                            Box::new(move |e: &Enr| enr_digest(e) == Some(digest) && (e.tcp4().is_some() || (e.ip4().is_some() && enr_quic_port(e).is_some()))),
                             32,
                         );
                         let tx = found_tx.clone();
@@ -1178,5 +1190,17 @@ mod tests {
         assert_eq!(c.digest_at_slot(10_000), [0, 0, 0, 3]);
         c.digest_schedule.clear();
         assert_eq!(c.digest_at_slot(10_000), [0, 0, 0, 1], "no schedule: never changes");
+    }
+
+    #[test]
+    fn a_quic_only_enr_is_dialed_over_quic_and_tcp_wins_when_both_are_there() {
+        let key = CombinedKey::secp256k1_from_bytes(&mut [7u8; 32]).unwrap();
+        let quic_only = Enr::builder().ip4(std::net::Ipv4Addr::new(172, 16, 72, 13)).udp4(9000).add_value("quic", &9001u16).build(&key).unwrap();
+        let (_, ma) = enr_dial(&quic_only).expect("dialable over QUIC");
+        assert!(ma.to_string().starts_with("/ip4/172.16.72.13/udp/9001/quic-v1/p2p/"), "{ma}");
+        let both = Enr::builder().ip4(std::net::Ipv4Addr::new(10, 0, 0, 1)).tcp4(9000).udp4(9000).add_value("quic", &9001u16).build(&key).unwrap();
+        assert!(enr_dial(&both).unwrap().1.to_string().starts_with("/ip4/10.0.0.1/tcp/9000/p2p/"));
+        let neither = Enr::builder().ip4(std::net::Ipv4Addr::new(10, 0, 0, 2)).udp4(9000).build(&key).unwrap();
+        assert!(enr_dial(&neither).is_none());
     }
 }
