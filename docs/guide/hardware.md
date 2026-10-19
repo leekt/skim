@@ -17,6 +17,21 @@ The measured Linux deployment uses two aarch64 cores. These are sizing recommend
 
 This section is the measurements and what fills when. Which knobs trade memory for latency, and why the defaults are what they are: [memory and latency](memory-and-latency.md).
 
+### Zero config: no subscriptions, head-only
+`skim` with no config file (nothing pinned, `--history off`, default 256-block window), following Sepolia over public peers on macOS (Apple silicon), build `c704325` (run as `skim run` with no config; same behaviour as plain `skim` since `e899046`), 2026-10-19. A fresh data dir; a few read-only example scripts queried it in the first half hour, otherwise idle.
+
+| Minutes | 1 | 5 | 10 | 20 | 30 | 40 | 50 | 60 |
+|---|---|---|---|---|---|---|---|---|
+| RSS (MB) | 69 | 112 | 131 | 149 | 161 | 170 | 175 | 179 |
+| Downloaded (MB, cumulative) | 19 | 83 | 152 | 289 | 402 | 526 | 643 | 757 |
+| EL peers | 0 | 3 | 4 | 10 | 16 | 18 | 19 | 25 |
+
+- **Startup:** the first SNAP-serving peer connected after 10.8 s, the first block was applied within the first minute, and RPC answered from then on.
+- **Memory:** 179 MB at one hour, still rising slowly (+5 MB over the last 10 minutes, against +18 MB per 10 minutes in the first). skim's counted structures were 52 MB: recent-BAL writes 16, bodies 14, envelopes kept to serve peers 10.5, raw BALs 3.4. The window and block caches are full by ~51 minutes; BAL address sets keep filling until ~7 h and headers until ~27 h, so this is not a steady state. A 30-hour Linux soak in the same mode is running (TODO 6).
+- **CPU:** 13 min 43 s of CPU in 61 minutes: about 0.22 of a core on average.
+- **Network:** 152 MB in and 35 MB out in the first 10 minutes, then about 720 MB/h in and 170 MB/h out (~17 GB/day in, ~4 GB/day out), mostly gossip and serving peers; it grew with the peer count.
+- **Disk:** 184 KB (restart data only).
+
 ### Short runs
 
 | Setup | RSS | Notes |
