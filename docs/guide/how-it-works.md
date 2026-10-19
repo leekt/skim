@@ -93,9 +93,9 @@ skim answers other peers' requests from recent data it has already verified agai
 |---|---|---|
 | Tracked state | memory, multi-version for `--window` blocks | ~10–100 MB for typical app state |
 | Contract code | memory, only for tracked accounts | per contract |
-| Headers, tx hashes, BAL addresses | memory, last 2,048–8,192 blocks | a few MB |
+| Headers, tx hashes, BAL addresses | memory, last 2,048–8,192 blocks | tens of MB once full (hours) |
 | Recent blocks and envelopes for serving | memory: BALs of the last 64 blocks, bodies of 128, envelopes of 64 slots | ~10–25 MB |
 | Restart snapshot | `redb` file in `--data-dir` (default `~/.skim/sepolia`): subscribed values, node key, peers | ~1 MB for 2,400 keys |
 | Archived history (optional) | `redb` file, only for `retention: archive` subscriptions | versions only on change |
 
-Measured with the Uniswap V3 config: ~200 MB RSS once the default 256-block window has filled (about 42 MB of it is the recent-BAL index), ~0.25 CPU core. `--window 32` keeps it near 100 MB. On disk: the restart snapshot (about 1 MB), plus the archive if you enable one. `--ephemeral` keeps nothing on disk.
+Measured: ~180 MB RSS following the head on Linux with the default 256-block window, 0.25-0.5 CPU core; `--window 32` keeps it near 100 MB. What each structure holds is in `skim_status.memory`; see [hardware requirements](hardware.md). On disk: the restart snapshot (about 1 MB), plus the archive if you enable one. `--ephemeral` keeps nothing on disk.

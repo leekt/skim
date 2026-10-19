@@ -105,7 +105,7 @@ All numbers are from Sepolia, measured from one home connection over public peer
 | **Warm simulation** | Uniswap V3 quote over JSON-RPC: **0.25 ms** P50, 0.56 ms P99; ~8,500 calls/s at 50 in flight |
 | **Fetch reliability** | 298,084 SNAP jobs over public peers, **0 failed**, 126 disconnects absorbed ([soak](docs/experiments/m0-soak.md)) |
 | **Unseen inputs** | Background prefetch had **99.9%** of predicted keys ready at call time. Worst on-path fetch: 1.6 s ([P1](docs/experiments/m2-p0-miss-tail.md)). |
-| **Footprint** | ~200 MB RSS with the default 256-block window (~100 MB with `--window 32`), ~0.25 CPU core. On disk: a restart snapshot of subscribed state (~1 MB for 2,400 keys; `--ephemeral` for none) |
+| **Footprint** | ~180 MB RSS following the head on Linux with the default 256-block window (~100 MB with `--window 32`), 0.25-0.5 CPU core. On disk: a restart snapshot of subscribed state (~1 MB for 2,400 keys; `--ephemeral` for none). See [hardware requirements](docs/guide/hardware.md) |
 
 What skim is **not**: faster than an in-process full node on raw execution, or a trustless light client (yet). It saves *resources* while keeping simulation quality close to a node's. Part of the saving is work that public SNAP peers do on skim's behalf.
 
@@ -182,7 +182,7 @@ The dashboard shows:
 
 **Next steps:**
 - **[Examples](examples):** Uniswap V3, Uniswap V4, sending transactions (all with viem), and ENS resolution for the [bigname](examples/bigname) indexer, and [smallname](examples/smallname): bigname, but small (skim serves current state, a small index handles discovery and history).
-- **[Docs](docs):** [getting started](docs/guide/getting-started.md), [how it works](docs/guide/how-it-works.md), [configuration](docs/guide/configuration.md), [JSON-RPC](docs/guide/json-rpc.md), [archive](docs/guide/archive.md), [trust](docs/guide/trust-and-correctness.md), [troubleshooting](docs/guide/troubleshooting.md).
+- **[Docs](docs):** [getting started](docs/guide/getting-started.md), [how it works](docs/guide/how-it-works.md), [configuration](docs/guide/configuration.md), [JSON-RPC](docs/guide/json-rpc.md), [archive](docs/guide/archive.md), [trust](docs/guide/trust-and-correctness.md), [troubleshooting](docs/guide/troubleshooting.md), [hardware requirements](docs/guide/hardware.md).
 
 **Supported methods:**
 - State and simulation: `eth_call` (with state overrides), `eth_simulateV1`, `debug_traceCall` / `debug_traceTransaction` / `debug_traceBlockBy*` (default, `callTracer`, `prestateTracer`, `4byteTracer`, `muxTracer`), `eth_createAccessList`, `eth_getProof`, `eth_estimateGas`, `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`, `eth_getTransactionCount` (including `pending`)
