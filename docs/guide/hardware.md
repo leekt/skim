@@ -24,7 +24,16 @@ An Oracle Cloud Ampere A1 (2 cores, 12 GB) runs the whole right-hand column with
 | macOS, head-only, `--window 32`, soak load, restarts every 6-12 min | median 99-105 MB, peaks 168-194 MB | peaks are the catch-up right after a restart |
 | Linux, catching up ~40k blocks of history | 230-296 MB | before the huge-page change; glibc's allocator instead: 394-610 MB |
 
-**Not established yet: whether memory levels off over long runs.** Every cache is bounded by entry count, but the slowest ones take hours to fill (below), and no run has yet been watched past all of them. Until then, the 512 MB / 2 GB recommendations leave room for growth.
+**Over three hours** (production, Linux aarch64, `--history local` plus an indexer, 20 subscriptions, default window, huge pages off), RSS in MB against the sum of what `skim_status.memory` counts:
+
+| Minutes | 1 | 31 | 61 | 106 | 136 | 181 |
+|---|---|---|---|---|---|---|
+| RSS | 109 | 203 | 240 | 262 | 265 | 276 |
+| Counted structures | 4 | 46 | 61 | 62 | 63 | 66 |
+
+- **Plateaued within about an hour:** block caches (receipts ~10-11 MB, bodies ~8 MB, envelopes served ~7 MB, raw BALs ~3 MB), recent-BAL writes (~16-18 MB), EL peers (~38).
+- **Still growing, as designed:** the transaction index, transaction hashes and BAL addresses, ~1.5 MB per 15 minutes together until 2,048 blocks (~7 h; about 19 MB more), and headers until ~27 h (a few MB).
+- **Not yet explained:** the gap between RSS and the counted structures (allocator overhead, code pages, network buffers, anything uncounted) grew from ~200 MB to ~210 MB over the last 75 minutes. Slow, but not flat: whether memory levels off is settled only by a run longer than the slowest cache's fill time (7 h; then 27 h).
 
 ### What holds memory
 
