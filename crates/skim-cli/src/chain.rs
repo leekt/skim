@@ -33,8 +33,13 @@ pub enum Placed {
 pub struct Chain {
     pub store: Arc<Store>,
     pub net: ElNet,
-    /// Called for every header applied (gossip or EL replay), before its BAL is applied.
+    /// Called for every header about to be applied (gossip or EL replay), before its BAL is:
+    /// what executing the block's state needs (header caches). Not a commitment: the apply can
+    /// still fail.
     pub on_header: Box<dyn Fn(&Header) + Send + Sync>,
+    /// Called once the store has applied the block: it's canonical now (chain-data index,
+    /// transaction inclusion). Never for a block the store refused.
+    pub on_applied: Box<dyn Fn(&Header) + Send + Sync>,
     /// How far back to look for a common ancestor.
     pub lookback: u64,
     /// Consensus peers: the missing blocks' payload envelopes (with their BALs) when no EL peer
@@ -46,7 +51,11 @@ pub struct Chain {
 impl Chain {
     fn apply(&self, h: &Header, writes: Arc<BlockWrites>) -> Result<StateReady, skim_state::StateError> {
         (self.on_header)(h);
-        self.store.apply_block(block_ref(h), writes)
+        let r = self.store.apply_block(block_ref(h), writes);
+        if r.is_ok() {
+            (self.on_applied)(h);
+        }
+        r
     }
 
     pub async fn place(&self, h: Header, writes: Arc<BlockWrites>) -> Placed {
@@ -288,6 +297,7 @@ mod tests {
             store,
             net,
             on_header: Box::new(|_| {}),
+            on_applied: Box::new(|_| {}),
             lookback: 4,
             cl: with_cl.then(|| Arc::new(source) as Arc<dyn crate::persist::EnvelopeSource>),
         }
@@ -320,6 +330,26 @@ mod tests {
         assert!(matches!(r, Placed::Deferred(_)), "{r:?}");
         assert_eq!(chain.store.head().map(|h| h.number), Some(100));
         assert!(chain.store.block(101).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_block_the_store_refuses_is_never_reported_as_applied() {
+        // Review: the chain-data callback (canonical index, transaction inclusion) ran before
+        // the store applied the block, so a refused block was canonical there but not here.
+        let a = fork(B256::repeat_byte(0x99), 100, 2, 0xa);
+        let mut chain = chain_at(&a[0].0, &[], false).await;
+        let applied = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = applied.clone();
+        chain.on_applied = Box::new(move |h| rec.lock().unwrap().push(h.number));
+        // A child of the head by hash but at the wrong height: the store refuses it.
+        let mut bad = a[1].0.clone();
+        bad.number = 102;
+        assert!(matches!(chain.place(bad, Default::default()).await, Placed::Deferred(_)));
+        assert!(applied.lock().unwrap().is_empty(), "not reported: the store's head is still 100");
+        assert_eq!(chain.store.head().map(|h| h.number), Some(100));
+        // The real child: applied, then reported.
+        assert!(matches!(chain.place(a[1].0.clone(), Default::default()).await, Placed::Applied { .. }));
+        assert_eq!(*applied.lock().unwrap(), vec![101]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

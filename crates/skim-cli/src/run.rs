@@ -467,9 +467,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         net: net.clone(),
         on_header: Box::new(move |h| {
             sim2.insert_header(h.clone());
-            cd2.note_header(h);
             store2.note_header(h.hash_slow(), alloy_rlp::encode(h));
         }),
+        // Chain data (the canonical index, transaction inclusion) follows the store: only a
+        // block it applied is canonical there too.
+        on_applied: Box::new(move |h| cd2.note_header(h)),
         lookback: 32,
         cl: Some(Arc::new(cl.clone())),
     };
