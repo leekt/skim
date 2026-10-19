@@ -9,10 +9,12 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+// Chain data and the post-fork history store live in skim-chain (shared with skim-hub); these
+// keep `crate::chaindata` / `crate::history` paths working.
+use skim_chain::{chaindata, history};
+
 mod bench_node;
 mod chain;
-mod chaindata;
-mod history;
 mod dashboard;
 mod persist;
 mod light;

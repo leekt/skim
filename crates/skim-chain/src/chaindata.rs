@@ -156,19 +156,21 @@ pub struct ChainData {
     withdrawals: Mutex<Cache<Arc<Vec<Withdrawal>>>>,
     bal_raw: Mutex<Cache<Bytes>>,
     pub max_log_range: u64,
+    /// The chain id transactions must carry (EIP-155) to be accepted for sending.
+    pub chain_id: u64,
     rr: AtomicUsize,
     /// Post-Amsterdam headers on disk (`history.redb` in the data dir), so logs and receipts
     /// cover the whole post-fork history. `None` with `--ephemeral`: memory only.
     history: std::sync::OnceLock<crate::history::HeaderStore>,
     /// Blocks whose receipts a scan is fetching right now: concurrent scans of the same blocks
     /// (several modules, or eth_getLogs) wait for that fetch and read the stored result.
-    pub(crate) inflight: Mutex<HashMap<B256, Arc<tokio::sync::Semaphore>>>,
+    pub inflight: Mutex<HashMap<B256, Arc<tokio::sync::Semaphore>>>,
     /// Tests: what connected peers report as the oldest block they serve.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub test_peers_from: Mutex<Option<u64>>,
     /// Tests: run once by a block stream at a named point (`before_capture`, `after_capture` of
     /// its header range, `after_scan` of its logs), e.g. to reorganize the chain mid-request.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub test_hooks: Mutex<HashMap<&'static str, Box<dyn Fn() + Send>>>,
 }
 
@@ -186,7 +188,7 @@ fn topics_def(f: &Filter) -> String {
 
 /// Filters split into atoms: one address with its filter's topic constraints, or (a filter with
 /// no address) the topic constraints alone. Each: identity hash, definition, and the atom filter.
-pub(crate) fn filter_atoms(filters: &[Filter]) -> Vec<(B256, Vec<u8>, Filter)> {
+pub fn filter_atoms(filters: &[Filter]) -> Vec<(B256, Vec<u8>, Filter)> {
     let mut out: Vec<(B256, Vec<u8>, Filter)> = Vec::new();
     for f in filters {
         let t = topics_def(f);
@@ -299,26 +301,26 @@ fn tx_hashes(raw: &[Bytes]) -> Vec<B256> {
 }
 
 impl ChainData {
-    pub fn new(net: ElNet, max_log_range: u64) -> Arc<Self> {
-        Self::with_net(Some(net), max_log_range)
+    pub fn new(net: ElNet, max_log_range: u64, chain_id: u64) -> Arc<Self> {
+        Self::with_net(Some(net), max_log_range, chain_id)
     }
 
     /// Without a network (tests): no peers; headers, receipts and transactions come only from
     /// what's been noted.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub fn offline(max_log_range: u64) -> Arc<Self> {
-        Self::with_net(None, max_log_range)
+        Self::with_net(None, max_log_range, 11155111)
     }
 
     /// Seeds a block's receipts and transaction hashes, as if fetched and verified (tests).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub fn note_receipts(&self, number: u64, hash: B256, receipts: Vec<Receipt>, txs: Vec<B256>) {
         self.receipts.lock().put(hash, Arc::new(receipts));
         let mut g = self.inner.write();
         self.index_txs(&mut g, number, hash, txs);
     }
 
-    fn with_net(net: Option<ElNet>, max_log_range: u64) -> Arc<Self> {
+    fn with_net(net: Option<ElNet>, max_log_range: u64, chain_id: u64) -> Arc<Self> {
         let cd = Arc::new(Self {
             net,
             inner: Default::default(),
@@ -328,12 +330,13 @@ impl ChainData {
             withdrawals: Mutex::new(Cache::new(BLOCK_CACHE)),
             bal_raw: Mutex::new(Cache::new(SERVE_BALS)),
             max_log_range,
+            chain_id,
             rr: AtomicUsize::new(0),
             history: Default::default(),
             inflight: Default::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testkit"))]
             test_peers_from: Default::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testkit"))]
             test_hooks: Default::default(),
         });
         let me = Arc::downgrade(&cd);
@@ -348,8 +351,8 @@ impl ChainData {
     }
 
     /// The post-fork header store, if any (tests).
-    #[cfg(test)]
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
+    #[cfg(any(test, feature = "testkit"))]
     pub fn run_test_hook(&self, stage: &'static str) {
         let f = self.test_hooks.lock().remove(stage);
         if let Some(f) = f {
@@ -397,12 +400,12 @@ impl ChainData {
     }
 
     /// Tests: a block's (verified) access list, as gossip would have delivered it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub fn note_bal(&self, hash: B256, bal: skim_bal::BlockAccessList) {
         self.bals.lock().put(hash, Arc::new(bal));
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub fn history_store(&self) -> Option<&crate::history::HeaderStore> {
         self.history.get()
     }
@@ -502,12 +505,12 @@ impl ChainData {
 
     /// Decodes, checks and gossips a signed transaction. `nonce`/`balance` are the sender's
     /// state at the head (for the same early errors a node's pool would give).
-    pub fn decode_raw(raw: &Bytes) -> Result<(SignedTx, Address), DataError> {
+    pub fn decode_raw(&self, raw: &Bytes) -> Result<(SignedTx, Address), DataError> {
         let tx = SignedTx::decode_2718(&mut raw.as_ref()).map_err(|e| DataError::Invalid(format!("invalid transaction: {e}")))?;
         if tx.is_eip4844() {
             return Err(DataError::Invalid("blob transactions are not supported (no sidecar gossip)".into()));
         }
-        if tx.chain_id().is_some_and(|c| c != skim_sim::env::chain_id()) {
+        if tx.chain_id().is_some_and(|c| c != self.chain_id) {
             return Err(DataError::Invalid(format!("wrong chain id {:?}", tx.chain_id())));
         }
         let from = tx.recover_signer().map_err(|e| DataError::Invalid(format!("invalid signature: {e}")))?;
@@ -609,7 +612,7 @@ impl ChainData {
     /// The oldest block any connected peer serves receipts for (eth/69 `earliest_block`), and how
     /// many peers reported one. Older receipts come only from what skim already holds.
     pub fn peers_serve_from(&self) -> (Option<u64>, usize) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testkit"))]
         if let Some(p) = *self.test_peers_from.lock() {
             return (Some(p), 1);
         }
@@ -651,7 +654,7 @@ impl ChainData {
 
     /// Makes headers down to `number` available: in memory for recent blocks; below that, on
     /// disk (post-Amsterdam history), walking back by hash from the lowest linked header.
-    pub(crate) async fn ensure_headers(&self, number: u64) -> Result<(), DataError> {
+    pub async fn ensure_headers(&self, number: u64) -> Result<(), DataError> {
         let Some(store) = self.history.get() else { return self.ensure_headers_mem(number).await };
         if let Ok(Some(floor)) = store.floor()
             && number < floor
@@ -1229,7 +1232,7 @@ impl ChainData {
     }
 
     /// The headers of `[from, to]` on one hash-linked chain (memory, else the post-fork store).
-    pub(crate) async fn linked_headers(&self, from: u64, to: u64) -> Result<Vec<(u64, B256, Arc<Header>)>, DataError> {
+    pub async fn linked_headers(&self, from: u64, to: u64) -> Result<Vec<(u64, B256, Arc<Header>)>, DataError> {
         self.ensure_headers(from).await?;
         let disk: HashMap<u64, (B256, Arc<Header>)> = {
             let anchor = self.inner.read().headers.first_key_value().map(|(n, (_, hd))| (*n, hd.parent_hash));

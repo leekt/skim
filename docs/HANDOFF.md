@@ -26,7 +26,8 @@ Read first:
 | `skim-state` | the multi-version store, recent-BAL index, archive (`redb`), restart snapshot |
 | `skim-snap` | SNAP scheduler (AIMD per peer, hedging, dedup) |
 | `skim-sim` | EVM (revm) over the store, subscriptions, predictors, prefetch |
-| `skim-cli` | the `skim` binary: `run` (the node), JSON-RPC, chain data and history (`chaindata.rs`, `history.rs`), streams (`stream.rs`), probes |
+| `skim-chain` | chain data (`chaindata`: headers, bodies, receipts, BALs from peers, verified; log scans; transaction lookup and sending) and the post-fork history store (`history`). A library, shared with skim-hub; `testkit` feature for dependent crates' tests |
+| `skim-cli` | the `skim` binary: `run` (the node), JSON-RPC, streams (`stream.rs`), restart persistence, probes |
 | `examples/` | viem examples, `smallname` (an ENS API with its own SQLite index, the reference indexer), `bigname` |
 | `metrics/` | Prometheus + Grafana stack, `gen_dashboard.py` generates the dashboard |
 
@@ -54,20 +55,21 @@ Read first:
 
 **On the devnet** ([devnet/](../devnet), `devnet/run.sh`): verified end to end on the minimal preset, with peers from discovery alone. The light client verifies and rotates, blocks apply ~0.53 s after their slot, and answers match geth (`devnet/check.py`).
 
+**`skim-chain` extracted** from `skim-cli`: chain data and the history store as a library (no behaviour change; `ChainData::new` now takes the chain id). skim-hub can depend on it.
+
 **Memory:** three production hours are in [hardware](guide/hardware.md#memory). Whether RSS levels off is still open (TODO 6).
 
 ## Next tasks (in order)
-1. **Extract a `skim-chain` library** from `skim-cli`: chain following and the history store (`ChainData`, `HeaderStore`), with no behaviour change. skim-hub will depend on it.
-2. **Open items in [`docs/TODO.md`](TODO.md):**
+1. **Open items in [`docs/TODO.md`](TODO.md):**
    - 24: a live blob-parameter fork on a devnet;
    - 25: TCP peers without yamux;
    - 26: probes on any network;
    - 6: memory past 7 h.
-3. **Pending measurements:**
+2. **Pending measurements:**
    - **Huge pages on/off for speed:** a `skim bench-node` A/B on Linux.
    - **Catch-up speed** (blocks/s during a stream backfill) for the use-case guide.
    - **A soak with full correctness coverage,** once the reference provider stops rate-limiting.
-4. **Ideas discussed, not started:**
+3. **Ideas discussed, not started:**
    - per-client quotas on block streams;
    - subscriptions registered per client over RPC, under one budget.
 
@@ -75,5 +77,5 @@ Loose end: `memory_usage.md` (repo root, uncommitted) is a memory-investigation 
 
 ## The skim-hub boundary
 - **skim-hub** is a separate, private repo: a shared chain-data hub for several skim instances. It's a **trusted** setup; data from before Glamsterdam can't be verified by skim.
-- **What skim provides it:** crates (`skim-el`, `skim-cl`, `skim-bal`, `skim-state`, and `skim-chain` once extracted), consumed as git dependencies pinned to a commit. Keep their public APIs stable, or coordinate changes.
+- **What skim provides it:** crates (`skim-el`, `skim-cl`, `skim-bal`, `skim-state`, `skim-chain`), consumed as git dependencies pinned to a commit. Keep their public APIs stable, or coordinate changes.
 - **The leaf side** (`--hub`) lives in this repo, but stays refused until the hub's API is specified (in the skim-hub repo) and the owner asks for it. When implemented, it must be opt-in, record the provenance of every hub answer, keep the free checks (header commitments) on, and fall back to public peers.

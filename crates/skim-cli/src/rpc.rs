@@ -570,7 +570,7 @@ impl Rpc {
             "eth_sendRawTransaction" => {
                 let chain = self.chain()?;
                 let raw: Bytes = need(params, 0)?;
-                let (tx, from) = ChainData::decode_raw(&raw)?;
+                let (tx, from) = chain.decode_raw(&raw)?;
                 // The early errors a node's pool would give, from verified state at the head.
                 use alloy_consensus::Transaction as _;
                 let b = self.resolve_block(None, latest)?;

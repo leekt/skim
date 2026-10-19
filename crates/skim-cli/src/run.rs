@@ -373,7 +373,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     });
     let light = crate::light::Light::new(cl.clone(), persist.clone());
     light.start(args.checkpoint, checkpoint_url);
-    let chaindata = crate::chaindata::ChainData::new(net.clone(), args.max_logs_range);
+    let chaindata = crate::chaindata::ChainData::new(net.clone(), args.max_logs_range, skim_sim::env::chain_id());
     if args.history == HistoryMode::Local {
         anyhow::ensure!(!args.ephemeral, "--history local needs a data dir (not --ephemeral)");
         let dir = args.data_dir.clone().unwrap_or_else(|| default_dir.clone());

@@ -12,7 +12,7 @@ use std::path::Path;
 use alloy_consensus::Header;
 use alloy_primitives::B256;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 use redb::ReadableTableMetadata;
 
 /// number -> (hash, header RLP)
@@ -233,7 +233,7 @@ impl HeaderStore {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub fn get(&self, n: u64) -> Result<Option<(B256, Header)>, StoreError> {
         let tx = self.db.begin_read()?;
         let t = tx.open_table(HEADERS)?;
@@ -407,7 +407,7 @@ impl HeaderStore {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub fn len(&self) -> Result<u64, StoreError> {
         let tx = self.db.begin_read()?;
         Ok(tx.open_table(HEADERS)?.len()?)

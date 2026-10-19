@@ -1,0 +1,32 @@
+[package]
+name = "skim-chain"
+description = "skim's chain data: verified headers, bodies, receipts and BALs from peers, log scans, and the post-Glamsterdam history store (shared with skim-hub)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Test seams (offline construction, seeding data, hooks) for dependent crates' tests.
+testkit = []
+
+[dependencies]
+skim-bal.workspace = true
+skim-el.workspace = true
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-rlp.workspace = true
+alloy-rpc-types-eth.workspace = true
+redb.workspace = true
+zstd = "0.13.3"
+thiserror.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

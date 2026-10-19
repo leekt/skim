@@ -53,6 +53,7 @@ skim-snap = { path = "crates/skim-snap" }
 skim-state = { path = "crates/skim-state" }
 skim-sim = { path = "crates/skim-sim" }
 skim-cl = { path = "crates/skim-cl" }
+skim-chain = { path = "crates/skim-chain" }
 
 [profile.release]
 # Full LTO: +24-28% eth_call throughput over thin LTO (M7), at a slower clean build.

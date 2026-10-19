@@ -7639,6 +7639,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "skim-chain"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-eth",
+ "futures",
+ "parking_lot",
+ "redb",
+ "serde",
+ "serde_json",
+ "skim-bal",
+ "skim-el",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
 name = "skim-cl"
 version = "0.1.0"
 dependencies = [
@@ -7688,6 +7710,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "skim-bal",
+ "skim-chain",
  "skim-cl",
  "skim-el",
  "skim-sim",
