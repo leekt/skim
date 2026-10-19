@@ -28,6 +28,8 @@ smallname avoids maintaining a complete current-state projection. Each kind of a
 - **Returned values are current and consistent:** every value in a response comes from contract state at the block in `meta.as_of`.
 - **A stale or over-inclusive candidate** is dropped by the live check, so it can't put a wrong row in a list.
 - **Lists aren't guaranteed complete.** If Alice transfers a name to Bob and the index hasn't processed that block yet, a lookup of the name shows Bob, Alice's list drops it, and Bob's list doesn't have it yet. Every response that uses the index reports `meta.index.indexed_block` and `lag_blocks`, next to `meta.as_of` (where values were read). Coverage before `history_from_block` is a separate limit, marked as described below.
+  - **For a UI:** show both positions, e.g. "values read at block X" beside "discovery indexed through Y".
+  - **Empty lists:** keep "nothing indexed yet" apart from "none". With `lag_blocks > 0`, an empty list for Bob can just mean the transfer hasn't been indexed, even while a lookup of the name already shows Bob. The test page does this: an empty list says whether the index is caught up, and a list from a lagging index says it may be missing recent changes.
 
 **ENS rules come from the chain.** The Universal Resolver applies ENSv1/ENSv2 resolution. For ownership, smallname follows bigname's [ADR 0007](https://github.com/ensdomains/bigname) ("follow the chain"):
 1. A registered ENSv2 entry decides.

@@ -6,11 +6,11 @@
 <title>smallname</title>
 <style>
   :root {
-    --bg: #f7f7f5; --fg: #1b1b1a; --muted: #6b6b66; --line: #e2e1dc; --card: #fff; --accent: #2f5bea; --ok: #1f7a3a; --bad: #b3261e;
+    --bg: #f7f7f5; --fg: #1b1b1a; --muted: #6b6b66; --line: #e2e1dc; --card: #fff; --accent: #2f5bea; --ok: #1f7a3a; --bad: #b3261e; --warn: #9a5b00; --note: #f4f1e8;
     color-scheme: light;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --bg: #141413; --fg: #ecebe6; --muted: #9b9a93; --line: #2c2b28; --card: #1c1b19; --accent: #7d9bff; --ok: #6cc08b; --bad: #ff8a80; color-scheme: dark; }
+    :root { --bg: #141413; --fg: #ecebe6; --muted: #9b9a93; --line: #2c2b28; --card: #1c1b19; --accent: #7d9bff; --ok: #6cc08b; --bad: #ff8a80; --warn: #e5b05c; --note: #24221d; color-scheme: dark; }
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
@@ -37,6 +37,8 @@
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { color: var(--muted); font-weight: 500; }
   .ok { color: var(--ok); } .bad { color: var(--bad); }
+  .meta .warn { color: var(--warn); }
+  .note { background: var(--note); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 4px 0 10px; font-size: 13px; }
   details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin-top: 8px; }
   a { color: var(--accent); }
 </style>
@@ -79,6 +81,14 @@ async function status() {
 function render(tab, j, ms) {
   if (j.error) return `<div class="card"><b class="bad">${esc(j.error.code)}</b> ${esc(j.error.message)}</div>`;
   const asOf = j.meta?.as_of ? Object.values(j.meta.as_of)[0] : null;
+  // Two positions: live values are read at `read`; lists and history come from the event index,
+  // which has processed blocks up to `indexed`. Between them, an index list can lag a lookup
+  // (e.g. right after a transfer, the new owner's list is still empty).
+  const read = asOf?.block_number ?? null;
+  const idx = j.meta?.index ?? null;
+  const indexed = idx?.indexed_block ?? null;
+  const behind = read != null && indexed != null ? Math.max(0, read - indexed) : 0;
+  const from = j.meta?.history_from_block ?? idx?.history_from_block ?? null;
   let body = "";
   const d = j.data;
   if (tab === "profile") {
@@ -88,7 +98,7 @@ function render(tab, j, ms) {
     if (d.records?.contenthash) rows.push(["contenthash", d.records.contenthash]);
     body = `<div class="grid">${rows.map(([k, v]) => `<div>${esc(k)}</div><div class="mono">${esc(v ?? "–")}</div>`).join("")}</div>`;
   } else if (Array.isArray(d)) {
-    if (!d.length) body = `<div class="meta">no results</div>`;
+    if (!d.length) body = emptyState(behind, read, indexed, from);
     else if ("type" in d[0]) body = table(["block", "type", "name", "kind", "tx"], d.map((e) => [e.block_number, e.type, e.name, e.kind ?? "", e.transaction_hash?.slice(0, 12) + "…"]));
     else body = table(["name", "owner", "status", "expires", "relations"], d.map((r) => [r.name, r.owner, r.status, when(r.expires_at), (r.relations ?? []).join(", ") + (r.is_primary ? " · primary" : "")]));
   } else if (tab === "primary name") {
@@ -96,9 +106,28 @@ function render(tab, j, ms) {
   } else if (tab === "records") {
     body = table(["key", "status", "value"], Object.entries(d.records).map(([k, v]) => [k, v.status, v.value ?? ""]));
   }
+  if (Array.isArray(d) && d.length && behind > 0) {
+    body = `<div class="note">The index is ${behind} block${behind === 1 ? "" : "s"} behind the values shown: names that changed after block ${indexed} may be missing from this list.</div>` + body;
+  }
   const more = j.page?.next_cursor ? ` · more results (cursor)` : "";
-  return `<div class="card"><div class="meta"><span>${ms} ms round trip</span>${j.meta?.smallname_ms != null ? `<span>${j.meta.smallname_ms} ms server</span>` : ""}${asOf ? `<span>as of block ${asOf.block_number}</span>` : ""}${more}</div>${body}
+  const positions =
+    (read != null ? `<span>values read at block ${read}</span>` : "") +
+    (indexed != null ? `<span class="${behind > 0 ? "warn" : ""}">discovery indexed through ${indexed}${behind > 0 ? ` (${behind} behind)` : ""}</span>` : "");
+  return `<div class="card"><div class="meta"><span>${ms} ms round trip</span>${j.meta?.smallname_ms != null ? `<span>${j.meta.smallname_ms} ms server</span>` : ""}${positions}${more}</div>${body}
     <details><summary>JSON</summary><pre>${esc(JSON.stringify(j, null, 2))}</pre></details></div>`;
+}
+/**
+ * An empty list is not always "none": the index may not have reached the block that would add
+ * an entry (lookups read newer state than the index has processed), and it only holds events
+ * from `from` on. Say which empty this is.
+ */
+function emptyState(behind, read, indexed, from) {
+  const since = from != null ? ` It covers events from block ${from} on; earlier activity isn't indexed.` : "";
+  if (behind > 0) {
+    return `<div class="note"><b>Nothing indexed yet, which isn't the same as none.</b> The index has processed blocks through ${indexed}; the values above were read at block ${read}. A change in the last ${behind} block${behind === 1 ? "" : "s"} (a transfer, say) may not be listed yet: a name lookup can already show it.${since}</div>`;
+  }
+  if (indexed != null) return `<div class="note">Nothing found. The index is caught up (through block ${indexed}).${since}</div>`;
+  return `<div class="meta">no results</div>`;
 }
 const table = (h, rows) => `<div class="tablewrap"><table><tr>${h.map((x) => `<th>${esc(x)}</th>`).join("")}</tr>${rows.map((r) => `<tr>${r.map((x) => `<td class="mono">${esc(x)}</td>`).join("")}</tr>`).join("")}</table></div>`;
 
