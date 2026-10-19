@@ -30,6 +30,10 @@ pub struct Args {
     /// skim holds no keys, and listens on localhost by default.
     #[arg(long, default_value = "*")]
     cors: String,
+    /// SNAP hedging: `adaptive` (each peer's own latency decides when a slow request is
+    /// duplicated to another peer) or `fixed` (after 1.2 s). For A/B measurements.
+    #[arg(long, default_value = "adaptive", hide = true)]
+    snap_hedge: String,
     /// The network: `sepolia` (built in), or a network-config directory, as consensus clients
     /// use (and ethereum-package / eth-clients publish): `config.yaml` (with its PRESET_BASE),
     /// `genesis.ssz` or `genesis_validators_root.txt`, `bootstrap_nodes.txt`, plus the execution
@@ -339,7 +343,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     });
     let sched = Scheduler::new(
         transport,
-        skim_snap::Config { no_peer_wait: std::time::Duration::from_secs(args.state_wait), ..Default::default() },
+        skim_snap::Config {
+            no_peer_wait: std::time::Duration::from_secs(args.state_wait),
+            hedge_adaptive: args.snap_hedge != "fixed",
+            ..Default::default()
+        },
     );
     let store = match &args.archive {
         Some(p) => {

@@ -14,6 +14,8 @@ enum Behav {
     /// Root not executed yet: the first `n` requests are unavailable, then it serves.
     DelayedRoot(usize),
     Fail,
+    /// Answers in `ms`, except the `at`-th request overall, which stalls for `stall_ms`.
+    StallAt { ms: u64, at: usize, stall_ms: u64 },
 }
 
 #[derive(Clone)]
@@ -61,6 +63,11 @@ impl Mock {
                 if self.requests.load(Ordering::SeqCst) <= n { Ok(unavailable) } else { Ok(ok()) }
             }
             Behav::Fail => Err(TransportError::Timeout),
+            Behav::StallAt { ms, at, stall_ms } => {
+                let n = self.requests.load(Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(if n == at { stall_ms } else { ms })).await;
+                Ok(ok())
+            }
         };
         self.inflight.lock().get_mut(&peer).unwrap().0 -= 1;
         r
@@ -165,6 +172,29 @@ async fn hedges_slow_peer() {
     let t = Instant::now();
     assert!(s.fetch(&[slot(3)]).await[0].is_ok());
     assert!(t.elapsed() < Duration::from_millis(1000), "took {:?}", t.elapsed());
+}
+
+/// One request stalls at a peer that otherwise answers in ~10 ms: how long until it's answered?
+async fn stalled_read(adaptive: bool) -> Duration {
+    let b = Behav::StallAt { ms: 10, at: 41, stall_ms: 3000 };
+    let m = Mock::new(&[(1, b), (2, b)]);
+    let s = Scheduler::new(m, Config { hedge_adaptive: adaptive, hedge_after: Duration::from_millis(1200), ..cfg() });
+    for i in 0..40 {
+        assert!(s.fetch(&[slot(100 + i)]).await[0].is_ok()); // both peers learn ~10 ms
+    }
+    let t = Instant::now();
+    assert!(s.fetch(&[slot(1)]).await[0].is_ok());
+    t.elapsed()
+}
+
+#[tokio::test]
+async fn a_stall_at_a_fast_peer_is_hedged_after_its_own_latency_not_a_fixed_delay() {
+    // Review (Myotis comparison): hedging after a fixed 1.2 s left the cold-read tail at
+    // ~1.2 s whenever one fast peer stalled. Adaptive: hedged at the 150 ms floor.
+    let adaptive = stalled_read(true).await;
+    assert!(adaptive < Duration::from_millis(500), "adaptive took {adaptive:?}");
+    let fixed = stalled_read(false).await;
+    assert!(fixed >= Duration::from_millis(1200), "fixed took {fixed:?}");
 }
 
 #[tokio::test]

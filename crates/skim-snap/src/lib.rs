@@ -134,8 +134,18 @@ pub struct Config {
     pub adaptive: bool,
     pub inflight_max: usize,
     pub max_attempts: u32,
-    /// Send one duplicate to another peer if no answer after this long.
+    /// Send one duplicate to another peer if no answer after this long. With `hedge_adaptive`,
+    /// the upper bound of the per-peer threshold.
     pub hedge_after: Duration,
+    /// Hedge at the asked peer's own typical latency plus `hedge_k` deviations (clamped to
+    /// `hedge_floor..=hedge_after`), instead of a fixed `hedge_after`: a request stuck at a peer
+    /// that usually answers in 15 ms goes to another one after ~150 ms, not 1.2 s.
+    pub hedge_adaptive: bool,
+    pub hedge_k: f64,
+    pub hedge_floor: Duration,
+    /// Hedges are skipped once they exceed this share of requests (when every peer is slow,
+    /// duplicates only add load).
+    pub hedge_budget: f64,
     pub deadline: Duration,
     /// How long an interactive job waits while no SNAP peer is connected at all (e.g. the first
     /// minute after a cold start) before failing with [`FetchError::NoPeers`].
@@ -153,6 +163,10 @@ impl Default for Config {
             inflight_max: 48,
             max_attempts: 8,
             hedge_after: Duration::from_millis(1200),
+            hedge_adaptive: true,
+            hedge_k: 4.0,
+            hedge_floor: Duration::from_millis(150),
+            hedge_budget: 0.1,
             deadline: Duration::from_secs(15),
             no_peer_wait: Duration::from_secs(3),
             code_batch: 32,
@@ -226,6 +240,8 @@ struct Job {
     unavailable: u32,
     inflight: u32,
     tried: HashSet<PeerId>,
+    /// The peer the latest request went to (whose latency decides when to hedge).
+    last_peer: Option<PeerId>,
     created: Instant,
     first_sent: Option<Instant>,
     last_sent: Option<Instant>,
@@ -240,6 +256,8 @@ struct Peer {
     limit: f64,
     min_ms: Option<f64>,
     ewma_ms: Option<f64>,
+    /// Mean absolute deviation of answer times around `ewma_ms` (EWMA).
+    dev_ms: Option<f64>,
     ok: u64,
     errors: u64,
     /// Roots this peer couldn't serve, and when. Retried after `ROOT_RETRY`: at the head a peer
@@ -418,6 +436,7 @@ impl<T: Transport> Inner<T> {
                 unavailable: 0,
                 inflight: 0,
                 tried: HashSet::new(),
+                last_peer: None,
                 created: Instant::now(),
                 first_sent: None,
                 last_sent: None,
@@ -548,7 +567,8 @@ impl<T: Transport> Inner<T> {
                 && !j.low
                 && !j.hedged
                 && !j.queued
-                && j.last_sent.is_some_and(|t| now.duration_since(t) > self.cfg.hedge_after)
+                && j.last_sent.is_some_and(|t| now.duration_since(t) > self.hedge_threshold(&st, j.last_peer))
+                && (st.stats.hedges as f64) < self.cfg.hedge_budget * (st.stats.requests as f64) + 1.0
             {
                 hedge.push(*k);
             }
@@ -570,6 +590,18 @@ impl<T: Transport> Inner<T> {
         // Place queued jobs: simulations first, then background work in what's left.
         self.place(&mut st, false);
         self.place(&mut st, true);
+    }
+
+    /// How long a request to `peer` may go unanswered before it's hedged.
+    fn hedge_threshold(&self, st: &State, peer: Option<PeerId>) -> Duration {
+        let cap = self.cfg.hedge_after;
+        if !self.cfg.hedge_adaptive {
+            return cap;
+        }
+        let Some((mean, dev)) = peer.and_then(|p| st.peers.get(&p)).and_then(|p| Some((p.ewma_ms?, p.dev_ms.unwrap_or(0.0)))) else {
+            return cap; // no history for this peer yet
+        };
+        Duration::from_secs_f64((mean + self.cfg.hedge_k * dev) / 1e3).clamp(self.cfg.hedge_floor, cap)
     }
 
     fn place(self: &Arc<Self>, st: &mut State, low: bool) {
@@ -608,6 +640,7 @@ impl<T: Transport> Inner<T> {
                 j.inflight += 1;
                 j.attempts += 1;
                 j.tried.insert(peer);
+                j.last_peer = Some(peer);
                 j.first_sent.get_or_insert_with(Instant::now);
                 j.last_sent = Some(Instant::now());
             }
@@ -669,6 +702,8 @@ impl<T: Transport> Inner<T> {
                 if let Some(p) = st.peers.get_mut(&peer) {
                     p.on_answer(&self.cfg, elapsed_ms);
                     p.ok += 1;
+                    let mean = p.ewma_ms.unwrap_or(elapsed_ms);
+                    p.dev_ms = Some(p.dev_ms.map_or(0.0, |d| 0.8 * d + 0.2 * (elapsed_ms - mean).abs()));
                     p.ewma_ms = Some(p.ewma_ms.map_or(elapsed_ms, |e| 0.8 * e + 0.2 * elapsed_ms));
                 }
                 let mut answered = HashSet::new();
