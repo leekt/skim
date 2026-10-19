@@ -480,6 +480,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let sim2 = sim.clone();
     let store2 = store.clone();
     let cd2 = chaindata.clone();
+    let cd3 = chaindata.clone();
     let chain = Chain {
         store: store.clone(),
         net: net.clone(),
@@ -490,6 +491,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         // Chain data (the canonical index, transaction inclusion) follows the store: only a
         // block it applied is canonical there too.
         on_applied: Box::new(move |h| cd2.note_header(h)),
+        on_rollback: Box::new(move |n| cd3.rollback_to(n)),
         lookback: 32,
         cl: Some(Arc::new(cl.clone())),
     };

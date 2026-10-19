@@ -416,6 +416,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         net: ctx.net.clone(),
         on_header: Box::new(|_| {}),
         on_applied: Box::new(|_| {}),
+        on_rollback: Box::new(|_| {}),
         lookback: 32,
         cl: None,
     };

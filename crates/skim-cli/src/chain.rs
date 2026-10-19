@@ -40,6 +40,10 @@ pub struct Chain {
     /// Called once the store has applied the block: it's canonical now (chain-data index,
     /// transaction inclusion). Never for a block the store refused.
     pub on_applied: Box<dyn Fn(&Header) + Send + Sync>,
+    /// Called before the store rolls back to a block (a reorg): whatever mirrors the canonical
+    /// chain (ChainData) forgets the blocks above it first, so no request sees the old fork there
+    /// while the store no longer has it.
+    pub on_rollback: Box<dyn Fn(u64) + Send + Sync>,
     /// How far back to look for a common ancestor.
     pub lookback: u64,
     /// Consensus peers: the missing blocks' payload envelopes (with their BALs) when no EL peer
@@ -49,6 +53,11 @@ pub struct Chain {
 }
 
 impl Chain {
+    fn rollback(&self, n: u64) {
+        (self.on_rollback)(n);
+        self.store.rollback_to(n);
+    }
+
     fn apply(&self, h: &Header, writes: Arc<BlockWrites>) -> Result<StateReady, skim_state::StateError> {
         (self.on_header)(h);
         let r = self.store.apply_block(block_ref(h), writes);
@@ -76,7 +85,7 @@ impl Chain {
             && b.number > 0
             && self.store.block(b.number - 1).is_some_and(|p| p.hash == b.parent_hash)
         {
-            self.store.rollback_to(b.number - 1);
+            self.rollback(b.number - 1);
             return match self.apply(&h, writes) {
                 Ok(ready) => Placed::Applied { ready, reorged_to: Some(b.number - 1), filled: 0 },
                 Err(e) => Placed::Deferred(e.to_string()),
@@ -89,7 +98,7 @@ impl Chain {
             },
             Err(Reconcile::NoAncestor) => {
                 tracing::warn!(number = b.number, "no common ancestor in window; re-anchoring");
-                self.store.rollback_to(0);
+                self.rollback(0);
                 // rollback_to(0) keeps block 0 entries only; start fresh at this block.
                 match self.apply(&h, writes) {
                     Ok(r) => Placed::Reanchored(r),
@@ -143,7 +152,7 @@ impl Chain {
             if decoded.len() != replay.len() {
                 continue;
             }
-            self.store.rollback_to(ancestor);
+            self.rollback(ancestor);
             for (h, w) in replay.iter().zip(decoded) {
                 if let Err(e) = self.apply(h, w) {
                     return Err(Reconcile::Defer(format!("replay failed at {}: {e}", h.number)));
@@ -192,7 +201,7 @@ impl Chain {
         })
         .await?;
         let ancestor = found.ok_or_else(|| anyhow::anyhow!("envelopes didn't link to a stored block"))?;
-        self.store.rollback_to(ancestor);
+        self.rollback(ancestor);
         let mut n_applied = 0;
         for (_, (h, w)) in got.range(ancestor + 1..b.number) {
             self.apply(h, Arc::new(w.clone())).map_err(|e| anyhow::anyhow!("replay failed at {}: {e}", h.number))?;
@@ -298,6 +307,7 @@ mod tests {
             net,
             on_header: Box::new(|_| {}),
             on_applied: Box::new(|_| {}),
+            on_rollback: Box::new(|_| {}),
             lookback: 4,
             cl: with_cl.then(|| Arc::new(source) as Arc<dyn crate::persist::EnvelopeSource>),
         }
@@ -350,6 +360,30 @@ mod tests {
         // The real child: applied, then reported.
         assert!(matches!(chain.place(a[1].0.clone(), Default::default()).await, Placed::Applied { .. }));
         assert_eq!(*applied.lock().unwrap(), vec![101]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reorg_rolls_chain_data_back_before_the_store_then_applies_the_new_block() {
+        // Review: on a reorg the store rolled back while ChainData kept the old fork until the
+        // new block was applied, so a concurrent request could mix the two.
+        let a = fork(B256::repeat_byte(0x99), 100, 2, 0xa);
+        let b = fork(a[0].0.hash_slow(), 101, 1, 0xb);
+        let mut chain = chain_at(&a[0].0, &[], false).await;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (e1, e2) = (events.clone(), events.clone());
+        let store = chain.store.clone();
+        chain.on_applied = Box::new(move |h| e1.lock().unwrap().push(format!("applied {} {:x}", h.number, h.hash_slow().0[0])));
+        chain.on_rollback = Box::new(move |n| {
+            // Called before the store rolls back: it still holds the old fork's head.
+            e2.lock().unwrap().push(format!("rollback {n} (store head {})", store.head().unwrap().number));
+        });
+        assert!(matches!(chain.place(a[1].0.clone(), Default::default()).await, Placed::Applied { .. }));
+        assert!(matches!(chain.place(b[0].0.clone(), Default::default()).await, Placed::Applied { reorged_to: Some(100), .. }));
+        let ev = events.lock().unwrap().clone();
+        assert_eq!(ev.len(), 3, "{ev:?}");
+        assert!(ev[0].starts_with("applied 101"));
+        assert_eq!(ev[1], "rollback 100 (store head 101)");
+        assert!(ev[2].starts_with("applied 101") && ev[2] != ev[0], "the new fork's block: {ev:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

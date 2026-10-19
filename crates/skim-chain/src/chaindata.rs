@@ -660,6 +660,20 @@ impl ChainData {
         self.index_txs(&mut g, number, hash, &hashes, keep.as_deref());
     }
 
+    /// The chain is being reorganized: forgets every block above `n` (headers, index entries,
+    /// inclusions of sent transactions, which become pending again) before the store rolls back,
+    /// so no request sees the old fork here while the store no longer has it.
+    pub fn rollback_to(&self, n: u64) {
+        let mut g = self.inner.write();
+        let stale: Vec<u64> = g.headers.range(n + 1..).map(|(k, _)| *k).collect();
+        for k in stale {
+            g.drop_header(k);
+            g.unindex_block(k);
+            g.unwind_included(k, None);
+            g.touched.remove(&k);
+        }
+    }
+
     /// Transactions, withdrawals, BAL (decoded and raw) and BAL addresses of a verified gossiped
     /// payload.
     #[allow(clippy::too_many_arguments)]
@@ -2013,5 +2027,22 @@ mod tests {
         assert_eq!(found(&cd, &t), Some((100, 1)));
         assert_eq!(found(&cd, &h[0]), Some((100, 0)), "B100 indexed");
         assert_eq!(cd.transaction(t).await.unwrap()["blockNumber"], json!("0x64"));
+    }
+
+    /// Review: a reorg's rollback must clear the old fork here before the store rolls back.
+    #[tokio::test]
+    async fn rolling_back_forgets_the_old_forks_blocks_and_inclusions() {
+        let cd = ChainData::offline(100);
+        cd.set_tx_index(TxIndexConfig { mode: TxIndexMode::All, blocks: 16 }, None);
+        let tx = legacy_tx(7, Address::repeat_byte(3));
+        let t = sent(&cd, &tx);
+        note_txs(&cd, 19, &[legacy_tx(1, Address::repeat_byte(4))], vec![]);
+        let (_, h20) = note_txs(&cd, 20, &[tx.clone(), legacy_tx(2, Address::repeat_byte(4))], vec![]);
+        assert_eq!(found(&cd, &t), Some((20, 0)));
+        cd.rollback_to(19);
+        assert!(cd.inner.read().sent.contains_key(&t), "pending again");
+        assert_eq!(found(&cd, &h20[1]), None, "block 20's index is gone");
+        assert!(cd.inner.read().headers.get(&20).is_none());
+        assert!(cd.inner.read().headers.get(&19).is_some(), "the common ancestor stays");
     }
 }
