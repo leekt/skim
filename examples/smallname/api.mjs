@@ -23,6 +23,50 @@ class ApiError extends Error {
 const bad = (m, d) => new ApiError(400, "invalid_input", m, d);
 const unsupported = (m, reason) => new ApiError(422, "unsupported", m, { unsupported_reason: reason });
 
+/** What a list check returns when the candidate's live state couldn't be read. */
+export const UNAVAILABLE = Symbol("unavailable");
+
+/**
+ * Fills a page from index candidates that are re-checked live: `candidates(after, n)` returns
+ * rows in key order, `check(row)` the response row, null (checked: it no longer matches), or
+ * UNAVAILABLE (its state couldn't be read). Checks continue past dropped candidates (bounded),
+ * so a page is full unless the candidates run out. An unreadable candidate ends the page just
+ * before it: the next cursor resumes there, so it's re-checked rather than skipped, and the
+ * result says `unavailable`. If it's the first candidate, the request fails (503) instead.
+ */
+export async function fill(candidates, check, keyOf, size, after) {
+  const out = [];
+  let last = after;
+  let more = false;
+  let unavailable = false;
+  for (let rounds = 0; out.length < size && rounds < 8 && !unavailable; rounds++) {
+    const batch = candidates(last, size * 2);
+    if (!batch.length) break;
+    const checked = await Promise.all(batch.map(check));
+    for (let i = 0; i < batch.length; i++) {
+      if (checked[i] === UNAVAILABLE) {
+        unavailable = true;
+        more = true;
+        break;
+      }
+      last = keyOf(batch[i]);
+      if (checked[i]) out.push(checked[i]);
+      if (out.length === size) {
+        more = i < batch.length - 1 || candidates(last, 1).length > 0;
+        break;
+      }
+    }
+    if (unavailable) break;
+    if (out.length < size && batch.length < size * 2) {
+      more = false;
+      break;
+    }
+    more = true;
+  }
+  if (unavailable && !out.length) throw new ApiError(503, "state_unavailable", "a candidate's live state couldn't be read; retry the same request", { retry: true });
+  return { rows: out, last, more, unavailable };
+}
+
 const enc = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
 function dec(c, scope) {
   try {
@@ -72,6 +116,7 @@ export function serve(store, { skim, port, host }) {
       missing = row.parent;
     }
     const r = await rd.one({ to: V1.nameWrapper, abi: VIEWS.nameWrapper, functionName: "names", args: [missing] });
+    if (!r.ok && r.code !== 3) return UNAVAILABLE; // couldn't be read: not "no name"
     if (!r.ok || r.value === "0x") return null;
     try {
       const name = dnsLabels(r.value).join(".");
@@ -180,35 +225,8 @@ export function serve(store, { skim, port, host }) {
     const ns = q.get("namespace");
     if (ns && ns !== "ens") throw unsupported(`namespace ${ns} is not indexed by smallname`, "not_supported_for_namespace");
   }
-  /**
-   * Fills a page from index candidates that are re-checked live: `candidates(after, n)` returns
-   * rows in key order, `check(row)` the response row or null (no longer holds). Checks continue
-   * past dropped candidates (bounded), so a page is full unless the candidates run out.
-   */
-  async function fill(candidates, check, keyOf, size, after) {
-    const out = [];
-    let last = after;
-    let more = false;
-    for (let rounds = 0; out.length < size && rounds < 8; rounds++) {
-      const batch = candidates(last, size * 2);
-      if (!batch.length) break;
-      const checked = await Promise.all(batch.map(check));
-      for (let i = 0; i < batch.length; i++) {
-        last = keyOf(batch[i]);
-        if (checked[i]) out.push(checked[i]);
-        if (out.length === size) {
-          more = i < batch.length - 1 || candidates(last, 1).length > 0;
-          break;
-        }
-      }
-      if (out.length < size && batch.length < size * 2) {
-        more = false;
-        break;
-      }
-      more = true;
-    }
-    return { rows: out, last, more };
-  }
+  // A page cut short by an unreadable candidate says so (its next cursor resumes there).
+  const listMeta = (rd, f) => ({ ...asOf(rd), ...partialMeta(), ...(f.unavailable && { incomplete: { reason: "state_unavailable", retry: "next_cursor" } }) });
   const page = (cursor, next, size, total = null) => ({ cursor: cursor ?? null, next_cursor: next, page_size: size, total_count: total, has_more: !!next });
 
   // ---- routes ----
@@ -287,11 +305,12 @@ export function serve(store, { skim, port, host }) {
       node, k, ...(qq ? [like] : []), n);
     const check = async (r) => {
       const row = await nameRow(rd, `${r.label}.${name}`, r.node);
+      if (row.read_status === "failed") return UNAVAILABLE;
       return q.get("include_expired") === "true" || row.status === "active" || row.status === "expired" ? strip(row) : null;
     };
     const f = await fill(cands, check, (r) => r.label, size, after);
     const total = store.get("SELECT count(*) c FROM names WHERE parent = ?", node).c;
-    return { data: f.rows, page: page(cursor, f.more ? enc({ s: scope, k: f.last }) : null, size, total), meta: { ...asOf(rd), ...partialMeta() } };
+    return { data: f.rows, page: page(cursor, f.more ? enc({ s: scope, k: f.last }) : null, size, total), meta: listMeta(rd, f) };
   }
 
   function historyQuery(q, where, args, scope, cursor) {
@@ -353,13 +372,16 @@ export function serve(store, { skim, port, host }) {
       address.toLowerCase(), ...rels, k, n);
     const check = async (r) => {
       const name = await nameOfLive(rd, r.node);
+      if (name === UNAVAILABLE) return UNAVAILABLE;
       if (!name) return null;
       const row = await nameRow(rd, name, r.node);
+      if (row.read_status === "failed") return UNAVAILABLE;
       const holds = [];
       if (row.owner?.toLowerCase() === address.toLowerCase()) holds.push("owner");
       if (row.manager?.toLowerCase() === address.toLowerCase()) holds.push("manager");
       if (rels[0].startsWith("addr:")) {
         const rec = await records(rd, name, [rels[0]]);
+        if (rec.records[rels[0]]?.status === "failed") return UNAVAILABLE;
         if (rec.records[rels[0]]?.value?.toLowerCase() === address.toLowerCase()) holds.push("resolves_to");
       }
       const wanted = relation === "any" ? holds.filter((h) => h !== "resolves_to") : holds.filter((h) => h === relation);
@@ -370,7 +392,7 @@ export function serve(store, { skim, port, host }) {
     const primary = await primaryName(rd, address);
     for (const r of out) r.is_primary = primary.status === "ok" && primary.name === r.name;
     out.sort((a, b) => (a.name < b.name ? -1 : 1));
-    return { data: out, page: page(cursor, f.more ? enc({ s: scope, k: f.last }) : null, size), meta: { ...asOf(rd), ...partialMeta() } };
+    return { data: out, page: page(cursor, f.more ? enc({ s: scope, k: f.last }) : null, size), meta: listMeta(rd, f) };
   }
 
   async function search(rd, q, cursor) {
@@ -385,12 +407,14 @@ export function serve(store, { skim, port, host }) {
       like, k, n);
     const check = async (r) => {
       const name = await nameOfLive(rd, r.node);
+      if (name === UNAVAILABLE) return UNAVAILABLE;
       if (!name) return null;
       const row = await nameRow(rd, name, r.node);
+      if (row.read_status === "failed") return UNAVAILABLE;
       return row.status === "active" || row.status === "expired" ? strip(row) : null;
     };
     const f = await fill(cands, check, (r) => r.label + r.node, size, after);
-    return { data: f.rows, page: page(cursor, f.more ? enc({ s: scope, k: f.last }) : null, size), meta: { ...asOf(rd), ...partialMeta() } };
+    return { data: f.rows, page: page(cursor, f.more ? enc({ s: scope, k: f.last }) : null, size), meta: listMeta(rd, f) };
   }
 
   async function expiring(rd, q, cursor) {
@@ -411,13 +435,15 @@ export function serve(store, { skim, port, host }) {
       after, before, ...(k ? [k.e, k.e, k.n] : []), n);
     const check = async (r) => {
       const name = await nameOfLive(rd, r.node);
+      if (name === UNAVAILABLE) return UNAVAILABLE;
       if (!name) return null;
       const row = await nameRow(rd, name, r.node);
+      if (row.read_status === "failed") return UNAVAILABLE;
       const e = Number(row.expires_at);
       return row.expires_at != null && e >= after && e < before ? strip(row) : null;
     };
     const f = await fill(cands, check, (r) => ({ e: r.expires, n: r.node }), size, c0 ? { e: c0.e, n: c0.n } : null);
-    return { data: f.rows, page: page(cursor, f.more ? enc({ s: scope, ...f.last }) : null, size), meta: { ...asOf(rd), ...partialMeta() } };
+    return { data: f.rows, page: page(cursor, f.more ? enc({ s: scope, ...f.last }) : null, size), meta: listMeta(rd, f) };
   }
 
   async function lookup(rd, body) {
@@ -508,8 +534,10 @@ export function serve(store, { skim, port, host }) {
       "SELECT DISTINCT node FROM events WHERE type = 'resolver' AND actor = ? AND node IS NOT NULL AND node > ? ORDER BY node LIMIT ?", a, k, n);
     const check = async (r) => {
       const name = await nameOfLive(rd, r.node);
+      if (name === UNAVAILABLE) return UNAVAILABLE;
       if (!name) return null;
       const row = await nameRow(rd, name, r.node);
+      if (row.read_status === "failed") return UNAVAILABLE;
       return row._resolver?.toLowerCase() === a ? strip(row) : null;
     };
     const f = await fill(cands, check, (r) => r.node, size, after);
@@ -521,7 +549,7 @@ export function serve(store, { skim, port, host }) {
         bound_names: f.rows,
       },
       page: page(cursor, f.more ? enc({ s: scope, k: f.last }) : null, size),
-      meta: { ...asOf(rd), ...partialMeta() },
+      meta: listMeta(rd, f),
     };
   }
 
@@ -571,7 +599,8 @@ export function serve(store, { skim, port, host }) {
   /** GET /v1/registries/{chain}/{address}: an ENSv2 registry's place in the tree and size. */
   async function registryOverview(rd, a) {
     const r = registryRow(a);
-    const parentName = r.parent_node ? (r.parent_node === "0x" + "00".repeat(32) ? "" : await nameOfLive(rd, r.parent_node)) : null;
+    let parentName = r.parent_node ? (r.parent_node === "0x" + "00".repeat(32) ? "" : await nameOfLive(rd, r.parent_node)) : null;
+    if (parentName === UNAVAILABLE) parentName = null; // unknown here; the namehash is still given
     return {
       data: {
         chain_id: CHAIN_ID, address: a,
@@ -592,7 +621,8 @@ export function serve(store, { skim, port, host }) {
     const exclude = q.get("exclude_owner") ? parseAddress(q.get("exclude_owner")).toLowerCase() : null;
     const scope = `reg:${a}:${owner ?? ""}:${exclude ?? ""}`;
     const after = cursor ? dec(cursor, scope).k : "";
-    const parentName = r.parent_node ? await nameOfLive(rd, r.parent_node) : null;
+    let parentName = r.parent_node ? await nameOfLive(rd, r.parent_node) : null;
+    if (parentName === UNAVAILABLE) parentName = null;
     const cands = (k, n) => store.all(
       `SELECT t.labelhash, t.node, coalesce(l.label, '[' || substr(t.labelhash, 3) || ']') AS label FROM v2_tokens t LEFT JOIN labels l ON l.labelhash = t.labelhash
        WHERE t.registry = ? AND t.labelhash > ? ORDER BY t.labelhash LIMIT ?`, a, k, n);

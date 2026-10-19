@@ -10,6 +10,7 @@ import { Ingest, child } from "./ingest.mjs";
 import { applyResponse } from "./sync.mjs";
 import { EVENTS, V1, V2 } from "./contracts.mjs";
 import { nameState } from "./live.mjs";
+import { fill, UNAVAILABLE } from "./api.mjs";
 
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
@@ -165,6 +166,28 @@ test("a reorg puts a re-mounted registry and its tokens back where they were", (
   store.rollback(95);
   assert.deepEqual(place(), [{ p: null, f: 0 }, null], "block 100's first mount undone");
   assert.equal(store.get("SELECT count(*) c FROM mount_undo").c, 0);
+});
+
+test("a list never skips a name whose live read failed: the page stops there, or the request fails", async () => {
+  // Review: Alice holds a.eth, b.eth, c.eth (page size 1). a.eth's read failed once: the page
+  // returned b.eth with a cursor after it, and a.eth was silently missing from the walk.
+  const names = ["a", "b", "c"];
+  const cands = (k, n) => names.filter((x) => x > k).slice(0, n);
+  const failing = new Set(["a"]);
+  const check = async (x) => (failing.has(x) ? UNAVAILABLE : x === "nope" ? null : x);
+  await assert.rejects(fill(cands, check, (x) => x, 1, ""), (e) => e.status === 503, "the first candidate unreadable: an explicit failure");
+  failing.clear();
+  assert.deepEqual((await fill(cands, check, (x) => x, 1, "")).rows, ["a"], "a retry finds it");
+  // A failure mid-page: the page ends before it, says so, and the cursor resumes there.
+  failing.add("b");
+  const p1 = await fill(cands, check, (x) => x, 2, "");
+  assert.deepEqual([p1.rows, p1.last, p1.more, p1.unavailable], [["a"], "a", true, true]);
+  failing.clear();
+  const p2 = await fill(cands, check, (x) => x, 2, p1.last);
+  assert.deepEqual(p2.rows, ["b", "c"], "b is re-checked, not skipped");
+  // A confirmed non-match is still passed over.
+  names.splice(1, 0, "nope");
+  assert.deepEqual((await fill(cands, check, (x) => x, 3, "")).rows, ["a", "b", "c"]);
 });
 
 /** A reader whose calls answer from `answers[functionName]` (a value, or a failure object). */

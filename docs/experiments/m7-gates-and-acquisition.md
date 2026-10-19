@@ -201,6 +201,15 @@ The thirteenth review's three findings (smallname P1 and P2, archive P2) were fi
 
 All mutation-checked. Two fixes have a second guard that no test isolates: the "same hash already indexed" check behind "no BAL decides nothing", and the resubscription base write behind the warm-up archive write. Each test fails with both halves removed.
 
+## Fifteenth review: ingestion order of the transaction index, archive rewrites, smallname lists
+| Finding | Fix | Regression test |
+|---|---|---|
+| P1: `skim run` notes a payload before the chain placer decides on its block, and the payload marked sent transactions included right away. A block never adopted (placement deferred: parent missing) made a transaction "included" and stopped its re-broadcast; in a same-height reorg the new fork's inclusion was recorded first and then wiped by the old fork's cleanup | A payload only fills caches. Indexing and inclusion happen once the block is canonical (header noted) and its body cached, whichever comes second, after a reorg's cleanup. The test helper follows `skim run`'s order | `a_payload_skim_hasnt_adopted_never_makes_a_transaction_included`, `a_same_height_reorg_includes_the_new_forks_transaction` (both fail with the old order) |
+| P2: the archive warm-up fix made every registration of an archived key rewrite its base, and subscription maintenance registers archive keys every block: one redb commit per key per block, under the store's write lock | The store records which archived keys have their base in the current segment (and at which block); a registration writes only when it's missing. Cleared on release and, above the fork point, on rollback. `StoreSizes.archive_base_writes` counts writes | `re_subscribing_an_archived_key_whose_base_is_written_writes_nothing` (50 registrations, no extra writes) |
+| P2 (smallname): list routes treated a name whose live read failed as a non-match and moved the cursor past it, so a page walk could silently miss a name | A check returns a row, null (a confirmed non-match) or `UNAVAILABLE`; the page stops before an unavailable candidate (`meta.incomplete`, cursor resumes there), or fails with 503 if it's the first | "a list never skips a name whose live read failed…" (`fill` over a, b, c with one read failing) |
+
+All mutation-checked. Not done: batching the initial base writes of many keys into one commit (each key is now written once per segment).
+
 ## Peer requests: coalescing and fetch order
 Measured on the aarch64 Linux deployment host (2 cores), each run on a fresh instance with its own ports and data directory, counted with `skim_status.peer_requests`.
 
