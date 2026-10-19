@@ -16,6 +16,9 @@ enum Behav {
     Fail,
     /// Answers in `ms`, except the `at`-th request overall, which stalls for `stall_ms`.
     StallAt { ms: u64, at: usize, stall_ms: u64 },
+    /// Answers in `ms`; every `stall_every`-th request overall stalls `stall_ms`, every
+    /// `fail_every`-th fails at once (a dropped request). Deterministic.
+    Chaos { ms: u64, stall_every: usize, stall_ms: u64, fail_every: usize },
 }
 
 #[derive(Clone)]
@@ -63,6 +66,15 @@ impl Mock {
                 if self.requests.load(Ordering::SeqCst) <= n { Ok(unavailable) } else { Ok(ok()) }
             }
             Behav::Fail => Err(TransportError::Timeout),
+            Behav::Chaos { ms, stall_every, stall_ms, fail_every } => {
+                let n = self.requests.load(Ordering::SeqCst);
+                if n % fail_every == fail_every / 2 {
+                    Err(TransportError::Timeout)
+                } else {
+                    tokio::time::sleep(Duration::from_millis(if n % stall_every == 0 { stall_ms } else { ms })).await;
+                    Ok(ok())
+                }
+            }
             Behav::StallAt { ms, at, stall_ms } => {
                 let n = self.requests.load(Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(if n == at { stall_ms } else { ms })).await;
@@ -356,3 +368,52 @@ async fn background_work_runs_on_a_peer_with_a_cap_of_one() {
     let r = tokio::time::timeout(Duration::from_secs(2), f).await.expect("background job ran");
     assert!(r.0.is_ok());
 }
+
+/// Cold reads against peers that sometimes stall or drop a request: (sorted latencies in ms,
+/// requests sent).
+async fn chaos_reads(adaptive: bool, n: usize) -> (Vec<f64>, usize) {
+    let b = Behav::Chaos { ms: 10, stall_every: 33, stall_ms: 2000, fail_every: 97 };
+    let m = Mock::new(&[(1, b), (2, b), (3, b)]);
+    let requests = m.requests.clone();
+    let s = Scheduler::new(m, Config { hedge_adaptive: adaptive, hedge_after: Duration::from_millis(1200), deadline: Duration::from_secs(15), ..cfg() });
+    for i in 0..30 {
+        let _ = s.fetch(&[slot(1_000_000 + i)]).await; // peers learn their latency
+    }
+    let start_requests = requests.load(Ordering::SeqCst);
+    let mut lat = Vec::new();
+    for wave in 0..n / 6 {
+        let futs = (0..6).map(|j| {
+            let s = s.clone();
+            async move {
+                let t = Instant::now();
+                let ok = s.fetch(&[slot((wave * 6 + j) as u64)]).await[0].is_ok();
+                (t.elapsed().as_secs_f64() * 1e3, ok)
+            }
+        });
+        for (ms, ok) in futures::future::join_all(futs).await {
+            assert!(ok);
+            lat.push(ms);
+        }
+    }
+    lat.sort_by(f64::total_cmp);
+    (lat, requests.load(Ordering::SeqCst) - start_requests)
+}
+
+/// Run with `cargo test -p skim-snap --release -- --ignored --nocapture hedging_under_injected`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a benchmark: ~1 minute"]
+async fn hedging_under_injected_stalls_and_drops() {
+    let pct = |v: &[f64], p: f64| v[((p / 100.0) * v.len() as f64) as usize].round();
+    let mut p99 = Vec::new();
+    for adaptive in [true, false] {
+        let (v, req) = chaos_reads(adaptive, 600).await;
+        println!(
+            "{:8}: n={} p50={} p95={} p99={} max={} ms, requests/read={:.2}",
+            if adaptive { "adaptive" } else { "fixed" },
+            v.len(), pct(&v, 50.0), pct(&v, 95.0), pct(&v, 99.0), v.last().unwrap().round(), req as f64 / v.len() as f64
+        );
+        p99.push(pct(&v, 99.0));
+    }
+    assert!(p99[0] < p99[1], "adaptive p99 {} vs fixed {}", p99[0], p99[1]);
+}
+

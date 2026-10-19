@@ -10,7 +10,7 @@ Items are removed from this file when they're done, and the commit that closes o
     shown not to exist on the networks skim targets.
 
 ## Measurements
-27. **Hedged fetch under stalls.** Measured on 3,600 interleaved cold reads: no regression and no extra requests with healthy peers, but no peer stalled, so the benefit (re-sending after ~150 ms instead of 1.2 s) wasn't observed live (M7, "Hedged fetch"). Done when a run that includes stalls (a long soak; `skim_snap_fetch` hedges > 0) shows the tail with adaptive vs fixed.
+27. **Hedged fetch under live stalls.** With injected stalls (mock peers, ~3% stalling 2 s) adaptive hedging cuts p99 from 1,233 to 187 ms at no extra request cost; on 3,600 live cold reads it cost nothing but no peer stalled, so the live benefit is unobserved (M7, "Hedged fetch"). The maximum stays ~1.2 s when a job's one hedge also stalls. Done when a run that includes stalls (a long soak; `skim_snap_fetch` hedges > 0) shows the tail with adaptive vs fixed.
 
 ## Releases
 28. **Signed releases.** `install.sh` checks each tarball's SHA-256 from the same release, which catches corrupted downloads but not a compromised release. Done when release artifacts carry signatures or build provenance (e.g. GitHub artifact attestations) and the install docs say how to verify them.

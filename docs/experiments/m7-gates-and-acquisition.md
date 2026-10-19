@@ -366,3 +366,12 @@ One node (build `d72e0ae`, `--debug-rpc`, macOS, 5+ SNAP peers), 3,600 cold read
 
 (Ranges: the two batches, 600 and 3,000 reads.) No peer stalled in these runs: the slowest read was 330 ms, far below the fixed 1.2 s threshold, so neither mode had a tail to cut, and adaptive hedging cost nothing (one hedge in 3,600 reads). Its benefit, a stalled request re-sent after ~150 ms instead of 1.2 s, is shown by `a_stall_at_a_fast_peer_is_hedged_after_its_own_latency_not_a_fixed_delay` but wasn't observed live, because the condition didn't occur. Earlier runs did record stalls (worst on-path fetch 1.6 s, [M2](m2-p0-miss-tail.md)); a long soak with the hedge counter is where they'd show.
 
+**With injected faults** (review 18 asked to separate this from live soaks): `hedging_under_injected_stalls_and_drops` in `skim-snap` (an `#[ignore]` benchmark: `cargo test -p skim-snap --release -- --ignored --nocapture hedging_under_injected`). Three mock peers answer in 10 ms; deterministically, every 33rd request stalls 2 s (~3%) and every 97th fails at once (~1%). 600 reads in waves of 6, after 30 warm-up reads:
+
+| Mode | p50 | p95 | p99 | Max | Requests per read |
+|---|---|---|---|---|---|
+| adaptive | 13 ms | 23 ms | **187 ms** | 1,239 ms | 1.04 |
+| fixed (1.2 s) | 13 ms | 15 ms | **1,233 ms** | 1,240 ms | 1.05 |
+
+With stalls present, adaptive hedging cuts p99 from ~1.2 s to under 0.2 s at no extra request cost (hedges replace the retries fixed mode needs anyway). p95 is a little higher (hedged reads land at 150-190 ms, near the boundary), and the maximum is unchanged: a few stalls weren't rescued early, plausibly because the one hedge a job gets landed on a stalling request too. Live, the effect still waits on a soak with real stalls (TODO 27).
+
