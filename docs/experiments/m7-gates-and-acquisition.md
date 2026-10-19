@@ -305,3 +305,9 @@ Devnet: `devnet/network_params.bpo.yaml` (three Nethermind + Lodestar, minimal p
 **Cause:** skim answered Status with the best status it had learned from peers, and that still carried the pre-fork digest. Peers re-check Status after a fork and dropped skim as being on another network. `status_to_send` stamps the digest in force (`our_status_carries_the_digest_in_force_after_a_fork`, mutation-checked). The overlap is kept: it is what the other clients do, and it avoids losing gossip at the boundary.
 
 Also fixed on the way: light-client gossip updates were size-checked with mainnet constants; they now use the network's preset.
+
+## How far back Sepolia peers serve history (`skim probe-retention`, 2026-10-19)
+Seven eth/71 peers (6 Geth, 1 Nethermind), head 11,947,494. The Glamsterdam fork block is **11,856,337** (91,157 blocks back, about 12.7 days).
+- **Every sampled block, from 16 back to the fork block itself:** all 7 peers served its BAL, body and receipts, each verified against the header.
+- **Advertised earliest block (eth/69+ Status):** 0 or 1 on six peers; one Geth reports 1,450,409 (the Merge), so pre-merge history has expired there.
+- **How long this lasts:** EIP-7928 requires ELs to keep BALs for the weak subjectivity period (3,533 epochs, about 15.7 days). Clients that prune at that minimum would drop Sepolia's fork-day BALs about 3 days after this measurement. After that, a post-fork archive can only come from someone who kept them, or from re-executing the blocks on an archive node (the result must match `block_access_list_hash`).
