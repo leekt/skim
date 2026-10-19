@@ -820,6 +820,34 @@ fn archived_keys_reloaded_after_a_restart_hold_no_slots_until_asked_for() {
 }
 
 #[test]
+fn a_reloaded_archived_key_warmed_by_an_on_demand_read_first_still_gets_a_base() {
+    // Review: after a restart, an on-demand read (touch_ttl) seeded the archived key's value from
+    // the recent BALs into memory only; the subscription asking for it later found nothing left
+    // to seed and wrote no base, so the new segment had no value until the key's next write.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("a.redb");
+    {
+        let s = Store::with_archive(8, archive::Archive::open(&path).unwrap()).unwrap();
+        s.apply_block(blk(1, 0), writes(&[(slot(1), 4)])).unwrap();
+        s.archive_key(slot(1));
+        s.apply_block(blk(2, 0), writes(&[])).unwrap();
+    }
+    let s = Store::with_archive(8, archive::Archive::open(&path).unwrap()).unwrap();
+    s.apply_block(blk(20, 0), writes(&[])).unwrap();
+    let run: Vec<_> = (13..=19).map(|n| (blk(n, 0), if n == 17 { writes(&[(slot(1), 6)]) } else { writes(&[]) })).collect();
+    s.seed_recent(&run).unwrap();
+    s.touch_ttl(&[slot(1)], 4); // an eth_call read it before any subscription asked
+    let ar = s.archive().unwrap();
+    assert_eq!(ar.get(&slot(1), 20).unwrap(), archive::ArchiveRead::Value(U256::from(6)), "archived when it became known");
+    assert!(s.archive_key_checked(slot(1)));
+    for n in 21..=30 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap();
+    }
+    assert_eq!(ar.get(&slot(1), 30).unwrap(), archive::ArchiveRead::Value(U256::from(6)));
+    assert_eq!(ar.get(&slot(1), 2).unwrap(), archive::ArchiveRead::Value(U256::from(4)), "the earlier segment is untouched");
+}
+
+#[test]
 fn a_reloaded_archived_key_promoted_after_seeding_gets_a_base_in_the_new_segment() {
     // Review (reverse ordering): K was archived in an earlier run. After the restart (block 20)
     // the recent BALs are seeded first, with K = 6 from block 17, and only then does a

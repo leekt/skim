@@ -188,6 +188,19 @@ Every fix above was mutation-checked: reverting it fails its test.
 
 Every fix above was mutation-checked.
 
+## Thirteenth and fourteenth reviews: live-read failures, registry placement, archive warm-up, the transaction index
+The thirteenth review's three findings (smallname P1 and P2, archive P2) were fixed together with the fourteenth review (of `9ed1f49`, the pinned transaction index).
+
+| Finding | Fix | Regression test |
+|---|---|---|
+| P1 (smallname): failed live reads were folded into null/absent. An unanswered `getSubregistry` ended the ENSv2 walk and fell back to the ENSv1 answer (wrong authority); unanswered `nameExpires`, `ownerOf` or old-registry `owner` gave a profile without an expiry or owner | A failure that isn't a revert (code 3) makes the name's state unavailable (`read_status: failed`); a revert, such as `ownerOf` of an expired lease, still means absent | `examples/smallname/test.mjs`: "a read skim couldn't answer is unavailable, never an absent value; a revert still is absent" (fake reader) |
+| P2 (smallname): `mount()` overwrote a registry's place and its tokens' nodes in place, keeping the rows' old `block`; rollback only deletes newer rows, so a re-mount from an abandoned fork stayed | A mount records what it overwrote (`mount_undo`, under its block); rollback replays those newest-first before deleting | "a reorg puts a re-mounted registry and its tokens back where they were" (re-mount at 105, rollback to 102 and 95) |
+| P2 (archive): an archived key reloaded after a restart and warmed by an on-demand read (`touch_ttl`) had its value seeded into memory only; the subscription asking for it later found nothing to seed and wrote no base | `touch_ttl` archives an archived key's value when it seeds it (as the BAL seeding does); a resubscription writes whatever is known as the base, whoever seeded it | `a_reloaded_archived_key_warmed_by_an_on_demand_read_first_still_gets_a_base` |
+| P2 (tx index): looking up an indexed transaction whose body and BAL had left their caches refetched the body and re-indexed the block from "no BAL", erasing its pinned entries (first lookup fine, later ones null) | A refetch leaves a block indexed under the same hash alone; pinned mode without the BAL decides nothing | `refetching_an_evicted_body_keeps_the_blocks_pinned_entries` |
+| P2 (tx index): included sent transactions were never dropped (two maps kept each other alive) and, once the header window dropped their block, were answered as pending | pending -> included (with the block's header and hash) -> expired after 24 h or beyond 4,096; a reorg, or another block noted at that height, makes them pending and re-broadcast again | `sent_transactions_move_pending_included_and_expire_with_a_bound` (index and header windows passed, body evicted, reorg, count bound) |
+
+All mutation-checked. Two fixes have a second guard that no test isolates: the "same hash already indexed" check behind "no BAL decides nothing", and the resubscription base write behind the warm-up archive write. Each test fails with both halves removed.
+
 ## Peer requests: coalescing and fetch order
 Measured on the aarch64 Linux deployment host (2 cores), each run on a fresh instance with its own ports and data directory, counted with `skim_status.peer_requests`.
 

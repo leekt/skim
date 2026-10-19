@@ -435,10 +435,10 @@ impl Store {
         }
         if !st.archived.insert(k) {
             // Already archived (e.g. reloaded after a restart) is not "its value is archived": a
-            // value just promoted from the recent BALs still has to become this segment's base.
-            if seeded {
-                self.archive_known_versions(&st, &k);
-            }
+            // value known in memory has to become this segment's base, whether this call seeded
+            // it or something earlier did (an on-demand read warming the key first). Repeating a
+            // base is harmless: it never overwrites a BAL write, and coverage only moves earlier.
+            self.archive_known_versions(&st, &k);
             return true;
         }
         let mem = st.archivable_versions(&k, &|n, h| ar.hash(n).ok().flatten() == Some(h));
@@ -576,6 +576,11 @@ impl Store {
                 self.admit_temp(&mut st, *k, head + n);
                 if st.seed_from_bal(k) {
                     self.bal_promotions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // An archived key's value just became known: archive it now, as the BAL
+                    // seeding does, rather than relying on a later subscription to notice.
+                    if st.archived.contains(k) {
+                        self.archive_known_versions(&st, k);
+                    }
                 }
             }
         }
