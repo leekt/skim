@@ -98,8 +98,8 @@ export function serve(store, { skim, port, host }) {
     const r = resolver.toLowerCase();
     const v = store.get("SELECT block, log_index FROM versions WHERE node = ? AND resolver = ? ORDER BY block DESC, log_index DESC LIMIT 1", node, r);
     return store
-      .all("SELECT key, block, log_index FROM record_keys WHERE node = ? AND resolver = ?", node, r)
-      .filter((k) => !v || k.block > v.block || (k.block === v.block && k.log_index > v.log_index))
+      .all("SELECT key, max(block * 1000000 + log_index) pos FROM record_key_writes WHERE node = ? AND resolver = ? GROUP BY key", node, r)
+      .filter((k) => !v || k.pos > v.block * 1000000 + v.log_index)
       .map((k) => k.key)
       .sort();
   }
@@ -517,7 +517,7 @@ export function serve(store, { skim, port, host }) {
     return {
       data: {
         chain_id: CHAIN_ID, address: a, ...k,
-        record_key_count: store.get("SELECT count(*) c FROM record_keys WHERE resolver = ?", a).c,
+        record_key_count: store.get("SELECT count(*) c FROM (SELECT DISTINCT node, key FROM record_key_writes WHERE resolver = ?)", a).c,
         bound_names: f.rows,
       },
       page: page(cursor, f.more ? enc({ s: scope, k: f.last }) : null, size),

@@ -818,3 +818,31 @@ fn archived_keys_reloaded_after_a_restart_hold_no_slots_until_asked_for() {
     assert_eq!(s.sizes().watched_keys, 2);
     assert!(!s.archive_key_checked(slot(10)), "the limit still holds");
 }
+
+#[test]
+fn a_reloaded_archived_key_promoted_after_seeding_gets_a_base_in_the_new_segment() {
+    // Review (reverse ordering): K was archived in an earlier run. After the restart (block 20)
+    // the recent BALs are seeded first, with K = 6 from block 17, and only then does a
+    // subscription ask for K. Its value must be archived in the new segment too.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("a.redb");
+    {
+        let s = Store::with_archive(8, archive::Archive::open(&path).unwrap()).unwrap();
+        s.apply_block(blk(1, 0), writes(&[(slot(1), 4)])).unwrap();
+        s.archive_key(slot(1));
+        s.apply_block(blk(2, 0), writes(&[])).unwrap();
+    }
+    let s = Store::with_archive(8, archive::Archive::open(&path).unwrap()).unwrap();
+    s.apply_block(blk(20, 0), writes(&[])).unwrap();
+    let run: Vec<_> = (13..=19).map(|n| (blk(n, 0), if n == 17 { writes(&[(slot(1), 6)]) } else { writes(&[]) })).collect();
+    s.seed_recent(&run).unwrap();
+    assert!(s.archive_key_checked(slot(1)), "subscribed again after the seeding");
+    assert_eq!(known(&s.snapshot(&blk(20, 0)).unwrap(), slot(1)), Some(6));
+    for n in 21..=40 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap();
+    }
+    let ar = s.archive().unwrap();
+    assert_eq!(ar.get(&slot(1), 20).unwrap(), archive::ArchiveRead::Value(U256::from(6)), "covered in the new segment");
+    assert_eq!(ar.get(&slot(1), 35).unwrap(), archive::ArchiveRead::Value(U256::from(6)));
+    assert_eq!(ar.get(&slot(1), 2).unwrap(), archive::ArchiveRead::Value(U256::from(4)), "the earlier segment is untouched");
+}

@@ -80,7 +80,7 @@ export class Ingest {
   }
   recordKey(node, resolver, key, l) {
     this.s.run(
-      "INSERT INTO record_keys (node, resolver, key, block, log_index) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET block = excluded.block, log_index = excluded.log_index",
+      "INSERT OR IGNORE INTO record_key_writes (node, resolver, key, block, log_index) VALUES (?, ?, ?, ?, ?)",
       node, lower(resolver), key, l.block, l.logIndex);
   }
   /** Whether `node` is in the subtree that `registry` names (walking up the name tree). */

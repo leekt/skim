@@ -429,10 +429,16 @@ impl Store {
         st.temp.remove(&k);
         st.watched_keys.insert(k);
         // Seed before archiving, so the archive starts at the block that wrote the value.
-        if st.seed_from_bal(&k) {
+        let seeded = st.seed_from_bal(&k);
+        if seeded {
             self.bal_promotions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if !st.archived.insert(k) {
+            // Already archived (e.g. reloaded after a restart) is not "its value is archived": a
+            // value just promoted from the recent BALs still has to become this segment's base.
+            if seeded {
+                self.archive_known_versions(&st, &k);
+            }
             return true;
         }
         let mem = st.archivable_versions(&k, &|n, h| ar.hash(n).ok().flatten() == Some(h));

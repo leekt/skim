@@ -29,9 +29,11 @@ CREATE INDEX IF NOT EXISTS rel_address ON rel (address, relation);
 CREATE TABLE IF NOT EXISTS expiry (node TEXT NOT NULL, source TEXT NOT NULL, expires INTEGER NOT NULL, block INTEGER NOT NULL, log_index INTEGER NOT NULL,
   PRIMARY KEY (node, source, block, log_index));
 CREATE INDEX IF NOT EXISTS expiry_expires ON expiry (expires);
--- Record keys ever written per (node, resolver), and version resets: the record inventory.
-CREATE TABLE IF NOT EXISTS record_keys (node TEXT NOT NULL, resolver TEXT NOT NULL, key TEXT NOT NULL, block INTEGER NOT NULL, log_index INTEGER NOT NULL,
-  PRIMARY KEY (node, resolver, key));
+-- Record keys written per (node, resolver), every occurrence (so a reorg that removes the latest
+-- leaves the earlier ones), and version resets: the record inventory.
+CREATE TABLE IF NOT EXISTS record_key_writes (node TEXT NOT NULL, resolver TEXT NOT NULL, key TEXT NOT NULL, block INTEGER NOT NULL, log_index INTEGER NOT NULL,
+  PRIMARY KEY (node, resolver, key, block, log_index));
+CREATE INDEX IF NOT EXISTS record_key_writes_resolver ON record_key_writes (resolver);
 CREATE TABLE IF NOT EXISTS versions (node TEXT NOT NULL, resolver TEXT NOT NULL, block INTEGER NOT NULL, log_index INTEGER NOT NULL,
   PRIMARY KEY (node, resolver, block, log_index));
 -- ENSv2: registries (and the node they hold names under), token -> node, record-id links.
@@ -51,7 +53,7 @@ CREATE TABLE IF NOT EXISTS v2_links (resolver TEXT NOT NULL, record_id TEXT NOT 
   PRIMARY KEY (resolver, node, block, log_index));
 `;
 
-const REORG_TABLES = ["blocks", "events", "names", "rel", "expiry", "record_keys", "versions", "registries", "v2_tokens", "v2_resolvers", "v2_links", "v2_resources", "migrations"];
+const REORG_TABLES = ["blocks", "events", "names", "rel", "expiry", "record_key_writes", "versions", "registries", "v2_tokens", "v2_resolvers", "v2_links", "v2_resources", "migrations"];
 
 export class Store {
   constructor(path) {
@@ -71,6 +73,11 @@ export class Store {
     // confirmed by the parent's mount); later mounts elsewhere don't move it.
     if (!this.db.prepare("SELECT 1 FROM pragma_table_info('registries') WHERE name = 'fixed'").get()) {
       this.db.exec("ALTER TABLE registries ADD COLUMN fixed INTEGER NOT NULL DEFAULT 0");
+    }
+    // Index files from before record_key_writes kept one row per key (its latest write): move
+    // those over once. (Their earlier writes are gone; reorgs from here on restore correctly.)
+    if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'record_keys'").get()) {
+      this.db.exec("BEGIN; INSERT OR IGNORE INTO record_key_writes SELECT node, resolver, key, block, log_index FROM record_keys; DROP TABLE record_keys; COMMIT;");
     }
     // Index files from before the migrations table: derive it once from the stored events.
     if (!this.db.prepare("SELECT 1 FROM migrations LIMIT 1").get() && !this.db.prepare("SELECT 1 FROM meta WHERE k = 'migrations_built'").get()) {

@@ -55,9 +55,20 @@ function discovered(store) {
     .filter((a) => !SEEDED.has(a) && !ADDRESSED.includes(a));
 }
 
-/** The log queries for a block or range: known contracts by address, ENSv2 topics from anyone. */
-function queries(store) {
-  return [{ address: [...ADDRESSED, ...discovered(store)] }, { topics: [DISCOVERY_TOPICS] }];
+/**
+ * The log queries for a block or range: known contracts by address, ENSv2 topics from anyone.
+ * `extra`: contracts a provisional pass found, not stored yet (see `applyResponse`).
+ */
+function queries(store, extra = []) {
+  return [{ address: [...new Set([...ADDRESSED, ...discovered(store), ...extra])] }, { topics: [DISCOVERY_TOPICS] }];
+}
+
+/** Thrown inside the response transaction to roll back a pass that found new contracts. */
+class Rescan extends Error {
+  constructor(found) {
+    super("new contracts found: re-read the batch with them");
+    this.found = found;
+  }
 }
 
 function parseLog(l) {
@@ -94,6 +105,9 @@ function applyAll(store, ingest, logs, tsOf) {
  */
 export async function follow(store, url, { fromBlock, log = console.log, signal } = {}) {
   const ingest = new Ingest(store);
+  // Contracts found by a provisional pass, used in the next request's filters until a pass that
+  // finds nothing new commits (then they're stored, or were on a fork that's gone).
+  let extra = [];
   while (!signal?.aborted) {
     try {
       const cursorNumber = store.meta("indexed_block");
@@ -101,17 +115,22 @@ export async function follow(store, url, { fromBlock, log = console.log, signal 
       const cursor = cursorNumber && cursorHash ? { number: Number(cursorNumber), hash: cursorHash } : null;
       const recent = store.all("SELECT number, hash FROM blocks ORDER BY number DESC LIMIT 128");
       const start = cursor ? undefined : Number(store.meta("next_from") || Math.max(fromBlock ?? 0, AMSTERDAM_BLOCK));
-      const before = discovered(store).length;
       const r = await rpc(url, "skim_streamNext", [{
         cursor,
         recent,
         // A new index: from the fork (or FROM_BLOCK); skim reports what it can't serve as a gap.
         fromBlock: start,
-        filters: queries(store),
+        filters: queries(store, extra),
         maxBlocks: 2048,
         waitMs: 10_000,
       }], { timeout: 900_000 });
-      const applied = applyResponse(store, ingest, r, { cursor, start, before, log });
+      const { applied, rescan } = applyResponse(store, ingest, r, { cursor, start, extra, log });
+      if (rescan) {
+        extra = rescan;
+        log(`${rescan.length} contracts found: re-reading the batch with them`);
+        continue;
+      }
+      extra = [];
       if (applied || r.events.length) log(`${r.cursor?.number ?? r.nextFrom - 1}: ${applied} ENS events (head ${r.head}${r.finalized ? `, finalized ${r.finalized.number}` : ""})`);
       if (r.finalized) store.meta("finalized_block", r.finalized.number);
       const fin = store.meta("finalized_block");
@@ -125,12 +144,28 @@ export async function follow(store, url, { fromBlock, log = console.log, signal 
 
 /**
  * Applies one stream response in a single SQLite transaction: rewinds, gaps, the blocks' events
- * and the new cursor commit together or not at all. Returns how many ENS events were indexed.
+ * and the new cursor commit together or not at all. Returns `{applied}` (ENS events indexed).
+ *
+ * A batch that announces contracts the request's filters didn't include (`extra` is what the
+ * caller already added) is incomplete: their events in it weren't asked for. Nothing of it is
+ * stored, not even the announcements; it returns `{rescan: [...]}` (every contract known so far
+ * plus the new ones), and the caller re-requests from the same cursor with them. Storing such a
+ * pass and keeping the old cursor would leave events beyond the cursor, which a reorg there
+ * would never undo.
  */
-export function applyResponse(store, ingest, r, { cursor, start, before = discovered(store).length, log = () => {} }) {
+export function applyResponse(store, ingest, r, { cursor, start, extra = [], log = () => {} }) {
   const first = !cursor;
+  const asked = new Set([...discovered(store), ...extra]);
   let applied = 0;
-  store.tx(() => {
+  try {
+    store.tx(() => applyInTx());
+  } catch (e) {
+    if (e instanceof Rescan) return { applied: 0, rescan: e.found };
+    throw e;
+  }
+  return { applied };
+
+  function applyInTx() {
     for (const e of r.events) {
       if (e.type === "rewind") {
         log(`reorg: rewinding to ${e.to.number}`);
@@ -150,12 +185,8 @@ export function applyResponse(store, ingest, r, { cursor, start, before = discov
       }
     }
     if (first && !store.meta("started_at_block")) store.meta("started_at_block", start);
-    // New ENSv2 contracts were announced in this batch: re-read it with them in the filter
-    // (keep the old cursor; re-applying is idempotent).
-    if (discovered(store).length > before) {
-      if (!cursor) store.meta("next_from", start); // first batch: from the start again
-      return;
-    }
+    const found = discovered(store).filter((a) => !asked.has(a));
+    if (found.length) throw new Rescan([...asked, ...found]);
     if (r.cursor) {
       store.run("INSERT OR REPLACE INTO blocks (number, hash, parent, ts) VALUES (?, ?, NULL, NULL)", r.cursor.number, r.cursor.hash);
       store.meta("indexed_block", r.cursor.number);
@@ -164,8 +195,7 @@ export function applyResponse(store, ingest, r, { cursor, start, before = discov
     } else {
       store.meta("next_from", r.nextFrom);
     }
-  });
-  return applied;
+  }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
