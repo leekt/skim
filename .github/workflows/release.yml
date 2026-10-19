@@ -1,7 +1,9 @@
 name: Release
 
-# Push a tag like v0.1.0 to publish binaries and a container image. Run it manually
-# (workflow_dispatch) to build everything without publishing.
+# Push a tag like v0.1.0 to publish a GitHub Release (tarballs + .sha256, the files install.sh
+# downloads) and a container image. Run it manually (workflow_dispatch) to build everything as
+# workflow artifacts without publishing. Tags with a hyphen (v0.2.0-rc.1) become prereleases,
+# which install.sh's "latest" skips.
 on:
   push:
     tags: ["v*"]
@@ -17,24 +19,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          # Linux builds on the oldest supported Ubuntu so the binaries need only glibc 2.35.
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
           - { os: macos-14, target: aarch64-apple-darwin }
+          # Intel macOS is cross-compiled on the Apple silicon runner.
+          - { os: macos-14, target: x86_64-apple-darwin }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
         with:
           toolchain: 1.97.0
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@aa7c1c80a07a27a84c0aa76d0cef0aad3830e330 # v2.7.8
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           key: ${{ matrix.target }}
       - name: Build
         run: cargo build --release --locked -p skim-cli --target ${{ matrix.target }}
       - name: Package
         shell: bash
+        env:
+          COPYFILE_DISABLE: "1" # no macOS ._* / xattr entries in the tarball
         run: |
           name="skim-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "dist/$name"
@@ -59,10 +66,25 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
-        with:
-          files: dist/*
-          generate_release_notes: true
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          ls -l dist
+          files=(dist/*.tar.gz dist/*.tar.gz.sha256)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A re-run replaces the assets instead of failing.
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            # With files given, gh uploads them to a draft and publishes it afterwards, so the
+            # release never appears without its assets.
+            flags=(--verify-tag --generate-notes --title "$TAG")
+            if [[ "$TAG" == *-* ]]; then flags+=(--prerelease); fi
+            gh release create "$TAG" "${flags[@]}" "${files[@]}"
+          fi
 
   image:
     name: Container image
