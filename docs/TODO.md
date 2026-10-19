@@ -11,9 +11,6 @@ Items are removed from this file when they're done, and the commit that closes o
     another muxer and announces no QUIC can't be peered with (Lodestar's devnet build refuses
     yamux; it announces QUIC, so skim uses that). Done when such a peer is either supported or
     shown not to exist on the networks skim targets.
-26. **Probes on any network.** `probe-*` and `follow` are Sepolia-only. Done when they take
-    `--network`, or are documented as Sepolia diagnostics.
-
 ## Memory
 6. **Whether RSS levels off.** Three production hours: block caches and the window level off within
    an hour, the transaction index grows as designed until ~7 h, and the uncounted part of RSS still

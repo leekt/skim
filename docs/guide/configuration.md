@@ -66,6 +66,8 @@ With no cap, memory grows with the contract: about 100 bytes per slot, so a cont
 - **You know the call your app makes** (a quote, `getReserves`, a lens contract): subscribe the call. This is the right default for anything non-trivial, including Uniswap V4, whose pools live inside one `PoolManager`.
 
 ## `skim run` flags
+Only `skim run` follows networks other than Sepolia (`--network`). The other subcommands (`probe-*`, `follow`, `bench-node`) are measurement tools from the experiments and are Sepolia-only.
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--config <path>` | none | the YAML above |

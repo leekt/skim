@@ -43,26 +43,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// M0 Spike B: Sepolia EL peers, eth/71 BALs, snap/2 point lookups, root-servable lag.
+    /// M0 Spike B (Sepolia only): EL peers, eth/71 BALs, snap/2 point lookups, root-servable lag.
     ProbeEl(probe_el::Args),
-    /// Diagnostics: CL req/resp (payload envelopes by range, light-client bootstrap).
+    /// Diagnostics (Sepolia only): CL req/resp (payload envelopes by range, light-client bootstrap).
     ProbeClReq(probe_clreq::Args),
-    /// Check what a skim node serves to peers (EL and CL), verifying every answer.
+    /// Check what a skim node serves to peers (EL and CL), verifying every answer (Sepolia only).
     ProbeServe(probe_serve::Args),
-    /// Time the restart catch-up walk over consensus peers (where the time goes).
+    /// Time the restart catch-up walk over consensus peers (where the time goes; Sepolia only).
     ProbeCatchup(probe_catchup::Args),
-    /// M0 Spike C: cold-call SNAP rounds and latency vs Infura eth_call at the same block.
+    /// M0 Spike C (Sepolia only): cold-call SNAP rounds and latency against a reference node.
     ProbeCall(probe_call::Args),
-    /// M1: follow the chain from CL gossip BALs into the MVCC store; time block -> state ready
-    /// -> eth_call done vs when Infura can answer the same block.
+    /// M1 (Sepolia only): follow the chain from CL gossip BALs into the MVCC store; time block ->
+    /// state ready -> eth_call done vs when a reference node can answer the same block.
     Follow(follow::Args),
-    /// Follow the chain and serve JSON-RPC (eth_call, eth_getStorageAt, ...) on top of it.
+    /// Follow the chain and serve JSON-RPC (eth_call, eth_getStorageAt, ...) on top of it. Any
+    /// Glamsterdam network (`--network`); the other subcommands are Sepolia diagnostics.
     Run(run::Args),
     /// P3 baseline: same per-block eth_call workload against a full node's RPC.
     BenchNode(bench_node::Args),
-    /// Peer-count sweep: one large learned wave fetched with 1/2/4/all peers per block.
+    /// Peer-count sweep (Sepolia only): one large learned wave fetched with 1/2/4/all peers per block.
     ProbeWave(probe_call::WaveArgs),
-    /// M0 Spike A: Sepolia CL gossip listener; execution-payload envelope timing and BAL checks.
+    /// M0 Spike A (Sepolia only): CL gossip listener; execution-payload envelope timing and BAL checks.
     ProbeCl(probe_cl::Args),
 }
 
