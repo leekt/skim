@@ -72,6 +72,8 @@ pub struct BookSummary {
     /// SNAP-capable peers seen, and how many of them held a session for [`HELD`].
     pub snap_peers_seen: usize,
     pub snap_peers_held: usize,
+    /// Peers remembered (bounded by [`MAX_RECORDS`]).
+    pub records: usize,
 }
 
 pub fn client_kind(client: &str) -> String {
@@ -147,6 +149,7 @@ impl PeerBook {
             first_snap: self.first_snap,
             snap_peers_seen: snap.len(),
             snap_peers_held: snap.iter().filter(|r| r.longest >= HELD).count(),
+            records: self.records.len(),
         }
     }
 }

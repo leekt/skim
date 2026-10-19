@@ -49,6 +49,7 @@ skim-cl.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 mimalloc = { version = "=0.1.52", default-features = false }
+libc = "0.2.190"
 
 [dev-dependencies]
 tempfile = "3"

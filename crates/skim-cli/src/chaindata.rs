@@ -101,6 +101,18 @@ impl Inner {
     }
 }
 
+/// What one retained structure holds, for `skim_status.memory` and the `skim_memory_*` metrics:
+/// entries, an estimate of the payload bytes they hold, and the slots allocated for them
+/// (collection capacity; spare capacity is memory too). Estimates count payload and fixed
+/// per-entry sizes, not allocator overhead, so they explain part of RSS, never all of it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemPart {
+    pub part: &'static str,
+    pub entries: usize,
+    pub bytes: usize,
+    pub capacity: usize,
+}
+
 /// A small insertion-ordered cache.
 struct Cache<V> {
     map: HashMap<B256, V>,
@@ -114,6 +126,10 @@ impl<V: Clone> Cache<V> {
     }
     fn get(&self, k: &B256) -> Option<V> {
         self.map.get(k).cloned()
+    }
+    fn part(&self, part: &'static str, size: impl Fn(&V) -> usize) -> MemPart {
+        let bytes = self.map.values().map(&size).sum::<usize>() + self.map.len() * (32 + std::mem::size_of::<V>());
+        MemPart { part, entries: self.map.len(), bytes, capacity: self.map.capacity() }
     }
     fn put(&mut self, k: B256, v: V) {
         if self.map.insert(k, v).is_none() {
@@ -339,6 +355,45 @@ impl ChainData {
         if let Some(f) = f {
             f();
         }
+    }
+
+    /// Retained block data, by structure (see [`MemPart`]). Walks the caches: a few milliseconds.
+    pub fn memory_parts(&self) -> Vec<MemPart> {
+        use std::mem::size_of;
+        let g = self.inner.read();
+        let header = |h: &Header| size_of::<Header>() + h.extra_data.len();
+        let mut out = vec![
+            MemPart {
+                part: "chain.headers",
+                entries: g.headers.len(),
+                bytes: g.headers.values().map(|(_, h)| 32 + header(h)).sum::<usize>() + g.by_hash.len() * 40,
+                capacity: g.by_hash.capacity(),
+            },
+            MemPart {
+                part: "chain.tx_hashes",
+                entries: g.txs.len(),
+                bytes: g.txs.values().map(|(_, t)| 48 + t.len() * 32).sum(),
+                capacity: g.txs.values().map(|(_, t)| t.capacity()).sum(),
+            },
+            MemPart { part: "chain.tx_index", entries: g.tx_index.len(), bytes: g.tx_index.len() * (32 + 12), capacity: g.tx_index.capacity() },
+            MemPart {
+                part: "chain.touched",
+                entries: g.touched.len(),
+                bytes: g.touched.values().map(|(_, t)| 48 + t.len() * 20).sum(),
+                capacity: g.touched.values().map(|(_, t)| t.capacity()).sum(),
+            },
+            MemPart { part: "chain.sent_txs", entries: g.sent.len(), bytes: g.sent.values().map(|s| alloy_rlp::Encodable::length(&s.tx) + 64).sum(), capacity: g.sent.capacity() },
+        ];
+        drop(g);
+        let log_bytes = |l: &alloy_primitives::Log| 20 + l.data.topics().len() * 32 + l.data.data.len() + 48;
+        out.push(self.receipts.lock().part("chain.receipts", |r| r.iter().map(|x| size_of::<Receipt>() + x.logs.iter().map(log_bytes).sum::<usize>()).sum()));
+        out.push(self.bodies.lock().part("chain.bodies", |b| b.iter().map(|t| t.len() + 24).sum()));
+        out.push(self.bals.lock().part("chain.bals_decoded", |b| alloy_rlp::Encodable::length(&**b)));
+        out.push(self.withdrawals.lock().part("chain.withdrawals", |w| w.len() * size_of::<Withdrawal>()));
+        out.push(self.bal_raw.lock().part("chain.bals_raw", |b| b.len()));
+        let inflight = self.inflight.lock().len();
+        out.push(MemPart { part: "chain.scan_inflight", entries: inflight, bytes: inflight * 48, capacity: inflight });
+        out
     }
 
     /// Tests: a block's (verified) access list, as gossip would have delivered it.

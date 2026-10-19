@@ -98,6 +98,11 @@ impl Dashboard {
         prune(&mut u);
     }
 
+    /// Addresses and methods tracked (for memory attribution).
+    pub fn sizes(&self) -> (usize, usize) {
+        (self.usage.lock().len(), self.methods.lock().len())
+    }
+
     pub fn record_method(&self, method: &str, ms: f64, ok: bool) {
         let mut m = self.methods.lock();
         let e = m.entry(method.to_string()).or_default();

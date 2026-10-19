@@ -160,6 +160,11 @@ pub struct ClPeer {
 /// Counters readable while the node runs.
 #[derive(Debug, Default, Clone)]
 pub struct NodeStats {
+    /// Retained data, for memory attribution: envelopes kept to serve (count, SSZ bytes), and
+    /// discovery bookkeeping (distinct nodes seen, dial cooldowns).
+    pub envelope_cache: (usize, usize),
+    pub seen_nodes: usize,
+    pub dial_records: usize,
     pub connected: usize,
     pub outbound: usize,
     pub inbound: usize,
@@ -697,6 +702,12 @@ impl Runner {
             }
             Cmd::Serve { slot, env } => {
                 self.served.insert(slot, env);
+                {
+                    let mut s = self.stats.lock().unwrap();
+                    s.envelope_cache = self.served.size();
+                    s.seen_nodes = self.seen_nodes.len();
+                    s.dial_records = self.last_dial.len();
+                }
                 self.stats.lock().unwrap().envelopes_from_slot = self.served.oldest_slot();
             }
             Cmd::LcUpdates { start_period, count, reply } => {

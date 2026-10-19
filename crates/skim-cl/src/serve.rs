@@ -27,6 +27,11 @@ pub struct EnvelopeCache {
 }
 
 impl EnvelopeCache {
+    /// Envelopes held, and their SSZ bytes.
+    pub fn size(&self) -> (usize, usize) {
+        (self.by_slot.len(), self.by_slot.values().map(|e| e.ssz.len()).sum())
+    }
+
     pub fn insert(&mut self, slot: u64, e: Served) {
         self.by_slot.insert(slot, e);
         while self.by_slot.len() > SERVE_SLOTS {

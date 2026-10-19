@@ -183,14 +183,28 @@ type CachedResult = Result<Value, (i64, String, Option<Value>)>;
 
 #[derive(Default)]
 pub struct CallCache {
-    map: alloy_primitives::map::HashMap<(B256, B256), (CachedResult, Reads)>,
+    map: alloy_primitives::map::HashMap<(B256, B256), (CachedResult, Reads, usize)>,
+    /// Estimated bytes the entries hold (see [`json_bytes`]), kept as entries come and go.
+    bytes: usize,
+}
+
+/// Rough heap size of a JSON value: string and number payloads plus a fixed cost per node.
+fn json_bytes(v: &Value) -> usize {
+    32 + match v {
+        Value::String(s) => s.len(),
+        Value::Array(a) => a.iter().map(json_bytes).sum(),
+        Value::Object(o) => o.iter().map(|(k, v)| k.len() + json_bytes(v)).sum(),
+        _ => 0,
+    }
 }
 
 impl CallCache {
     const MAX: usize = 20_000;
+    /// Entries hold results of any size: the count alone doesn't bound memory.
+    const MAX_BYTES: usize = 32 << 20;
 
     fn get(&self, k: &(B256, B256)) -> Option<(R, Reads)> {
-        self.map.get(k).map(|(r, a)| (r.clone().map_err(|(code, message, data)| RpcError { code, message, data }), a.clone()))
+        self.map.get(k).map(|(r, a, _)| (r.clone().map_err(|(code, message, data)| RpcError { code, message, data }), a.clone()))
     }
 
     fn put(&mut self, k: (B256, B256), r: &R, reads: Reads) {
@@ -199,10 +213,25 @@ impl CallCache {
             Err(e) if e.code == 3 => Err((e.code, e.message.clone(), e.data.clone())),
             Err(_) => return, // unavailable / invalid: not a property of the block
         };
-        if self.map.len() >= Self::MAX {
+        if self.map.len() >= Self::MAX || self.bytes >= Self::MAX_BYTES {
+            // Keys name a block hash: everything here is for recent blocks, and starting over
+            // only costs re-executing calls that are asked again.
             self.map.clear();
+            self.map.shrink_to(Self::MAX / 4);
+            self.bytes = 0;
         }
-        self.map.insert(k, (v, reads));
+        let size = 64 + reads.len() * 20 + match &v {
+            Ok(v) => json_bytes(v),
+            Err((_, m, d)) => m.len() + d.as_ref().map_or(0, json_bytes),
+        };
+        if let Some((_, _, old)) = self.map.insert(k, (v, reads, size)) {
+            self.bytes -= old;
+        }
+        self.bytes += size;
+    }
+
+    pub fn part(&self) -> crate::chaindata::MemPart {
+        crate::chaindata::MemPart { part: "rpc.call_cache", entries: self.map.len(), bytes: self.bytes, capacity: self.map.capacity() }
     }
 }
 
@@ -714,6 +743,10 @@ impl Rpc {
                     // responses count again).
                     "peer_requests": skim_el::requests::counts().into_iter().map(|(k, n)| (k.to_string(), json!(n))).collect::<serde_json::Map<_, _>>(),
                     "history": self.chain.as_ref().map(|c| c.history_json()),
+                    "memory": {
+                        "parts": self.memory_parts(),
+                        "note": "entries, estimated payload bytes and capacity per retained structure; payload only (no allocator overhead or code pages), so the sum explains part of RSS",
+                    },
                     "snap_fetch": {
                         "stats": sim.sched.stats(),
                         "peers": sim.sched.peer_stats().into_iter().map(|(id, p)| {
@@ -809,6 +842,11 @@ impl Rpc {
     pub fn refresh_metrics(&self, top_addresses: usize) {
         use metrics::{counter, gauge};
         let sim = &self.sim;
+        for p in self.memory_parts() {
+            gauge!("skim_memory_bytes", "part" => p.part).set(p.bytes as f64);
+            gauge!("skim_memory_entries", "part" => p.part).set(p.entries as f64);
+            gauge!("skim_memory_capacity", "part" => p.part).set(p.capacity as f64);
+        }
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
         if let Some(h) = sim.store.head() {
             gauge!("skim_head_block").set(h.number as f64);
@@ -908,6 +946,36 @@ impl Rpc {
                 gauge!("skim_address_slots", "address" => addr, "pinned" => "false").set(unpinned as f64);
             }
         }
+    }
+
+    /// Retained data by structure (entries, estimated payload bytes, capacity): block caches,
+    /// state, the call cache, peers and network bookkeeping. Explains part of RSS (payload, not
+    /// allocator overhead or code pages); what it doesn't cover needs a heap profile.
+    pub fn memory_parts(&self) -> Vec<crate::chaindata::MemPart> {
+        use crate::chaindata::MemPart;
+        let mut out = self.chain.as_ref().map(|c| c.memory_parts()).unwrap_or_default();
+        out.push(self.call_cache.lock().part());
+        let z = self.sim.store.sizes();
+        out.push(MemPart { part: "state.recent_bal_writes", entries: z.recent_bals, bytes: z.recent_bal_bytes, capacity: z.recent_bals });
+        out.push(MemPart { part: "state.versions", entries: z.versions, bytes: z.versions * 40 + z.keys * 96, capacity: z.keys });
+        out.push(MemPart { part: "state.code", entries: z.code, bytes: z.code_bytes, capacity: z.code });
+        let (addrs, methods) = self.dash.sizes();
+        out.push(MemPart { part: "dashboard.addresses", entries: addrs, bytes: addrs * 160, capacity: addrs });
+        out.push(MemPart { part: "dashboard.methods", entries: methods, bytes: methods * 1100, capacity: methods });
+        let net = &self.sim.sched.transport().net;
+        let peers = net.peers().len();
+        out.push(MemPart { part: "el.peers", entries: peers, bytes: 0, capacity: peers });
+        out.push(MemPart { part: "el.peer_book", entries: net.peer_book().records, bytes: net.peer_book().records * 96, capacity: skim_el::book::MAX_RECORDS });
+        let (q, ql) = self.sim.sched.queue_lens();
+        out.push(MemPart { part: "snap.queued_jobs", entries: q + ql, bytes: (q + ql) * 200, capacity: q + ql });
+        if let Some(s) = &self.cl_stats {
+            let s = s.lock().unwrap();
+            out.push(MemPart { part: "cl.envelopes_served", entries: s.envelope_cache.0, bytes: s.envelope_cache.1, capacity: skim_cl::serve::SERVE_SLOTS });
+            out.push(MemPart { part: "cl.peers", entries: s.connected, bytes: 0, capacity: s.connected });
+            out.push(MemPart { part: "cl.seen_nodes", entries: s.seen_nodes, bytes: s.seen_nodes * 48, capacity: s.seen_nodes });
+            out.push(MemPart { part: "cl.dial_records", entries: s.dial_records, bytes: s.dial_records * 56, capacity: s.dial_records });
+        }
+        out
     }
 
     /// `skim_dashboard`: peers, latency, RPC and address usage in one document.
@@ -1191,6 +1259,22 @@ enum Sub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_call_cache_is_bounded_by_bytes_not_only_by_entries() {
+        let mut c = CallCache::default();
+        let big: R = Ok(json!("x".repeat(1 << 20))); // 1 MiB results
+        for i in 0..200u64 {
+            c.put((B256::from(alloy_primitives::U256::from(i)), B256::ZERO), &big, Arc::from(vec![]));
+            assert!(c.bytes <= CallCache::MAX_BYTES + (2 << 20), "{} bytes after {i}", c.bytes);
+        }
+        assert!(c.map.len() < 40, "{} entries", c.map.len());
+        assert_eq!(c.part().bytes, c.bytes);
+        // Replacing an entry doesn't count it twice.
+        let before = c.bytes;
+        c.put((B256::from(alloy_primitives::U256::from(199u64)), B256::ZERO), &big, Arc::from(vec![]));
+        assert_eq!(c.bytes, before);
+    }
 
     #[test]
     fn unknown_method_names_share_one_label_however_many_there_are() {

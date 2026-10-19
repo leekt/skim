@@ -85,6 +85,12 @@ pub fn fuzz_snap1_response(raw: &[u8]) -> bool {
 /// A signed transaction as gossiped on the EL (no blob sidecars).
 pub type SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>;
 /// A receipt as served by `GetReceipts` (the bloom is recomputed locally).
+/// EL session limits. reth's defaults (100 outbound, 30 inbound) are for a full node; skim
+/// reaches 30-40 sessions in practice, and each one holds buffers and peer state, so a ceiling
+/// keeps that memory bounded (measured with `skim_status.memory`).
+pub const MAX_OUTBOUND_PEERS: usize = 40;
+pub const MAX_INBOUND_PEERS: usize = 15;
+
 pub type Receipt = alloy_consensus::EthereumReceipt;
 pub type BlockBody = alloy_consensus::BlockBody<SignedTx>;
 pub use reth_network_peers::TrustedPeer;
@@ -184,7 +190,11 @@ impl ElNet {
                 ..Default::default()
             })
             .peer_config(
-                PeersConfig::default().with_trusted_nodes(trusted).with_trusted_nodes_only(trusted_only),
+                PeersConfig::default()
+                    .with_trusted_nodes(trusted)
+                    .with_trusted_nodes_only(trusted_only)
+                    .with_max_outbound(MAX_OUTBOUND_PEERS)
+                    .with_max_inbound_opt(Some(MAX_INBOUND_PEERS)),
             )
             .with_snap(true)
             .add_rlpx_sub_protocol(snap1::Snap1Handler { peers: snap1.clone() })

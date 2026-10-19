@@ -40,6 +40,9 @@ fn describe() {
     describe_counter!("skim_rpc_requests_total", "JSON-RPC requests by method and outcome");
     describe_gauge!("skim_peers", "Connected peers by layer (el, cl)");
     describe_gauge!("skim_snap_peers", "Connected EL peers that serve SNAP state");
+    describe_gauge!("skim_memory_bytes", "Estimated payload bytes retained, by structure (part): payload only, no allocator overhead");
+    describe_gauge!("skim_memory_entries", "Entries retained, by structure (part)");
+    describe_gauge!("skim_memory_capacity", "Allocated slots (collection capacity), by structure (part)");
     describe_gauge!("skim_peer_clients", "Connected peers by layer and client");
     describe_gauge!("skim_snap_peer_latency_ms", "SNAP answer latency per peer (EWMA)");
     describe_gauge!("skim_snap_peer_inflight", "SNAP requests in flight per peer");

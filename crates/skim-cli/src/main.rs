@@ -66,6 +66,14 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // No transparent huge pages for skim: mimalloc asks for them, and a 2 MiB page that is only
+    // partly used counts fully in RSS. Measured following the head on aarch64 Linux: 179 MB at
+    // 26 min without, 251-256 MB with (same state; M7, "Memory"). MIMALLOC_ALLOW_THP=1 keeps them.
+    #[cfg(target_os = "linux")]
+    if std::env::var("MIMALLOC_ALLOW_THP").as_deref() != Ok("1") {
+        // SAFETY: prctl with integer arguments only.
+        unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0) };
+    }
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
