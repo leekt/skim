@@ -34,6 +34,9 @@ pub struct Args {
     /// duplicated to another peer) or `fixed` (after 1.2 s). For A/B measurements.
     #[arg(long, default_value = "adaptive", hide = true)]
     snap_hedge: String,
+    /// Enable diagnostic RPC methods for measurements (`skim_debugSetSnapHedge`).
+    #[arg(long, hide = true)]
+    debug_rpc: bool,
     /// The network: `sepolia` (built in), or a network-config directory, as consensus clients
     /// use (and ethereum-package / eth-clients publish): `config.yaml` (with its PRESET_BASE),
     /// `genesis.ssz` or `genesis_validators_root.txt`, `bootstrap_nodes.txt`, plus the execution
@@ -441,6 +444,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         cl_stats: Some(cl.stats.clone()),
         dash: dash.clone(),
     });
+    crate::rpc::DEBUG_RPC.store(args.debug_rpc, std::sync::atomic::Ordering::Relaxed);
     tokio::spawn(serve(rpc.clone(), args.rpc, (args.cors != "none").then(|| args.cors.clone())));
     if let (Some(addr), Some(handle)) = (args.metrics, metrics_handle) {
         let top = args.metrics_addresses;

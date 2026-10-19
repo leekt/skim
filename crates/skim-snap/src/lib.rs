@@ -328,6 +328,8 @@ impl<T: Transport> Clone for Scheduler<T> {
 struct Inner<T> {
     transport: T,
     cfg: Config,
+    /// `cfg.hedge_adaptive`, switchable while running (A/B measurements on one node).
+    hedge_adaptive: std::sync::atomic::AtomicBool,
     state: Mutex<State>,
     wake: Notify,
 }
@@ -335,7 +337,8 @@ struct Inner<T> {
 impl<T: Transport> Scheduler<T> {
     /// Spawns the dispatcher. Must be called inside a Tokio runtime.
     pub fn new(transport: T, cfg: Config) -> Self {
-        let inner = Arc::new(Inner { transport, cfg, state: Mutex::default(), wake: Notify::new() });
+        let hedge_adaptive = std::sync::atomic::AtomicBool::new(cfg.hedge_adaptive);
+        let inner = Arc::new(Inner { transport, cfg, hedge_adaptive, state: Mutex::default(), wake: Notify::new() });
         let weak = Arc::downgrade(&inner);
         tokio::spawn(async move {
             loop {
@@ -379,6 +382,11 @@ impl<T: Transport> Scheduler<T> {
     pub fn queue_lens(&self) -> (usize, usize) {
         let st = self.inner.state.lock();
         (st.queue.len(), st.queue_lo.len())
+    }
+
+    /// Switches between adaptive and fixed hedging while running (A/B measurements).
+    pub fn set_hedge_adaptive(&self, on: bool) {
+        self.inner.hedge_adaptive.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn transport(&self) -> &T {
@@ -595,7 +603,7 @@ impl<T: Transport> Inner<T> {
     /// How long a request to `peer` may go unanswered before it's hedged.
     fn hedge_threshold(&self, st: &State, peer: Option<PeerId>) -> Duration {
         let cap = self.cfg.hedge_after;
-        if !self.cfg.hedge_adaptive {
+        if !self.hedge_adaptive.load(std::sync::atomic::Ordering::Relaxed) {
             return cap;
         }
         let Some((mean, dev)) = peer.and_then(|p| st.peers.get(&p)).and_then(|p| Some((p.ewma_ms?, p.dev_ms.unwrap_or(0.0)))) else {

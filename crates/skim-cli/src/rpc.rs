@@ -30,6 +30,10 @@ use skim_state::{BlockRef, StateError};
 
 use crate::chaindata::{ChainData, DataError};
 
+/// `skim run --debug-rpc`: diagnostic methods for measurements (`skim_debugSetSnapHedge`).
+/// Off by default: they don't exist on a normal node.
+pub static DEBUG_RPC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub const CLIENT_VERSION: &str = concat!("skim/", env!("CARGO_PKG_VERSION"), " (P2P-backed simulation; unverified state)");
 
 #[derive(Debug)]
@@ -461,6 +465,16 @@ impl Rpc {
             "net_listening" => Ok(json!(true)),
             // skim holds no keys: wallets and libraries that ask get an empty list, not an error.
             "eth_accounts" | "eth_requestAccounts" => Ok(json!([])),
+            "skim_debugSetSnapHedge" if DEBUG_RPC.load(std::sync::atomic::Ordering::Relaxed) => {
+                let mode: String = need(params, 0)?;
+                let adaptive = match mode.as_str() {
+                    "adaptive" => true,
+                    "fixed" => false,
+                    _ => return Err(RpcError::params("mode is `adaptive` or `fixed`")),
+                };
+                self.sim.sched.set_hedge_adaptive(adaptive);
+                Ok(json!(mode))
+            }
             "eth_syncing" => Ok(json!(latest.is_none())),
             "eth_blockNumber" => Ok(hex_u64(self.resolve_block(None, latest)?.number)),
             "eth_getBlockByNumber" | "eth_getBlockByHash" => {
