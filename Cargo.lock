@@ -7732,6 +7732,7 @@ dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
+ "dyn-clone",
  "futures",
  "parking_lot",
  "reth-chainspec",

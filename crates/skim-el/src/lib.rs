@@ -120,9 +120,7 @@ impl ElNetwork {
     pub fn from_dir(dir: &std::path::Path, extra_bootnodes: &[String]) -> Result<Self, Box<dyn std::error::Error>> {
         let raw = std::fs::read(dir.join("genesis.json")).map_err(|e| format!("{}: {e}", dir.join("genesis.json").display()))?;
         let genesis: alloy_genesis::Genesis = serde_json::from_slice(&raw)?;
-        if genesis.config.amsterdam_time.is_none() {
-            return Err("genesis.json has no amsterdamTime: skim follows Glamsterdam networks".into());
-        }
+        let spec = Self::spec_from_genesis(genesis)?;
         let mut lines: Vec<String> = std::fs::read_to_string(dir.join("enodes.txt")).map(|t| t.lines().map(|l| l.trim().to_string()).collect()).unwrap_or_default();
         lines.extend(extra_bootnodes.iter().cloned());
         let bootnodes = lines
@@ -130,12 +128,44 @@ impl ElNetwork {
             .filter(|l| l.starts_with("enode://"))
             .map(|l| l.parse::<reth_network_peers::NodeRecord>().map_err(|e| format!("bootnode {l}: {e}")))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { spec: Arc::new(ChainSpec::from(genesis)), bootnodes, dns: None })
+        Ok(Self { spec: Arc::new(spec), bootnodes, dns: None })
+    }
+
+    /// The chain spec of a Glamsterdam network's `genesis.json`. Refused without `amsterdamTime`,
+    /// or if Cancun isn't active by then: skim applies BAL post-values as the new state, which
+    /// is only complete with EIP-6780 (SELFDESTRUCT deletes only accounts created in the same
+    /// transaction).
+    pub fn spec_from_genesis(genesis: alloy_genesis::Genesis) -> Result<ChainSpec, Box<dyn std::error::Error>> {
+        let Some(amsterdam) = genesis.config.amsterdam_time else {
+            return Err("genesis.json has no amsterdamTime: skim follows Glamsterdam networks".into());
+        };
+        if genesis.config.cancun_time.is_none_or(|c| c > amsterdam) {
+            return Err("genesis.json: Cancun (EIP-6780) must be active by amsterdamTime".into());
+        }
+        let mut spec = ChainSpec::from(genesis);
+        spec.hardforks = forks_in_activation_order(&spec.hardforks);
+        Ok(spec)
     }
 
     pub fn chain_id(&self) -> u64 {
         self.spec.chain.id()
     }
+}
+
+/// reth lists a genesis's timestamp forks in mainnet's order and folds them into the fork id
+/// (EIP-2124/6122) in list order. A network that activates them in another order, such as a
+/// blob-parameter fork after Amsterdam, then gets a fork id no other client computes, and peers
+/// drop skim at the handshake (Nethermind: a protocol breach, then a block on the address).
+/// Timestamp forks are ordered by activation time here (stable; block forks stay first, as
+/// they were).
+fn forks_in_activation_order(h: &reth_chainspec::ChainHardforks) -> reth_chainspec::ChainHardforks {
+    use reth_chainspec::ForkCondition;
+    let mut forks: Vec<_> = h.forks_iter().map(|(f, c)| (dyn_clone::clone_box(f), c)).collect();
+    forks.sort_by_key(|(_, c)| match c {
+        ForkCondition::Timestamp(t) => (1, *t),
+        _ => (0, 0),
+    });
+    reth_chainspec::ChainHardforks::new(forks)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -742,5 +772,47 @@ impl ElNet {
         for (id, addr) in peers {
             self.handle.add_peer(*id, *addr);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn genesis(amsterdam: u64, bpo3: Option<u64>, cancun: Option<u64>) -> alloy_genesis::Genesis {
+        let mut g = alloy_genesis::Genesis::default();
+        let c = &mut g.config;
+        c.chain_id = 3151908;
+        c.terminal_total_difficulty = Some(U256::ZERO);
+        c.terminal_total_difficulty_passed = true;
+        (c.shanghai_time, c.cancun_time, c.prague_time, c.osaka_time) = (Some(0), cancun, Some(0), Some(0));
+        (c.bpo1_time, c.bpo2_time, c.bpo3_time, c.amsterdam_time) = (Some(0), Some(0), bpo3, Some(amsterdam));
+        g
+    }
+
+    #[test]
+    fn a_blob_parameter_fork_after_amsterdam_folds_into_the_fork_id_in_activation_order() {
+        // The devnet that found this: BPO3 activated after Amsterdam. reth's mainnet ordering put
+        // BPO3 first, so skim's fork id matched no peer once both were active.
+        let spec = ElNetwork::spec_from_genesis(genesis(100, Some(200), Some(0))).unwrap();
+        let at = |t: u64| spec.fork_id(&Head { timestamp: t, ..Default::default() });
+        let before = at(50);
+        assert_eq!(before.next, 100, "Amsterdam is the next fork");
+        let mid = at(150);
+        assert_eq!(mid.next, 200, "then BPO3");
+        let mut h = before.hash;
+        h += 100u64;
+        assert_eq!(mid.hash, h, "Amsterdam folded in");
+        h += 200u64;
+        assert_eq!(at(300).hash, h, "then BPO3, in activation order");
+        assert_eq!(at(300).next, 0);
+    }
+
+    #[test]
+    fn a_network_without_cancun_by_amsterdam_is_refused() {
+        // BAL post-values are the whole new state only with EIP-6780.
+        assert!(ElNetwork::spec_from_genesis(genesis(100, None, None)).is_err());
+        assert!(ElNetwork::spec_from_genesis(genesis(100, None, Some(150))).is_err());
+        assert!(ElNetwork::spec_from_genesis(genesis(100, None, Some(100))).is_ok());
     }
 }

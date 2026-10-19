@@ -4,6 +4,7 @@
 #
 #   devnet/run.sh <skim linux binary> [extra skim args...]
 #   ENCLAVE=skim-bpo PARAMS=network_params.bpo.yaml SKIM_RPC_PORT=8601 devnet/run.sh ...   (a second devnet)
+#   CONFIG=skim.yaml devnet/run.sh ...   (an app config: subscriptions etc.)
 #
 # Starts the devnet if the enclave doesn't exist, exports its network config to devnet/out/<enclave>/net,
 # then runs skim with the devnet's EL nodes as trusted peers and its finalized root as the
@@ -27,6 +28,11 @@ kurtosis enclave inspect "$ENCLAVE" >/dev/null || { echo "kurtosis can't inspect
 mkdir -p "$OUT/bin"
 kurtosis files download "$ENCLAVE" el_cl_genesis_data "$OUT/net" >/dev/null
 cp "$BIN" "$OUT/bin/skim"
+CONFIG_ARGS=()
+if [ -n "${CONFIG:-}" ]; then
+  cp "$CONFIG" "$OUT/bin/skim.yaml"
+  CONFIG_ARGS=(--config /b/skim.yaml)
+fi
 
 # Mapped localhost ports of the first EL and CL (for identities and the checkpoint).
 inspect=$(kurtosis enclave inspect "$ENCLAVE")
@@ -56,5 +62,5 @@ docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run -d --name "$NAME" --network "$NET" -p "127.0.0.1:$PORT:8545" -e RUST_LOG="${RUST_LOG:-info}" \
   -v "$OUT/bin:/b:ro" -v "$OUT/net:/net:ro" ubuntu:24.04 \
   sh -c 'cp /b/skim /usr/local/bin/skim && chmod +x /usr/local/bin/skim && exec skim "$@"' -- \
-  run --network /net --rpc 0.0.0.0:8545 --data-dir /tmp/skim --checkpoint "$CHECKPOINT" "${PEERS[@]}" "$@"
+  run --network /net --rpc 0.0.0.0:8545 --data-dir /tmp/skim --checkpoint "$CHECKPOINT" "${PEERS[@]}" ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"} "$@"
 echo "skim on the devnet: http://127.0.0.1:$PORT  (docker logs -f $NAME)"

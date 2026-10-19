@@ -21,6 +21,7 @@ reth-tasks.workspace = true
 reth-dns-discovery.workspace = true
 reth-network-peers.workspace = true
 alloy-genesis = "2.5.0"
+dyn-clone = "1.0.20"
 serde_json.workspace = true
 tokio.workspace = true
 futures.workspace = true
