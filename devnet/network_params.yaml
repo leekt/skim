@@ -1,0 +1,22 @@
+# A local Glamsterdam devnet for testing skim on a network other than Sepolia (see README.md).
+#
+#   kurtosis run --enclave skim-devnet github.com/ethpandaops/ethereum-package --args-file devnet/network_params.yaml
+#
+# Images: ethPandaOps' glamsterdam-devnet-8 builds. Minimal preset (6 s slots, 8-slot epochs,
+# 32-member sync committees); Gloas activates at epoch 4, about 3 minutes in.
+participants:
+  - el_type: geth
+    el_image: ethpandaops/geth:glamsterdam-devnet-8
+    cl_type: lodestar
+    cl_image: ethpandaops/lodestar:glamsterdam-devnet-8
+    count: 2
+  - el_type: nethermind
+    el_image: ethpandaops/nethermind:glamsterdam-devnet-8
+    cl_type: lodestar
+    cl_image: ethpandaops/lodestar:glamsterdam-devnet-8
+    count: 1
+network_params:
+  preset: minimal
+  gloas_fork_epoch: 4
+additional_services:
+  - dora
