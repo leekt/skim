@@ -7,7 +7,7 @@ This document describes the implemented architecture as of 2026-10-19. Operator 
 | | Current implementation |
 |---|---|
 | Status | Experimental; BAL follower, verified state, local simulation, selective archive and block streams implemented |
-| Networks | Sepolia built in; other Glamsterdam networks through `skim run --network <dir>` (Cancun must be active by `amsterdamTime`); other subcommands are Sepolia diagnostics |
+| Networks | Sepolia and Hoodi built in; other Glamsterdam networks through `skim run --network <dir>` (Cancun must be active by `amsterdamTime`); other subcommands are Sepolia diagnostics |
 | Consensus presets | `mainnet` and `minimal`; preset-sized light-client verification and committee rotation |
 | Language/toolchain | Rust 2024; Rust 1.97.0 pinned in `rust-toolchain.toml` |
 | Core dependencies | reth v2.7.0 networking, libp2p/discv5, revm 43, alloy, redb, axum |

@@ -66,7 +66,9 @@ predictors:
 
 ## Networks
 
-`skim run` defaults to the built-in Sepolia configuration. To follow another Glamsterdam network, pass a network-config directory:
+`skim run` defaults to the built-in Sepolia configuration. **Hoodi is built in too** (`--network hoodi`): its published metadata (eth-clients/hoodi), mainnet preset, Glamsterdam at epoch 132352 (2026-10-26 17:42:48 UTC), default checkpoint `checkpoint-sync.hoodi.ethpandaops.io`. Before a network's Glamsterdam fork skim can't follow it (there are no BALs): it says so at startup, `skim status` shows the time left, and it picks the chain up at activation.
+
+To follow another Glamsterdam network, pass a network-config directory (an eth-clients `metadata/` directory works as is: bootnodes may be `.txt` or `.yaml` lists):
 
 ```bash
 skim run --network /path/to/network --config skim.yaml \

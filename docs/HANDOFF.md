@@ -73,6 +73,7 @@ Read first:
 **Memory:** nine production hours (Linux aarch64, `--history local` plus an indexer, on the build that indexed every transaction) are in [hardware](guide/hardware.md#memory): RSS 147 MB at start, 346 MB at 9 h, flat after ~7 h; 305 of 339 MB was mimalloc's heap. A run on the `--tx-index pinned` build started 2026-10-19 11:31 UTC; the 27 h result decides TODO 6 and the README's footprint row, which is deliberately left until then. The [memory audit](experiments/memory-audit.md) (2026-10-18) preserves the earlier investigation; its proposals have been implemented.
 
 ## Next tasks (in order)
+0. **Hoodi, from its Glamsterdam fork (2026-10-26 17:42:48 UTC).** `--network hoodi` is built in (`d92354c`). A zero-config run is scheduled on the production machine (ask the owner): it starts 12 minutes before the fork (a live crossing into Glamsterdam), samples memory every minute, runs `docs/experiments/tools/cold_read_bench.py` two hours after the fork, and stops after 24 hours. Then record startup, the crossing, memory, CPU and read latency in the hardware guide and M7.
 1. **Open items in [`docs/TODO.md`](TODO.md):**
    - 6: memory past 27 h: read the pinned-index run when it reaches 27 h, update [hardware](guide/hardware.md#memory), [memory and latency](guide/memory-and-latency.md) and the README footprint row, then close or narrow the item;
    - 25: TCP peers without yamux.

@@ -24,7 +24,7 @@
 
 skim never holds Ethereum's full state. It holds your app's working set and keeps it current block by block from Glamsterdam's [block-level access lists](https://eips.ethereum.org/EIPS/eip-7928) (BALs): the values each block wrote, committed in its header. Anything else is fetched when a request needs it, with Merkle proofs. No full node, no RPC provider.
 
-`skim run` defaults to Sepolia and also follows custom Glamsterdam networks with `--network <dir>`, using the `mainnet` or `minimal` consensus preset. See [network configuration](docs/guide/configuration.md#networks) and the verified [devnet example](devnet/README.md). The bundled app examples use Sepolia contracts.
+`skim run` defaults to Sepolia; Hoodi is built in too (`--network hoodi`, from its Glamsterdam fork on 2026-10-26), and custom Glamsterdam networks work with `--network <dir>`, using the `mainnet` or `minimal` consensus preset. See [network configuration](docs/guide/configuration.md#networks) and the verified [devnet example](devnet/README.md). The bundled app examples use Sepolia contracts.
 
 ```console
 $ skim run --config skim.yaml          # follows Sepolia, serves JSON-RPC on :8545
