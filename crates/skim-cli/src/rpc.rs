@@ -767,9 +767,10 @@ impl Rpc {
         let ms = t.elapsed().as_secs_f64() * 1e3;
         tracing::debug!(method, ms, ok = res.is_ok(), "rpc");
         if method != "skim_dashboard" {
-            // Method names come from the request: only known ones get their own series (in the
-            // dashboard too, whose per-method table would otherwise grow with every new name).
-            let m = if known_method(method) { method.to_string() } else { "other".to_string() };
+            // Method names come from the request: only methods skim implements get their own
+            // series (in the dashboard too, whose per-method table would otherwise grow with
+            // every new name).
+            let m = method_label(method, &res);
             self.dash.record_method(&m, ms, res.is_ok());
             metrics::histogram!("skim_rpc_request_duration_seconds", "method" => m.clone()).record(ms / 1e3);
             let outcome = match &res {
@@ -793,11 +794,14 @@ impl Rpc {
     }
 }
 
-/// Methods skim implements (others are labelled "other" in metrics, bounding cardinality).
-fn known_method(m: &str) -> bool {
-    (m.starts_with("eth_") || m.starts_with("debug_") || m.starts_with("skim_") || m.starts_with("net_") || m.starts_with("web3_"))
-        && m.len() <= 40
-        && m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+/// The label a request is counted under: its method if skim implements it (dispatch didn't answer
+/// "method not found"), else "other". Shared with dispatch by construction, so the set of labels
+/// is bounded by the methods that exist, whatever names clients send.
+fn method_label(method: &str, res: &R) -> String {
+    match res {
+        Err(e) if e.code == -32601 => "other".to_string(),
+        _ => method.to_string(),
+    }
 }
 
 impl Rpc {
@@ -1182,4 +1186,26 @@ enum Sub {
     NewHeads,
     Logs(Box<alloy_rpc_types_eth::Filter>),
     Skim,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_method_names_share_one_label_however_many_there_are() {
+        // Review: names were only checked for their shape, so every distinct `eth_nonexistent_N`
+        // got its own dashboard entry and metric series.
+        let dash = crate::dashboard::Dashboard::default();
+        let not_found: R = Err(RpcError::new(-32601, "method not found".to_string()));
+        for i in 0..10_000 {
+            dash.record_method(&method_label(&format!("eth_nonexistent_{i}"), &not_found), 1.0, false);
+        }
+        assert_eq!(dash.methods_json().len(), 1);
+        assert_eq!(dash.methods_json()[0]["method"], "other");
+        // A method skim implements keeps its label, even when it fails.
+        let reverted: R = Err(RpcError::new(3, "execution reverted".to_string()));
+        assert_eq!(method_label("eth_call", &reverted), "eth_call");
+        assert_eq!(method_label("eth_blockNumber", &Ok(json!("0x1"))), "eth_blockNumber");
+    }
 }

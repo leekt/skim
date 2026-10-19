@@ -176,6 +176,16 @@ Also from the review: stored matches are encoded and compressed before the write
 
 Every fix above was mutation-checked: reverting it fails its test.
 
+## Twelfth review: smallname's discovery boundary and inventory, reloaded archive keys, metric labels
+| Finding | Fix | Regression test |
+|---|---|---|
+| P1 (smallname): a batch that discovered new contracts committed its events but kept the old cursor (to re-read with wider filters). A reorg of those blocks before the re-read left them indexed: the cursor was still canonical, so no rewind came | Such a pass is provisional: the whole transaction rolls back, the found contracts are kept in memory for the next request's filters, and the batch commits only with its cursor | `examples/smallname/test.mjs`: "a pass that finds new contracts stores nothing, so a fork can't leave its events behind" (A101 announces a resolver, B101 replaces it: no orphan event or resolver; fails with the old commit-then-rescan) |
+| P2 (smallname): `record_keys` kept one row per key and overwrote its position, so rolling back the latest write deleted the key | `record_key_writes` keeps every write; inventory is "keys written after the latest version reset". Old index files migrate on open | "a reorg restores a record key's earlier write…" (compared with an index of the surviving chain only), and the migration test |
+| P2: a key reloaded as archived after a restart, then promoted from seeded BALs when a subscription asked for it again, returned early ("already archived") without archiving the value | The early return still writes newly promoted versions as the segment's base | `a_reloaded_archived_key_promoted_after_seeding_gets_a_base_in_the_new_segment` (reverse ordering, no healer) |
+| P2: `known_method` checked only a name's shape, so every made-up `eth_*` name got its own dashboard entry and metric series | The label comes from dispatch: "method not found" is counted as `other` | `unknown_method_names_share_one_label_however_many_there_are` (10,000 names, one entry) |
+
+Every fix above was mutation-checked.
+
 ## Peer requests: coalescing and fetch order
 Measured on the aarch64 Linux deployment host (2 cores), each run on a fresh instance with its own ports and data directory, counted with `skim_status.peer_requests`.
 
