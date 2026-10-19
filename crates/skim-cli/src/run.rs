@@ -514,7 +514,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             })
         });
         chaindata.note_payload(
-            number,
+            Arc::new(v.header.clone()),
             v.computed_hash,
             env.payload.transactions.iter().map(|t| alloy_primitives::Bytes::copy_from_slice(t)).collect(),
             env.payload

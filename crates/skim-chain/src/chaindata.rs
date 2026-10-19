@@ -48,6 +48,10 @@ const SERVE_BALS: usize = 64;
 /// Re-broadcast interval and give-up time for sent transactions.
 const REBROADCAST: Duration = Duration::from_secs(12);
 const SENT_TTL: Duration = Duration::from_secs(30 * 60);
+/// Included sent transactions remembered (to answer lookups after the block windows drop them):
+/// at most this many, for at most this long. Older ones are found only through the index.
+const INCLUDED_MAX: usize = 4096;
+const INCLUDED_TTL: Duration = Duration::from_secs(24 * 3600);
 /// Passes over the connected peers before a fetch reports "unavailable", with growing pauses
 /// (peers come and go, and a busy one may answer a moment later).
 const PASSES: u32 = 3;
@@ -101,11 +105,24 @@ fn tx_key(h: &B256) -> u64 {
     u64::from_be_bytes(h[..8].try_into().unwrap())
 }
 
+/// A transaction sent through skim, not yet seen in a canonical block.
 struct Sent {
     tx: SignedTx,
     from: Address,
     first: Instant,
     last: Instant,
+}
+
+/// A sent transaction seen in a block: where, with the block's header, so it's answered as
+/// included even after the header and index windows drop that block. A reorg removing the block
+/// makes it pending (and re-broadcast) again.
+struct Included {
+    tx: SignedTx,
+    from: Address,
+    header: Arc<Header>,
+    block_hash: B256,
+    index: u32,
+    at: Instant,
 }
 
 #[derive(Default)]
@@ -120,8 +137,8 @@ struct Inner {
     /// `tx_collisions` (in practice never: about 1e-9 per window).
     tx_index: HashMap<u64, (u64, u32)>,
     tx_collisions: Vec<(u64, u64, u32)>,
-    /// Sent transactions seen in a block: exact hash -> (block, position).
-    sent_included: HashMap<B256, (u64, u32)>,
+    /// Sent transactions seen in a canonical block (bounded: `INCLUDED_MAX`, `INCLUDED_TTL`).
+    included: HashMap<B256, Included>,
     /// Every address in a block's BAL, for blocks skim followed.
     touched: BTreeMap<u64, (B256, Arc<HashSet<Address>>)>,
     sent: HashMap<B256, Sent>,
@@ -135,9 +152,8 @@ impl Inner {
         self.by_hash.insert(hash, h.number);
     }
 
-    /// Drops block `n`'s index entries. `reorg`: the block left the chain, so sent transactions
-    /// seen in it are pending again (on window eviction they stay included).
-    fn unindex_block(&mut self, n: u64, reorg: bool) {
+    /// Drops block `n`'s index entries.
+    fn unindex_block(&mut self, n: u64) {
         if let Some((_, keys)) = self.txs.remove(&n) {
             for k in keys {
                 if self.tx_index.get(&k).is_some_and(|(b, _)| *b == n) {
@@ -146,15 +162,38 @@ impl Inner {
             }
             self.tx_collisions.retain(|(_, b, _)| *b != n);
         }
-        if reorg {
-            self.sent_included.retain(|_, (b, _)| *b != n);
+    }
+
+    /// Block `n` left the chain (or `n` is now `keep`, another block): sent transactions
+    /// included in a block at `n` other than `keep` are pending again.
+    fn unwind_included(&mut self, n: u64, keep: Option<B256>) {
+        let gone: Vec<B256> =
+            self.included.iter().filter(|(_, i)| i.header.number == n && Some(i.block_hash) != keep).map(|(h, _)| *h).collect();
+        for h in gone {
+            if let Some(i) = self.included.remove(&h) {
+                let now = Instant::now();
+                self.sent.insert(h, Sent { tx: i.tx, from: i.from, first: now, last: now - REBROADCAST });
+            }
+        }
+    }
+
+    /// Moves sent transactions found in a block (`hashes`, by position) to `included`.
+    fn note_inclusions(&mut self, header: &Arc<Header>, block_hash: B256, hashes: &[B256]) {
+        if self.sent.is_empty() {
+            return;
+        }
+        for (i, t) in hashes.iter().enumerate() {
+            if let Some(s) = self.sent.remove(t) {
+                tracing::info!(tx = %t, number = header.number, "sent transaction included");
+                self.included.insert(*t, Included { tx: s.tx, from: s.from, header: header.clone(), block_hash, index: i as u32, at: Instant::now() });
+            }
         }
     }
 
     /// Locations a hash may be at (unconfirmed: a prefix match on a canonical, indexed block).
     fn candidates(&self, tx: &B256) -> Vec<(u64, u32)> {
         let k = tx_key(tx);
-        let mut out: Vec<(u64, u32)> = self.sent_included.get(tx).copied().into_iter().collect();
+        let mut out: Vec<(u64, u32)> = Vec::new();
         out.extend(self.tx_index.get(&k).copied());
         out.extend(self.tx_collisions.iter().filter(|(x, _, _)| *x == k).map(|(_, b, i)| (*b, *i)));
         out.dedup();
@@ -391,7 +430,7 @@ impl ChainData {
         self.test_tx_hashes.lock().insert(hash, Arc::new(txs.clone()));
         let keep = self.select_txs(None, txs.len());
         let mut g = self.inner.write();
-        self.index_txs(&mut g, number, hash, &txs, &keep);
+        self.index_txs(&mut g, number, hash, &txs, keep.as_deref());
     }
 
     fn with_net(net: Option<ElNet>, max_log_range: u64, chain_id: u64) -> Arc<Self> {
@@ -458,8 +497,8 @@ impl ChainData {
             },
             MemPart {
                 part: "chain.tx_index",
-                entries: g.tx_index.len() + g.tx_collisions.len() + g.sent_included.len(),
-                bytes: g.tx_index.len() * (8 + 12) + g.tx_collisions.len() * 20 + g.sent_included.len() * 44,
+                entries: g.tx_index.len() + g.tx_collisions.len(),
+                bytes: g.tx_index.len() * (8 + 12) + g.tx_collisions.len() * 20,
                 capacity: g.tx_index.capacity(),
             },
             MemPart {
@@ -469,6 +508,12 @@ impl ChainData {
                 capacity: g.touched.values().map(|(_, t)| t.capacity()).sum(),
             },
             MemPart { part: "chain.sent_txs", entries: g.sent.len(), bytes: g.sent.values().map(|s| alloy_rlp::Encodable::length(&s.tx) + 64).sum(), capacity: g.sent.capacity() },
+            MemPart {
+                part: "chain.sent_included",
+                entries: g.included.len(),
+                bytes: g.included.values().map(|i| alloy_rlp::Encodable::length(&i.tx) + size_of::<Header>() + 96).sum(),
+                capacity: INCLUDED_MAX,
+            },
         ];
         drop(g);
         let log_bytes = |l: &alloy_primitives::Log| 20 + l.data.topics().len() * 32 + l.data.data.len() + 48;
@@ -506,24 +551,27 @@ impl ChainData {
         let mut g = self.inner.write();
         while g.txs.len() > cfg.blocks {
             let Some((&n, _)) = g.txs.first_key_value() else { break };
-            g.unindex_block(n, false);
+            g.unindex_block(n);
         }
     }
 
-    /// Which of a block's `n` transactions to index: all, none, or those changing a pinned
-    /// address (by the BAL's changes per transaction; without the BAL, none).
-    fn select_txs(&self, bal: Option<&skim_bal::BlockAccessList>, n: usize) -> Vec<bool> {
+    /// Which of a block's `n` transactions to index: all, or those changing a pinned address
+    /// (by the BAL's changes per transaction). `None`: don't index the block now (index off, or
+    /// pinned mode without the block's BAL: that can't tell which transactions qualify, and
+    /// mustn't be read as "none do").
+    fn select_txs(&self, bal: Option<&skim_bal::BlockAccessList>, n: usize) -> Option<Vec<bool>> {
         let cfg = *self.tx_cfg.read();
         if cfg.blocks == 0 {
-            return vec![false; n];
+            return None;
         }
         if cfg.mode == TxIndexMode::All {
-            return vec![true; n];
+            return Some(vec![true; n]);
         }
+        let bal = bal?;
         let mut keep = vec![false; n];
-        let Some(pinned) = self.pinned.read().clone().map(|f| f()) else { return keep };
+        let Some(pinned) = self.pinned.read().clone().map(|f| f()) else { return Some(keep) };
         if pinned.is_empty() {
-            return keep;
+            return Some(keep);
         }
         // BAL index 0 is the pre-execution system calls; transaction i is index i + 1.
         let mut mark = |idx: u64| {
@@ -531,7 +579,7 @@ impl ChainData {
                 keep[(idx - 1) as usize] = true;
             }
         };
-        for acc in bal.map(|b| b.as_slice()).unwrap_or_default() {
+        for acc in bal.iter() {
             if !pinned.contains(&acc.address) {
                 continue;
             }
@@ -542,7 +590,7 @@ impl ChainData {
                 sc.changes.iter().for_each(|c| mark(c.block_access_index.0));
             }
         }
-        keep
+        Some(keep)
     }
 
     fn store_tip(&self, hash: B256, h: &Header) {
@@ -564,11 +612,13 @@ impl ChainData {
             let stale: Vec<u64> = g.headers.range(h.number..).map(|(n, _)| *n).collect();
             for n in stale {
                 g.drop_header(n);
-                g.unindex_block(n, true);
+                g.unindex_block(n);
+                g.unwind_included(n, None);
                 g.touched.remove(&n);
             }
         }
         g.put_header(hash, Arc::new(h.clone()));
+        g.unwind_included(h.number, Some(hash));
         drop(g);
         self.store_tip(hash, h);
         let mut g = self.inner.write();
@@ -583,7 +633,7 @@ impl ChainData {
     #[allow(clippy::too_many_arguments)]
     pub fn note_payload(
         &self,
-        number: u64,
+        header: Arc<Header>,
         hash: B256,
         raw_txs: Vec<Bytes>,
         withdrawals: Vec<Withdrawal>,
@@ -591,6 +641,7 @@ impl ChainData {
         bal: Arc<skim_bal::BlockAccessList>,
         bal_raw: Bytes,
     ) {
+        let number = header.number;
         let hashes = tx_hashes(&raw_txs);
         let keep = self.select_txs(Some(&bal), raw_txs.len());
         self.bodies.lock().put(hash, Arc::new(raw_txs));
@@ -598,22 +649,21 @@ impl ChainData {
         self.bals.lock().put(hash, bal);
         self.bal_raw.lock().put(hash, bal_raw);
         let mut g = self.inner.write();
-        self.index_txs(&mut g, number, hash, &hashes, &keep);
+        g.note_inclusions(&header, hash, &hashes);
+        self.index_txs(&mut g, number, hash, &hashes, keep.as_deref());
         g.touched.insert(number, (hash, Arc::new(touched)));
         while g.touched.len() > TOUCHED_BLOCKS {
             g.touched.pop_first();
         }
     }
 
-    /// Indexes the `keep` transactions of a block (and any sent ones). Only keys are stored.
-    fn index_txs(&self, g: &mut Inner, number: u64, hash: B256, hashes: &[B256], keep: &[bool]) {
-        g.unindex_block(number, true);
+    /// Indexes the `keep` transactions of a block, replacing what was indexed at its height.
+    /// `None` leaves the block's index as it is. Only keys are stored.
+    fn index_txs(&self, g: &mut Inner, number: u64, hash: B256, hashes: &[B256], keep: Option<&[bool]>) {
+        let Some(keep) = keep else { return };
+        g.unindex_block(number);
         let mut keys = Vec::new();
         for (i, t) in hashes.iter().enumerate() {
-            if g.sent.contains_key(t) {
-                tracing::info!(tx = %t, number, "sent transaction included");
-                g.sent_included.insert(*t, (number, i as u32));
-            }
             if !keep.get(i).copied().unwrap_or(false) {
                 continue;
             }
@@ -630,7 +680,7 @@ impl ChainData {
         g.txs.insert(number, (hash, keys));
         while g.txs.len() > blocks {
             let Some((&n, _)) = g.txs.first_key_value() else { break };
-            g.unindex_block(n, false);
+            g.unindex_block(n);
         }
     }
 
@@ -664,12 +714,14 @@ impl ChainData {
         let mut due = Vec::new();
         {
             let mut g = self.inner.write();
-            let included: HashSet<B256> = g.sent.keys().filter(|h| g.sent_included.contains_key(*h)).copied().collect();
-            g.sent.retain(|h, s| included.contains(h) || s.first.elapsed() < SENT_TTL);
-            let Inner { sent, sent_included, .. } = &mut *g;
-            sent_included.retain(|h, _| sent.contains_key(h));
-            for (h, s) in g.sent.iter_mut() {
-                if !included.contains(h) && s.last.elapsed() >= REBROADCAST {
+            g.sent.retain(|_, s| s.first.elapsed() < SENT_TTL);
+            g.included.retain(|_, i| i.at.elapsed() < INCLUDED_TTL);
+            while g.included.len() > INCLUDED_MAX {
+                let Some(oldest) = g.included.iter().min_by_key(|(_, i)| i.at).map(|(h, _)| *h) else { break };
+                g.included.remove(&oldest);
+            }
+            for s in g.sent.values_mut() {
+                if s.last.elapsed() >= REBROADCAST {
                     s.last = Instant::now();
                     due.push(s.tx.clone());
                 }
@@ -687,7 +739,7 @@ impl ChainData {
         let mut nonces: Vec<u64> = g
             .sent
             .iter()
-            .filter(|(h, s)| s.from == from && !g.sent_included.contains_key(*h) && s.tx.nonce() >= latest)
+            .filter(|(_, s)| s.from == from && s.tx.nonce() >= latest)
             .map(|(_, s)| s.tx.nonce())
             .collect();
         nonces.sort();
@@ -976,15 +1028,34 @@ impl ChainData {
                 {
                     self.withdrawals.lock().put(hash, Arc::new(w.into_inner()));
                 }
-                let bal = self.bals.lock().get(&hash);
-                let keep = self.select_txs(bal.as_deref(), raw.len());
-                let hashes = tx_hashes(&raw);
-                let mut g = self.inner.write();
-                self.index_txs(&mut g, header.number, hash, &hashes, &keep);
+                self.accept_body(hash, header, &raw);
                 return Ok(raw);
             }
         }
         Err(DataError::Unavailable(format!("block {} body not served by peers", header.number)))
+    }
+
+    /// A verified body fetched for a canonical block: sent transactions in it become included,
+    /// and the block is indexed unless it already is (same hash). A refetch must never shrink
+    /// the index: without the block's BAL, pinned mode leaves it as it was.
+    fn accept_body(&self, hash: B256, header: &Header, raw: &[Bytes]) {
+        let hashes = tx_hashes(raw);
+        let indexed = self.inner.read().txs.get(&header.number).is_some_and(|(h, _)| *h == hash);
+        let keep = if indexed { None } else { self.select_txs(self.bals.lock().get(&hash).as_deref(), raw.len()) };
+        let mut g = self.inner.write();
+        if g.headers.get(&header.number).is_some_and(|(h, _)| *h == hash) {
+            g.note_inclusions(&Arc::new(header.clone()), hash, &hashes);
+        }
+        self.index_txs(&mut g, header.number, hash, &hashes, keep.as_deref());
+    }
+
+    /// Tests: a body as a peer would serve it (verified like a fetched one).
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn test_serve_body(&self, hash: B256, header: &Header, raw: Vec<Bytes>) {
+        let root = ordered_trie_root_with_encoder(&raw, |t: &Bytes, buf| buf.extend_from_slice(t));
+        assert_eq!(root, header.transactions_root, "test body must match its header");
+        self.bodies.lock().put(hash, Arc::new(raw.clone()));
+        self.accept_body(hash, header, &raw);
     }
 
     /// All receipts of a block, verified against `receipts_root`.
@@ -1101,6 +1172,9 @@ impl ChainData {
     /// Where a transaction is: (number, block hash, header, index), if it's indexed. Each
     /// candidate is confirmed against the block's (verified) transactions.
     pub async fn locate_tx(&self, tx: &B256) -> Result<Option<(u64, B256, Arc<Header>, u32)>, DataError> {
+        if let Some(i) = self.inner.read().included.get(tx) {
+            return Ok(Some((i.header.number, i.block_hash, i.header.clone(), i.index)));
+        }
         for (n, bh, h, i) in self.candidates(tx) {
             let raw = self.block_txs(bh, &h).await?;
             if raw.get(i as usize).is_some_and(|r| keccak256(r) == *tx) {
@@ -1123,12 +1197,13 @@ impl ChainData {
     /// Index hits on canonical blocks, unconfirmed (see [`Self::locate_tx`]).
     fn candidates(&self, tx: &B256) -> Vec<(u64, B256, Arc<Header>, u32)> {
         let g = self.inner.read();
-        g.candidates(tx)
+        let included = g.included.get(tx).map(|i| (i.header.number, i.block_hash, i.header.clone(), i.index));
+        included
             .into_iter()
-            .filter_map(|(n, i)| {
+            .chain(g.candidates(tx).into_iter().filter_map(|(n, i)| {
                 let (bh, h) = g.headers.get(&n)?.clone();
-                (g.txs.get(&n).is_some_and(|(x, _)| *x == bh) || g.sent_included.contains_key(tx)).then_some((n, bh, h, i))
-            })
+                g.txs.get(&n).is_some_and(|(x, _)| *x == bh).then_some((n, bh, h, i))
+            }))
             .collect()
     }
 
@@ -1149,7 +1224,10 @@ impl ChainData {
     /// `eth_getTransactionByHash`: sent transactions (pending or included) and transactions of
     /// indexed blocks. `null` if unknown.
     pub async fn transaction(&self, hash: B256) -> Result<Value, DataError> {
-        let sent = self.inner.read().sent.get(&hash).map(|s| (s.tx.clone(), s.from));
+        let sent = {
+            let g = self.inner.read();
+            g.sent.get(&hash).map(|s| (s.tx.clone(), s.from)).or_else(|| g.included.get(&hash).map(|i| (i.tx.clone(), i.from)))
+        };
         match (self.locate_tx(&hash).await?, sent) {
             (Some((n, bh, h, i)), Some((tx, from))) => Ok(Self::tx_json(&tx, from, Some((n, bh, &h, i)))),
             (None, Some((tx, from))) => Ok(Self::tx_json(&tx, from, None)),
@@ -1737,24 +1815,33 @@ mod tests {
         assert!(started.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    /// A block of legacy transactions to the given addresses (dummy signatures: decoded, never
-    /// recovered), noted as a gossiped payload with `bal`. Returns the transaction hashes.
-    fn note_block(cd: &ChainData, number: u64, to: &[Address], bal: skim_bal::BlockAccessList) -> (B256, Vec<B256>) {
+    fn legacy_tx(nonce: u64, to: Address) -> SignedTx {
         use alloy_consensus::{Signed, TxLegacy};
-        let raw: Vec<Bytes> = to
-            .iter()
-            .enumerate()
-            .map(|(i, a)| {
-                let tx = TxLegacy { nonce: number * 100 + i as u64, to: alloy_primitives::TxKind::Call(*a), gas_limit: 21000, ..Default::default() };
-                let signed = Signed::new_unhashed(tx, alloy_primitives::Signature::test_signature());
-                Bytes::from(SignedTx::Legacy(signed).encoded_2718())
-            })
-            .collect();
-        let h = Header { number, ..Default::default() };
+        let tx = TxLegacy { nonce, to: alloy_primitives::TxKind::Call(to), gas_limit: 21000, ..Default::default() };
+        SignedTx::Legacy(Signed::new_unhashed(tx, alloy_primitives::Signature::test_signature()))
+    }
+
+    /// A block of legacy transactions (dummy signatures: decoded, never recovered), its header
+    /// committing to them. Not noted anywhere.
+    fn block(number: u64, txs: &[SignedTx]) -> (Header, B256, Vec<Bytes>, Vec<B256>) {
+        let raw: Vec<Bytes> = txs.iter().map(|t| Bytes::from(t.encoded_2718())).collect();
+        let transactions_root = ordered_trie_root_with_encoder(&raw, |t: &Bytes, buf| buf.extend_from_slice(t));
+        let h = Header { number, transactions_root, ..Default::default() };
         let hash = h.hash_slow();
-        cd.note_header(&h);
         let hashes = tx_hashes(&raw);
-        cd.note_payload(number, hash, raw, vec![], HashSet::new(), Arc::new(bal), Bytes::new());
+        (h, hash, raw, hashes)
+    }
+
+    /// A block of transactions to `to`, noted as canonical and gossiped with `bal`.
+    fn note_block(cd: &ChainData, number: u64, to: &[Address], bal: skim_bal::BlockAccessList) -> (B256, Vec<B256>) {
+        let txs: Vec<SignedTx> = to.iter().enumerate().map(|(i, a)| legacy_tx(number * 100 + i as u64, *a)).collect();
+        note_txs(cd, number, &txs, bal)
+    }
+
+    fn note_txs(cd: &ChainData, number: u64, txs: &[SignedTx], bal: skim_bal::BlockAccessList) -> (B256, Vec<B256>) {
+        let (h, hash, raw, hashes) = block(number, txs);
+        cd.note_header(&h);
+        cd.note_payload(Arc::new(h), hash, raw, vec![], HashSet::new(), Arc::new(bal), Bytes::new());
         (hash, hashes)
     }
 
@@ -1794,28 +1881,67 @@ mod tests {
         assert_eq!(found(&cd, &h[1]), Some((11, 1)));
     }
 
+    /// Review: refetching an evicted body, with the BAL gone from its cache too, re-indexed the
+    /// block from "no BAL" and erased its pinned entries: the first lookup worked, the next ones
+    /// returned null.
     #[tokio::test]
-    async fn the_window_bounds_the_index_but_sent_transactions_stay_included_until_a_reorg() {
-        let other = Address::repeat_byte(3);
+    async fn refetching_an_evicted_body_keeps_the_blocks_pinned_entries() {
+        use skim_bal::alloy_eip7928::{AccountChanges, BlockAccessIndex, NonceChange};
+        let pinned = Address::repeat_byte(1);
+        let cd = ChainData::offline(100);
+        let set: HashSet<Address> = [pinned].into();
+        cd.set_tx_index(TxIndexConfig { mode: TxIndexMode::Pinned, blocks: 16 }, Some(Arc::new(move || set.clone())));
+        let txs = [legacy_tx(1, Address::repeat_byte(9)), legacy_tx(2, Address::repeat_byte(9))];
+        let bal = vec![AccountChanges::new(pinned)
+            .with_nonce_change(NonceChange::new(BlockAccessIndex(1), 1))
+            .with_nonce_change(NonceChange::new(BlockAccessIndex(2), 2))];
+        let (h, hash, raw, hashes) = block(100, &txs);
+        cd.note_header(&h);
+        cd.note_payload(Arc::new(h.clone()), hash, raw.clone(), vec![], HashSet::new(), Arc::new(bal), Bytes::new());
+        // Body and BAL leave their caches; the index window still covers the block.
+        cd.bodies.lock().map.remove(&hash);
+        cd.bals.lock().map.remove(&hash);
+        cd.test_serve_body(hash, &h, raw);
+        for _ in 0..2 {
+            assert_eq!(found(&cd, &hashes[0]), Some((100, 0)));
+        }
+        assert_eq!(found(&cd, &hashes[1]), Some((100, 1)), "the block's other pinned transaction");
+    }
+
+    /// Review: included sent transactions were kept forever (they kept each other alive), and once
+    /// the header window dropped their block they were answered as pending.
+    #[tokio::test]
+    async fn sent_transactions_move_pending_included_and_expire_with_a_bound() {
+        let to = Address::repeat_byte(3);
         let cd = ChainData::offline(100);
         cd.set_tx_index(TxIndexConfig { mode: TxIndexMode::All, blocks: 1 }, None);
-        // Pretend skim sent the first transaction of block 20.
-        let probe = {
-            use alloy_consensus::{Signed, TxLegacy};
-            let tx = TxLegacy { nonce: 2000, to: alloy_primitives::TxKind::Call(other), gas_limit: 21000, ..Default::default() };
-            SignedTx::Legacy(Signed::new_unhashed(tx, alloy_primitives::Signature::test_signature()))
-        };
-        let sent_hash = keccak256(probe.encoded_2718());
-        cd.inner.write().sent.insert(sent_hash, Sent { tx: probe, from: other, first: Instant::now(), last: Instant::now() });
-        let (_, h20) = note_block(&cd, 20, &[other, other], vec![]);
-        assert_eq!(h20[0], sent_hash);
-        let (_, h21) = note_block(&cd, 21, &[other], vec![]);
-        assert_eq!(found(&cd, &h20[1]), None, "block 20 left the 1-block window");
-        assert_eq!(found(&cd, &h21[0]), Some((21, 0)));
-        assert_eq!(found(&cd, &sent_hash), Some((20, 0)), "a sent transaction stays found after eviction");
-        assert!(cd.inner.read().sent_included.contains_key(&sent_hash), "and stays included (no rebroadcast)");
-        // A reorg replacing block 20: the sent transaction is pending again.
+        let sent = legacy_tx(7, to);
+        let sent_hash = keccak256(sent.encoded_2718());
+        let now = Instant::now();
+        cd.inner.write().sent.insert(sent_hash, Sent { tx: sent.clone(), from: to, first: now, last: now });
+        let (hash20, h) = note_txs(&cd, 20, &[sent.clone()], vec![]);
+        assert_eq!(h[0], sent_hash);
+        assert!(cd.inner.read().sent.is_empty(), "included: no longer pending (no rebroadcast, not in the pending nonce)");
+        // The index window and the header window both drop block 20.
+        note_block(&cd, 21, &[to], vec![]);
+        cd.inner.write().drop_header(20);
+        cd.bodies.lock().map.remove(&hash20);
+        let v = cd.transaction(sent_hash).await.unwrap();
+        assert_eq!(v["blockNumber"], json!("0x14"), "still answered as included: {v}");
+        // A different block at 20 (a reorg): pending again.
         cd.note_header(&Header { number: 20, gas_limit: 1, ..Default::default() });
-        assert!(!cd.inner.read().sent_included.contains_key(&sent_hash));
+        assert!(cd.inner.read().sent.contains_key(&sent_hash));
+        assert_eq!(cd.transaction(sent_hash).await.unwrap()["blockNumber"], Value::Null);
+        // Included records are bounded in number.
+        {
+            let mut g = cd.inner.write();
+            let header = Arc::new(Header::default());
+            for i in 0..INCLUDED_MAX as u64 + 10 {
+                let k = B256::from(alloy_primitives::U256::from(i));
+                g.included.insert(k, Included { tx: sent.clone(), from: to, header: header.clone(), block_hash: B256::ZERO, index: 0, at: Instant::now() });
+            }
+        }
+        cd.rebroadcast();
+        assert_eq!(cd.inner.read().included.len(), INCLUDED_MAX);
     }
 }
