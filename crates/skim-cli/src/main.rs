@@ -6,19 +6,71 @@
 // arenas; mimalloc returns them. On macOS the system allocator is the smaller one: following the
 // head with the same load, mimalloc's footprint was 236-255 MB against 86-94 MB (M7, "Memory").
 #[cfg(all(target_os = "linux", not(any(feature = "dhat-heap", feature = "alloc-system", feature = "alloc-jemalloc"))))]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-// Allocator comparisons on Linux: `alloc-system` (glibc, no global_allocator) or jemalloc.
+type BaseAlloc = mimalloc::MiMalloc;
+// Allocator comparisons on Linux: `alloc-system` (glibc) or `alloc-jemalloc`.
 #[cfg(all(target_os = "linux", feature = "alloc-jemalloc", not(feature = "dhat-heap")))]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
+type BaseAlloc = tikv_jemallocator::Jemalloc;
+#[cfg(all(not(feature = "dhat-heap"), any(not(target_os = "linux"), all(feature = "alloc-system", not(feature = "alloc-jemalloc")))))]
+type BaseAlloc = std::alloc::System;
 // Heap profiling (`--features dhat-heap`): every allocation with its call site; on exit,
 // `dhat-heap.json` (view it at https://nnethercote.github.io/dh_view/dh_view.html).
 #[cfg(feature = "dhat-heap")]
+type BaseAlloc = dhat::Alloc;
+
+/// Whichever allocator, counted: `heap::live()` is skim's live heap, so RSS minus it is what the
+/// allocator holds beyond that (free pages it keeps, fragmentation) plus code and stacks.
 #[global_allocator]
-static GLOBAL: dhat::Alloc = dhat::Alloc;
+#[allow(clippy::default_constructed_unit_structs)]
+static GLOBAL: heap::Counting<BaseAlloc> = heap::Counting(BaseAlloc {});
+
+/// Live heap accounting around the global allocator: one relaxed atomic per allocation and free.
+mod heap {
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Bytes currently allocated by skim (requested sizes; the allocator's own overhead is not
+    /// in it, by design).
+    pub fn live() -> usize {
+        LIVE.load(Relaxed)
+    }
+
+    pub struct Counting<A>(pub A);
+
+    // SAFETY: every call forwards to the inner allocator unchanged; only a counter is updated.
+    unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let p = unsafe { self.0.alloc(l) };
+            if !p.is_null() {
+                LIVE.fetch_add(l.size(), Relaxed);
+            }
+            p
+        }
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            let p = unsafe { self.0.alloc_zeroed(l) };
+            if !p.is_null() {
+                LIVE.fetch_add(l.size(), Relaxed);
+            }
+            p
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            unsafe { self.0.dealloc(p, l) };
+            LIVE.fetch_sub(l.size(), Relaxed);
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+            let q = unsafe { self.0.realloc(p, l, new) };
+            if !q.is_null() {
+                if new >= l.size() {
+                    LIVE.fetch_add(new - l.size(), Relaxed);
+                } else {
+                    LIVE.fetch_sub(l.size() - new, Relaxed);
+                }
+            }
+            q
+        }
+    }
+}
 
 // Chain data and the post-fork history store live in skim-chain (shared with skim-hub); these
 // keep `crate::chaindata` / `crate::history` paths working.
@@ -135,6 +187,17 @@ mod tests {
 
     fn args(a: &[&str]) -> Vec<String> {
         with_default_subcommand(a.iter().map(Into::into).collect()).into_iter().map(|s| s.into_string().unwrap()).collect()
+    }
+
+    #[test]
+    fn the_live_heap_counter_follows_allocations() {
+        // Other test threads allocate too: a large allocation dominates the noise.
+        let before = heap::live();
+        let v = vec![1u8; 64 << 20];
+        let during = heap::live();
+        assert!(during >= before + (64 << 20) - (1 << 20), "{before} -> {during}");
+        drop(v);
+        assert!(heap::live() < during - (60 << 20));
     }
 
     #[test]

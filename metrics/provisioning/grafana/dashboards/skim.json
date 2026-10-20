@@ -3285,7 +3285,7 @@
     {
       "type": "timeseries",
       "title": "Retained data by structure (stacked) vs RSS",
-      "description": "Estimated payload bytes each structure holds (skim_memory_bytes). The gap to RSS is allocator overhead, code pages and what isn't counted: a heap profile explains it. A part that keeps rising after its cache is full points at a leak.",
+      "description": "Estimated payload bytes each structure holds (skim_memory_bytes), and skim's whole live heap (heap (live), counted at the allocator). Between the stack and the heap line: live data no structure counts (network buffers, page caches). Between the heap line and RSS: allocator overhead (free pages it keeps, fragmentation) plus code and stacks. A part that keeps rising after its cache is full points at a leak.",
       "targets": [
         {
           "datasource": {
@@ -3304,6 +3304,15 @@
           "expr": "sum(process_resident_memory_bytes{instance=~\"$instance\"})",
           "legendFormat": "RSS",
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(skim_heap_live_bytes{instance=~\"$instance\"})",
+          "legendFormat": "heap (live)",
+          "refId": "C"
         }
       ],
       "fieldConfig": {
@@ -3326,6 +3335,28 @@
             "matcher": {
               "id": "byName",
               "options": "RSS"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "heap (live)"
             },
             "properties": [
               {

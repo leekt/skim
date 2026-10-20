@@ -255,13 +255,14 @@ next_row(8)
 ts("Retained data by structure (stacked) vs RSS", [
     target(f"sum by (part) (skim_memory_bytes{{{I}}})", "{{part}}"),
     target(f"sum(process_resident_memory_bytes{{{I}}})", "RSS", ref="B"),
+    target(f"sum(skim_heap_live_bytes{{{I}}})", "heap (live)", ref="C"),
 ], "bytes", x=0, w=16, h=10, stack=True, legend_table=True,
-   desc="Estimated payload bytes each structure holds (skim_memory_bytes). The gap to RSS is allocator overhead, code pages and what isn't counted: a heap profile explains it. A part that keeps rising after its cache is full points at a leak.")
+   desc="Estimated payload bytes each structure holds (skim_memory_bytes), and skim's whole live heap (heap (live), counted at the allocator). Between the stack and the heap line: live data no structure counts (network buffers, page caches). Between the heap line and RSS: allocator overhead (free pages it keeps, fragmentation) plus code and stacks. A part that keeps rising after its cache is full points at a leak.")
 # RSS is the total to compare against, not another layer of the stack.
 next(p for p in panels if p.get("title") == "Retained data by structure (stacked) vs RSS")["fieldConfig"]["overrides"] = [{
-    "matcher": {"id": "byName", "options": "RSS"},
+    "matcher": {"id": "byName", "options": name},
     "properties": [{"id": "custom.stacking", "value": {"mode": "none"}}, {"id": "custom.fillOpacity", "value": 0}, {"id": "custom.lineWidth", "value": 2}],
-}]
+} for name in ("RSS", "heap (live)")]
 ts("Entries by structure", [target(f"sum by (part) (skim_memory_entries{{{I}}})", "{{part}}")], x=16, w=8, h=10, legend_table=True,
    desc="Blocks, keys or peers each structure holds. Fixed-size caches level off once full (tx index after 2,048 blocks, headers after 8,192).")
 next_row(10)

@@ -785,7 +785,8 @@ impl Rpc {
                     "history": self.chain.as_ref().map(|c| c.history_json()),
                     "memory": {
                         "parts": self.memory_parts(),
-                        "note": "entries, estimated payload bytes and capacity per retained structure; payload only (no allocator overhead or code pages), so the sum explains part of RSS",
+                        "heap_live_bytes": crate::heap::live(),
+                        "note": "parts: entries, estimated payload bytes and capacity per retained structure (payload only). heap_live_bytes: everything skim has allocated now, counted at the allocator; RSS minus it is allocator overhead (free pages kept, fragmentation) plus code and stacks",
                     },
                     "snap_fetch": {
                         "stats": sim.sched.stats(),
@@ -906,6 +907,7 @@ impl Rpc {
     pub fn refresh_metrics(&self, top_addresses: usize) {
         use metrics::{counter, gauge};
         let sim = &self.sim;
+        gauge!("skim_heap_live_bytes").set(crate::heap::live() as f64);
         for p in self.memory_parts() {
             gauge!("skim_memory_bytes", "part" => p.part).set(p.bytes as f64);
             gauge!("skim_memory_entries", "part" => p.part).set(p.entries as f64);
