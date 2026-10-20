@@ -28,6 +28,15 @@ The checkpoint source is, in order: `--checkpoint`, the last verified finalized 
 
 The light client supports both `mainnet` and `minimal` consensus presets and catches up across committee periods. End-to-end bootstrap, updates and rotation have been verified on the [minimal-preset devnet](../../devnet/README.md). Earlier Sepolia runs encountered unavailable Gloas light-client data; this is a peer-availability observation, not a permanent network restriction. `skim_status.light_client` reports `period`, `verified_block`, `finalized_block`, accepted/rejected updates, checkpoint provenance and `last_error`.
 
+## Three kinds of verification
+| | What skim does | What that leaves |
+|---|---|---|
+| **Consensus:** which block is canonical | a sync-committee light client: `safe` and `finalized` are authenticated, `latest` is optimistic | not full fork choice or attestation validation |
+| **Signatures and proofs:** are the block's transactions authorized | taken on trust from consensus | (EIP-8288 would make this checkable with one STARK per block: [future considerations](future-considerations.md#participating-in-the-network-not-just-consuming-it)) |
+| **Execution:** are the results and state root correct | BAL post-values applied as committed by the header; fetched values checked by Merkle proof | no re-execution, no state-root recompute |
+
+Improving one doesn't improve the others.
+
 ## What skim does not verify (yet)
 - **Full validator consensus and fork choice.** skim uses a sync-committee light client rather than validating every proposer/attestation and running a full consensus client. Default `latest` remains optimistic; authenticated tags require verified updates and a matching selected-chain block.
 - **Execution of the block itself.** skim takes the BAL's post-values as given, because they are committed by the block hash. A block that is valid by hash but whose BAL disagrees with its own execution would be invalid under consensus, and is out of scope here. For a consensus-authenticated block (`safe`, `finalized`) the post-values are therefore as trustworthy as the header; on optimistic `latest`, a gossiped block that consensus later rejects is the remaining risk.

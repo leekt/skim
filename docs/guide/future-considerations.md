@@ -9,14 +9,52 @@ Geth's partial-state proposal ([go-ethereum PR 33764](https://github.com/ethereu
 
 The open question for skim: **can the state root be checked from a minimal witness, without storing all accounts?** For example, keeping the trie paths of the held keys and updating them per block from BAL changes plus the sibling nodes those changes need. That would keep skim's footprint app-sized while adding a per-block root check. It may need witnesses that BALs don't carry, and it conflicts with skim's small-working-set goal if it degrades into holding the account trie. Research, not a roadmap item.
 
-## A validation-state mode (VOPS, AA-VOPS)
-[Validity-Only Partial Statelessness](https://ethresear.ch/t/a-pragmatic-path-towards-validity-only-partial-statelessness-vops/22236) (VOPS; ethresear.ch, 2025-04) is an architecture proposal, not a client: nodes keep, per EOA, only address, nonce, balance and a code flag (~40 bytes; the post estimates ~8.4 GiB against ~233 GiB of full state, "a 25x storage reduction"), enough to check that a pending transaction is valid. The goal is censorship resistance under FOCIL: a valid-only mempool that every node can enforce. The post names EIP-7928 BALs as the way to publish the per-block account changes. It's one of the motivations behind Geth's partial-state PR.
+## Participating in the network, not just consuming it
+Long-term goal: **a lightweight Ethereum client that participates in the network, not just consumes it.** Three roles on one partial-state engine. Users run the light client by default and opt into the others with the resources they want to give.
 
-Native account abstraction breaks the "nonce and balance are enough" assumption. **AA-VOPS**, in the same post, has each node keep only the accounts it cares about (the account leaf, the storage slots validation needs, and a Merkle path witness), refreshed from per-block state diffs. That is close to skim's model: subscribed keys kept current from BALs, plus witnesses.
+| Role | Weight | Fit with skim |
+|---|---|---|
+| Verified lightweight client | core | very high |
+| Light mempool participant | core extension | very high |
+| Recursive proof aggregator | optional, by hardware | medium, until its cost is known |
 
-A possible skim direction: alongside the **application state** it keeps for `eth_call`, simulation and indexing, a **validation state** for pending-transaction checks (nonces, balances, the keys and policies that authorize a smart account). Caveats:
-- A mempool-validation working set differs from an `eth_call` working set.
-- Using it for a censorship-resistant mempool needs the validity rules and state availability the protocol requires. skim's selective cache alone doesn't provide those guarantees.
+**Three kinds of verification**, kept apart, because improving one doesn't improve the others:
+
+| | Today | With [EIP-8288](https://eips.ethereum.org/EIPS/eip-8288), if skim verifies the block's STARK |
+|---|---|---|
+| **Consensus:** which block is canonical | sync-committee light client, not full fork choice; `latest` is optimistic | unchanged |
+| **Signatures and proofs:** are the block's authorizations valid | taken on trust from consensus | checked: one recursive STARK per block |
+| **Execution:** are the block's results and state root correct | not checked: BAL post-values trusted through the header commitment; no state-root recompute | unchanged |
+
+Verifying the block STARK would not make skim a validating node, and nothing should claim it does.
+
+### 1. The verified lightweight client
+What skim is today (subscribed state kept current from BALs, proofs for fetched values, local execution, a sync-committee light client), plus, once EIP-8288 lands, verifying the block-level recursive STARK: every signature and proof a block depends on, checked at roughly one proof verification per block. Prerequisites:
+- **EIP-8141 frame transactions** in the networking and RPC stack: the sender stops being `ecrecover`, sending means a mode-0 wrapper (transactions plus their proofs), and gas estimates add `recursive_stark_gas`.
+- **Headers without the proof:** EIP-8288 adds `recursive_stark` to the header, which "does increase the block header size greatly". skim keeps 8,192 headers in memory and every post-fork header on disk with `--history local`, so it would verify the proof and keep only the hash links and `block_deps_hash`.
+
+### 2. A light mempool participant
+Under EIP-8288, signatures are proven by STARKs, but a mempool node still has to know whether a transaction is **includable**, which is a question about state: nonce, balance, and under native account abstraction, whatever the account's validation reads. A full node answers it with all of the state. skim can keep just the validation state, and its existing machinery for `eth_call` subscriptions is that mechanism already: run the call, learn its access set from execution, subscribe those keys, re-check when a BAL touches one.
+
+```
+incoming transaction
+  -> run its validation (frame) locally; the access set is its dependencies
+  -> fetch the missing state (SNAP, with proofs)
+  -> keep those keys current from BALs; re-validate when one changes
+  -> validate / relay / aggregate
+  -> release the keys on inclusion or expiry
+```
+
+This is the [VOPS](https://ethresear.ch/t/a-pragmatic-path-towards-validity-only-partial-statelessness-vops/22236) idea (nodes keep only what pending-transaction validity needs; ~40 bytes per EOA, "a 25x storage reduction", in the post's estimate) and its native-AA variant, AA-VOPS (each node keeps only the accounts and slots validation needs, with witnesses, refreshed per block). Caveats:
+- **Bounded validation is the protocol's job.** If validation can read arbitrary state, a mempool node can be made to fetch and track unbounded state per transaction (a DoS vector). skim has to follow the protocol's validation rules, as ERC-4337's validation rules did for user operations, not invent its own.
+- **A selective cache isn't a mempool guarantee.** A censorship-resistant mempool (FOCIL) needs the validity rules and state availability the protocol requires.
+- **A first measurement is possible today:** the validation working set of Sepolia's current mempool (senders' nonces and balances, delegated accounts' code) and how fast it churns. That's `skim probe-mempool`.
+
+### 3. A recursive proof aggregator
+In EIP-8288, mempool nodes rebuild a recursive STARK over their valid transactions every `AGGREGATION_INTERVAL` (1,000 ms), and builders do the same over what they include. Proving capacity scales with how many nodes aggregate, which makes this role matter long-term. But its cost depends on an implementation and parameters that are still TBD, so no plan should assume a typical skim produces a recursive STARK every second. Partial participation (smaller aggregates, the EIP's priority order) may be what fits cheap hardware. Measure first.
+
+### On "more nodes, more security"
+Conditionally true. More light clients mean wider access and more independent checking; more relays diversify propagation and can improve censorship resistance; more aggregators spread and scale proving. None of it is automatically more consensus security or more throughput: topology, aggregation scheduling, duplicate work and censorship resistance decide that.
 
 ## Embedding: skim as a library
 Today skim is a process serving JSON-RPC. As a library, an application (an SDK, a desktop or mobile wallet, a Node.js service through a native addon) could link P2P networking, the partial-state store, local EVM and consensus verification directly, with no RPC hop. The crates are already split along these lines (`skim-el`, `skim-cl`, `skim-state`, `skim-sim`, `skim-chain`); the work is a stable embedding API, lifecycle control (start, stop, persistence), and builds for the target platforms.
