@@ -41,6 +41,23 @@ export class Ingest {
       store.run("INSERT OR IGNORE INTO registries (address, parent_node, block, fixed) VALUES (?, ?, 0, 1)", lower(a), parent);
       store.run("UPDATE registries SET parent_node = ?, fixed = 1 WHERE address = ?", parent, lower(a));
     }
+    this.repairRenewedNames();
+  }
+
+  /**
+   * Once per index: names known only from renewals indexed before renewals added the name's
+   * edge (registered before the index starts) get it now, so lists and history can name them.
+   */
+  repairRenewedNames() {
+    if (this.s.meta("repaired_renewed_names") === "1") return;
+    this.s.tx(() => {
+      for (const e of this.s.all("SELECT node, block, ts, kind, data FROM events WHERE kind IN ('ControllerNameRenewed', 'RegistrarNameRenewed') AND node IS NOT NULL AND node NOT IN (SELECT node FROM names)")) {
+        const d = JSON.parse(e.data);
+        const labelHash = e.kind === "ControllerNameRenewed" ? d.label : tokenNode(d.id);
+        if (child(ETH_NODE, labelHash) === e.node) this.edge(e.node, ETH_NODE, labelHash, e.block, e.ts);
+      }
+      this.s.meta("repaired_renewed_names", "1");
+    });
   }
 
   /** A label preimage, kept only if it hashes to `labelHash`. */
@@ -237,6 +254,8 @@ export class Ingest {
         if (addr !== lower(V1.baseRegistrar)) return false;
         const n = child(ETH_NODE, tokenNode(args.id));
         this.expiry(n, "v1_lease", args.expires, l);
+        // A renewal shows the name exists under .eth, even if it was registered before the index.
+        this.edge(n, ETH_NODE, tokenNode(args.id), l.block, ts);
         ev("renewal", n);
         break;
       }
@@ -244,6 +263,7 @@ export class Ingest {
         if (!CONTROLLERS.has(addr)) return false;
         this.preimage(args.name, args.label);
         const n = child(ETH_NODE, args.label);
+        this.edge(n, ETH_NODE, args.label, l.block, ts);
         // NameWrapper.renew sets the wrapper expiry to lease expiry + grace, without an event.
         this.expiry(n, "wrapper", args.expires + V1_GRACE_S, l);
         ev("renewal", n);

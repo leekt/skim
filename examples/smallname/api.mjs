@@ -23,6 +23,47 @@ class ApiError extends Error {
 const bad = (m, d) => new ApiError(400, "invalid_input", m, d);
 const unsupported = (m, reason) => new ApiError(422, "unsupported", m, { unsupported_reason: reason });
 
+/**
+ * History rows (in query order) grouped into actions: one item per (transaction, type, name).
+ * One renewal is several logs (controller, registrar, ENSv2 registry...); listing each made one
+ * action several identical-looking rows. A row with no name joins its transaction's group of the
+ * same type when there's exactly one. Pages end only at transaction boundaries (`size` groups or
+ * more), so an action is never split across pages. Returns {groups, last, more}: `last` is the
+ * last row consumed (the cursor), `more` whether rows remain beyond it.
+ */
+export function historyGroups(rows, size) {
+  const groups = [];
+  let i = 0;
+  while (i < rows.length) {
+    const txKey = (r) => r.tx ?? `${r.block}:${r.log_index}`;
+    const t = txKey(rows[i]);
+    let j = i;
+    while (j < rows.length && txKey(rows[j]) === t) j++;
+    const txRows = rows.slice(i, j);
+    // A transaction is complete only if a row of another transaction follows it.
+    if (j === rows.length && groups.length > 0) break;
+    const byKey = new Map();
+    for (const r of txRows.filter((r) => r.node)) {
+      const k = `${r.type}|${r.node}`;
+      if (!byKey.has(k)) byKey.set(k, []);
+      byKey.get(k).push(r);
+    }
+    for (const r of txRows.filter((r) => !r.node)) {
+      const named = [...byKey.keys()].filter((k) => k.startsWith(`${r.type}|`));
+      const k = named.length === 1 ? named[0] : `${r.type}|`;
+      if (!byKey.has(k)) byKey.set(k, []);
+      byKey.get(k).push(r);
+    }
+    const txGroups = [...byKey.values()].sort((a, b) => txRows.indexOf(a[0]) - txRows.indexOf(b[0]));
+    groups.push(...txGroups);
+    i = j;
+    if (groups.length >= size) break;
+  }
+  const consumed = groups.flat();
+  const last = consumed.length ? consumed.reduce((a, r) => (rows.indexOf(r) > rows.indexOf(a) ? r : a)) : null;
+  return { groups, last, more: rows.length > consumed.length };
+}
+
 /** What a list check returns when the candidate's live state couldn't be read. */
 export const UNAVAILABLE = Symbol("unavailable");
 
@@ -339,20 +380,34 @@ export function serve(store, { skim, port, host }) {
       conds.push(order === "DESC" ? "(block < ? OR (block = ? AND log_index < ?))" : "(block > ? OR (block = ? AND log_index > ?))");
       a.push(c.b, c.b, c.l);
     }
-    const rows = store.all(`SELECT * FROM events WHERE ${conds.join(" AND ")} ORDER BY block ${order}, log_index ${order} LIMIT ?`, ...a, size + 1);
-    const more = rows.length > size;
+    // Enough rows for `size` actions plus the start of the next (an action is a few logs).
+    let lim = (size + 1) * 8;
+    let rows, g;
+    for (;;) {
+      rows = store.all(`SELECT * FROM events WHERE ${conds.join(" AND ")} ORDER BY block ${order}, log_index ${order} LIMIT ?`, ...a, lim);
+      g = historyGroups(rows, size);
+      if (rows.length < lim || g.more) break;
+      lim *= 4;
+    }
+    const more = g.more || rows.length === lim;
     const inc = new Set(q.get("include")?.split(",") ?? []);
-    const data = rows.slice(0, size).map((e) => {
+    const data = g.groups.map((group) => {
+      // The outermost call's log is usually emitted last (the controller's, with the name).
+      const e = group.reduce((x, r) => (r.log_index > x.log_index ? r : x));
       const ev = {
         id: `${e.block.toString(16).padStart(16, "0")}${e.log_index.toString(16).padStart(8, "0")}${e.block_hash?.slice(2, 42) ?? ""}`.padEnd(64, "0"),
         type: e.type, name: e.node ? nameOf(e.node) : null, namespace: "ens", registration_id: null,
         block_number: e.block, timestamp: s(e.ts), transaction_hash: e.tx, log_index: e.log_index,
       };
+      if (group.length > 1) ev.log_count = group.length;
       if (inc.has("raw")) ev.kind = e.kind;
-      if (inc.has("data")) Object.assign(ev, { contract_address: e.address, data: JSON.parse(e.data) });
+      if (inc.has("data")) {
+        Object.assign(ev, { contract_address: e.address, data: JSON.parse(e.data) });
+        if (group.length > 1) ev.logs = group.map((r) => ({ log_index: r.log_index, contract_address: r.address, kind: r.kind, data: JSON.parse(r.data) }));
+      }
       return ev;
     });
-    const last = rows[size - 1];
+    const last = g.last;
     let total = null;
     if (inc.has("total_count")) total = store.get(`SELECT count(*) c FROM events WHERE ${conds.slice(0, cursor ? -1 : undefined).join(" AND ")}`, ...a.slice(0, cursor ? -3 : undefined)).c;
     return { data, page: page(cursor, more ? enc({ s: sc, b: last.block, l: last.log_index }) : null, size, total), meta: { ...partialMeta(), index: indexMeta(null) } };

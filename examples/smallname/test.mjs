@@ -8,9 +8,9 @@ import { encodeEventTopics, encodeAbiParameters, keccak256, toHex, namehash, lab
 import { Store } from "./store.mjs";
 import { Ingest, child } from "./ingest.mjs";
 import { applyResponse } from "./sync.mjs";
-import { EVENTS, V1, V2 } from "./contracts.mjs";
+import { EVENTS, V1, V2, V1_CONTROLLERS } from "./contracts.mjs";
 import { nameState } from "./live.mjs";
-import { fill, UNAVAILABLE } from "./api.mjs";
+import { fill, UNAVAILABLE, historyGroups } from "./api.mjs";
 
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
@@ -188,6 +188,50 @@ test("a list never skips a name whose live read failed: the page stops there, or
   // A confirmed non-match is still passed over.
   names.splice(1, 0, "nope");
   assert.deepEqual((await fill(cands, check, (x) => x, 3, "")).rows, ["a", "b", "c"]);
+});
+
+test("history lists one item per action, not per log, and never splits a transaction across pages", () => {
+  // vitalik.eth's renewal: five logs in one transaction (ENSv2 registry with no name yet, the
+  // BaseRegistrar twice, ENSv2, the controller), then a bulk renewal of two names.
+  const v = "0xvitalik", a = "0xalice", b = "0xbob";
+  const row = (block, log_index, tx, kind, node, type = "renewal") => ({ block, log_index, tx, kind, node, type });
+  const rows = [
+    row(11, 3, "0xt2", "ControllerNameRenewed", b), row(11, 2, "0xt2", "ControllerNameRenewed", a),
+    row(11, 1, "0xt2", "RegistrarNameRenewed", b), row(11, 0, "0xt2", "RegistrarNameRenewed", a),
+    row(10, 80, "0xt1", "ControllerNameRenewed", v), row(10, 79, "0xt1", "RegistrarNameRenewed", v),
+    row(10, 76, "0xt1", "V2NameRenewed", v), row(10, 75, "0xt1", "RegistrarNameRenewed", v),
+    row(10, 74, "0xt1", "ExpiryUpdated", null),
+    row(9, 5, "0xt0", "ControllerNameRenewed", v),
+  ];
+  const g = historyGroups(rows, 2);
+  assert.deepEqual(g.groups.map((x) => [x[0].node, x.length]), [[b, 2], [a, 2]], "the bulk renewal: one item per name");
+  assert.deepEqual(g.last, rows[3]);
+  assert.equal(g.more, true);
+  const g2 = historyGroups(rows.slice(4), 1);
+  assert.deepEqual(g2.groups.map((x) => [x[0].node, x.length]), [[v, 5]], "five logs, one renewal; the unnamed one folds in");
+  assert.deepEqual(g2.last, rows[8], "the page ends after the whole transaction");
+  // A page of 3: the bulk renewal (2) plus vitalik's (1), ending at a transaction boundary.
+  assert.equal(historyGroups(rows, 3).groups.length, 3);
+});
+
+test("a renewal of a name registered before the index gives it a name, and old renewals are repaired", () => {
+  const { store, ingest } = fresh();
+  const b = block(100, "A");
+  const log = {
+    address: V1_CONTROLLERS[0],
+    topics: encodeEventTopics({ abi: [EVENTS.ControllerNameRenewed], eventName: "NameRenewed", args: { label: labelhash("vitalik") } }),
+    data: encodeAbiParameters([{ type: "string" }, { type: "uint256" }, { type: "uint256" }], ["vitalik", 0n, 3177760424n]),
+    blockNumber: toHex(100), blockHash: b.hash, blockTimestamp: toHex(b.timestamp), logIndex: "0x0", transactionIndex: "0x0",
+    transactionHash: hash("renew"), removed: false,
+  };
+  applyResponse(store, ingest, { events: [apply(b, [log])], cursor: { number: 100, hash: b.hash }, nextFrom: 101 }, { cursor: null, start: 100 });
+  const node = namehash("vitalik.eth");
+  assert.equal(store.get("SELECT label FROM names WHERE node = ?", node)?.label, "vitalik", "named from the renewal");
+  // An index from before this: the renewal is stored, the edge isn't. Opening repairs it once.
+  store.run("DELETE FROM names WHERE node = ?", node);
+  store.meta("repaired_renewed_names", "0");
+  new Ingest(store);
+  assert.equal(store.get("SELECT label FROM names WHERE node = ?", node)?.label, "vitalik");
 });
 
 /** A reader whose calls answer from `answers[functionName]` (a value, or a failure object). */
