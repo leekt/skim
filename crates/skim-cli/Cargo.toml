@@ -46,7 +46,12 @@ alloy-rpc-types-eth.workspace = true
 alloy-rpc-types-trace.workspace = true
 skim-cl.workspace = true
 skim-chain.workspace = true
+dhat = { version = "=0.3.3", optional = true }
 
+
+[features]
+# Heap profiling build: replaces the allocator with dhat's (slow; diagnostics only).
+dhat-heap = ["dep:dhat"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 mimalloc = { version = "=0.1.52", default-features = false }

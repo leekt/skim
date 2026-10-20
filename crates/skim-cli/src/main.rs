@@ -5,9 +5,15 @@
 // on aarch64 Linux: 228 MB peak heap, 554 MB RSS), as freed receipt buffers stayed in per-thread
 // arenas; mimalloc returns them. On macOS the system allocator is the smaller one: following the
 // head with the same load, mimalloc's footprint was 236-255 MB against 86-94 MB (M7, "Memory").
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "dhat-heap")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// Heap profiling (`--features dhat-heap`): every allocation with its call site; on exit,
+// `dhat-heap.json` (view it at https://nnethercote.github.io/dh_view/dh_view.html).
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static GLOBAL: dhat::Alloc = dhat::Alloc;
 
 // Chain data and the post-fork history store live in skim-chain (shared with skim-hub); these
 // keep `crate::chaindata` / `crate::history` paths working.
@@ -85,6 +91,8 @@ fn with_default_subcommand(mut argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::O
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
     // No transparent huge pages for skim: mimalloc asks for them, and a 2 MiB page that is only
     // partly used counts fully in RSS. Measured following the head on aarch64 Linux: 179 MB at
     // 26 min without, 251-256 MB with (same state; M7, "Memory"). MIMALLOC_ALLOW_THP=1 keeps them.
