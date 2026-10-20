@@ -5,9 +5,14 @@
 // on aarch64 Linux: 228 MB peak heap, 554 MB RSS), as freed receipt buffers stayed in per-thread
 // arenas; mimalloc returns them. On macOS the system allocator is the smaller one: following the
 // head with the same load, mimalloc's footprint was 236-255 MB against 86-94 MB (M7, "Memory").
-#[cfg(all(target_os = "linux", not(feature = "dhat-heap")))]
+#[cfg(all(target_os = "linux", not(any(feature = "dhat-heap", feature = "alloc-system", feature = "alloc-jemalloc"))))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// Allocator comparisons on Linux: `alloc-system` (glibc, no global_allocator) or jemalloc.
+#[cfg(all(target_os = "linux", feature = "alloc-jemalloc", not(feature = "dhat-heap")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 // Heap profiling (`--features dhat-heap`): every allocation with its call site; on exit,
 // `dhat-heap.json` (view it at https://nnethercote.github.io/dh_view/dh_view.html).

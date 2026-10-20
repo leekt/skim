@@ -8,6 +8,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      features:
+        description: "skim-cli cargo features for a diagnostic build (e.g. alloc-jemalloc); empty for the normal build"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -39,7 +44,9 @@ jobs:
           # (cached from ubuntu-24.04) don't link on ubuntu-22.04 (__isoc23_* symbols).
           key: ${{ matrix.os }}-${{ matrix.target }}
       - name: Build
-        run: cargo build --release --locked -p skim-cli --target ${{ matrix.target }}
+        env:
+          FEATURES: ${{ inputs.features }}
+        run: cargo build --release --locked -p skim-cli --target ${{ matrix.target }} ${FEATURES:+--features "$FEATURES"}
       - name: Package
         shell: bash
         env:

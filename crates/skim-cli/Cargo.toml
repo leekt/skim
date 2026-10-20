@@ -52,9 +52,13 @@ dhat = { version = "=0.3.3", optional = true }
 [features]
 # Heap profiling build: replaces the allocator with dhat's (slow; diagnostics only).
 dhat-heap = ["dep:dhat"]
+# Allocator comparisons (Linux; the default is mimalloc): glibc's malloc, or jemalloc.
+alloc-system = []
+alloc-jemalloc = ["dep:tikv-jemallocator"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 mimalloc = { version = "=0.1.52", default-features = false }
+tikv-jemallocator = { version = "=0.7.0", optional = true }
 libc = "0.2.190"
 
 [dev-dependencies]
