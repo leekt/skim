@@ -163,6 +163,37 @@ impl ElNetwork {
     }
 }
 
+/// A pending transaction as a mempool measurement needs it.
+#[derive(Debug, Clone)]
+pub struct PendingTx {
+    pub hash: B256,
+    pub sender: alloy_primitives::Address,
+    pub nonce: u64,
+    /// gas_limit x max fee per gas + value: the balance it needs to stay includable.
+    pub max_cost: U256,
+    /// EIP-2718 type (4: an EIP-7702 set-code transaction).
+    pub ty: u8,
+}
+
+impl PendingTx {
+    fn from_tx(tx: &SignedTx) -> Option<Self> {
+        use alloy_consensus::Transaction as _;
+        use alloy_consensus::transaction::SignerRecoverable as _;
+        let sender = tx.recover_signer().ok()?;
+        let max_cost = U256::from(tx.gas_limit()) * U256::from(tx.max_fee_per_gas()) + tx.value();
+        Some(Self { hash: *tx.tx_hash(), sender, nonce: tx.nonce(), max_cost, ty: alloy_consensus::Typed2718::ty(tx) })
+    }
+}
+
+/// What peers say about pending transactions.
+#[derive(Debug)]
+pub enum MempoolEvent {
+    /// Hashes announced (eth/68 `NewPooledTransactionHashes`).
+    Announced { peer: PeerId, hashes: Vec<B256> },
+    /// Full transactions sent to skim (`Transactions`).
+    Transactions { peer: PeerId, txs: Vec<PendingTx> },
+}
+
 /// Enodes from an `enodes.txt` (one per line) or `.yaml` (`- enode://…` items, comments).
 fn enode_lines(text: &str) -> Vec<String> {
     text.lines()
@@ -264,6 +295,20 @@ impl ElNet {
         trusted_only: bool,
         node_key: Option<[u8; 32]>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_with(network, listen_port, trusted, trusted_only, node_key, None).await
+    }
+
+    /// [`Self::start`], also listening to the transactions peers announce or send
+    /// (`mempool`: what they say, as [`MempoolEvent`]s). skim keeps no transaction pool and
+    /// relays nothing; this is for measurements (`skim run --mempool-probe`).
+    pub async fn start_with(
+        network: &ElNetwork,
+        listen_port: u16,
+        trusted: Vec<TrustedPeer>,
+        trusted_only: bool,
+        node_key: Option<[u8; 32]>,
+        mempool: Option<tokio::sync::mpsc::Sender<MempoolEvent>>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let secret = match node_key {
             Some(k) => reth_network::config::SecretKey::from_byte_array(&k)?,
             None => rng_secret_key(),
@@ -305,6 +350,25 @@ impl ElNet {
             .set_head(head)
             .build(NoopProvider::eth(spec));
         let mut manager = NetworkManager::eth(config).await?;
+        if let Some(out) = mempool {
+            let (tx, mut rx) = reth_metrics::common::mpsc::memory_bounded_channel(32 << 20, "skim_mempool");
+            manager.set_transactions(tx);
+            tokio::spawn(async move {
+                use reth_network::transactions::NetworkTransactionEvent as E;
+                while let Some(ev) = rx.recv().await {
+                    let ev = match ev {
+                        E::IncomingPooledTransactionHashes { peer_id, msg } => MempoolEvent::Announced { peer: peer_id, hashes: msg.iter_hashes().copied().collect() },
+                        E::IncomingTransactions { peer_id, msg } => {
+                            MempoolEvent::Transactions { peer: peer_id, txs: msg.0.iter().filter_map(PendingTx::from_tx).collect() }
+                        }
+                        _ => continue, // peers asking skim for pooled transactions: it has none
+                    };
+                    if out.try_send(ev).is_err() {
+                        // The probe is behind: drop rather than buffer without bound.
+                    }
+                }
+            });
+        }
         // Peers' requests come to skim's handler (answered from `serve`, or empty until it is set).
         let (req_tx, req_rx) = tokio::sync::mpsc::channel(1024);
         manager.set_eth_request_handler(req_tx);
@@ -755,6 +819,14 @@ impl ElNet {
             }
         }
         (Ok(out), start.elapsed())
+    }
+
+    /// eth/68 `GetPooledTransactions`: the pending transactions behind announced hashes (the peer
+    /// returns those it still has), with their senders recovered.
+    pub async fn pooled_transactions(&self, peer: PeerId, hashes: Vec<B256>) -> Timed<Vec<PendingTx>> {
+        let request = reth_eth_wire_types::GetPooledTransactions(hashes);
+        let (r, d) = self.send(peer, |response| PeerRequest::GetPooledTransactions { request, response }).await;
+        (r.map(|p| p.0.into_iter().filter_map(|t| PendingTx::from_tx(&SignedTx::from(t))).collect()), d)
     }
 
     /// Sends full transactions to every connected peer. Returns how many peers got them.

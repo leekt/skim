@@ -12,6 +12,7 @@ alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-rlp.workspace = true
 reth-network.workspace = true
+reth-metrics.workspace = true
 reth-eth-wire.workspace = true
 reth-network-api.workspace = true
 reth-eth-wire-types.workspace = true

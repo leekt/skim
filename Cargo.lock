@@ -7829,6 +7829,7 @@ dependencies = [
  "reth-dns-discovery",
  "reth-eth-wire",
  "reth-eth-wire-types",
+ "reth-metrics",
  "reth-network",
  "reth-network-api",
  "reth-network-peers",

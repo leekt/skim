@@ -37,6 +37,10 @@ pub struct Args {
     /// Enable diagnostic RPC methods for measurements (`skim_debugSetSnapHedge`).
     #[arg(long, hide = true)]
     debug_rpc: bool,
+    /// Measure the public mempool's validation state (pending transactions' senders' nonce,
+    /// balance, code hash kept current from BALs) and log it once a minute. Sepolia research.
+    #[arg(long, hide = true)]
+    mempool_probe: bool,
     /// The network: `sepolia` or `hoodi` (built in), or a network-config directory, as consensus clients
     /// use (and ethereum-package / eth-clients publish): `config.yaml` (with its PRESET_BASE),
     /// `genesis.ssz` or `genesis_validators_root.txt`, `bootstrap_nodes.txt`, plus the execution
@@ -314,7 +318,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         Some(p) => Some(crate::persist::node_key(p)?),
         None => None,
     };
-    let net = ElNet::start(&el_net, args.el_port, args.trusted_peer.clone(), false, node_key)
+    let (mempool_tx, mempool_rx) = if args.mempool_probe {
+        let (tx, rx) = tokio::sync::mpsc::channel(4096);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let net = ElNet::start_with(&el_net, args.el_port, args.trusted_peer.clone(), false, node_key, mempool_tx)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let saved = match &persist {
@@ -381,6 +391,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         },
     );
     *sim.state_wait.write() = std::time::Duration::from_secs(args.state_wait);
+    let mempool_probe = mempool_rx.map(|rx| {
+        tracing::info!("mempool probe: measuring the pending transactions' validation state (logs once a minute)");
+        crate::mempool_probe::MempoolProbe::start(net.clone(), sim.clone(), rx)
+    });
     let cfg: Config = match &args.config {
         Some(p) => serde_yaml_ng::from_str(&std::fs::read_to_string(p)?)?,
         None => Config::default(),
@@ -536,7 +550,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64() * 1e3 - v.header.timestamp as f64 * 1e3)
             .unwrap_or(f64::NAN);
-        let writes = BlockWrites::from_bal(&bal);
+        let writes = Arc::new(BlockWrites::from_bal(&bal));
+        let probe_hashes: Vec<alloy_primitives::B256> =
+            if mempool_probe.is_some() { env.payload.transactions.iter().map(alloy_primitives::keccak256).collect() } else { Vec::new() };
         let served = (!args.no_serve).then(|| {
             (env.payload.slot_number, skim_cl::serve::Served {
                 root: env.beacon_block_root,
@@ -563,8 +579,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             Arc::new(bal),
             alloy_primitives::Bytes::copy_from_slice(env.payload.block_access_list),
         );
-        match chain.place(v.header, Arc::new(writes)).await {
+        match chain.place(v.header, writes.clone()).await {
             Placed::Applied { ready, reorged_to, filled } => {
+                if let Some(p) = &mempool_probe {
+                    p.on_block(&probe_hashes, &writes.writes);
+                }
                 if let Some((slot, e)) = served {
                     cl.serve_envelope(slot, e);
                 }

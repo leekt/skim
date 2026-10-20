@@ -81,6 +81,7 @@ mod chain;
 mod dashboard;
 mod persist;
 mod light;
+mod mempool_probe;
 mod metrics;
 mod follow;
 mod probe_cl;
