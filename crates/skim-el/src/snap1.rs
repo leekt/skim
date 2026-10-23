@@ -132,7 +132,7 @@ impl ConnectionHandler for Snap1Handler {
         let session = self.peers.next_id.fetch_add(1, Ordering::Relaxed);
         self.peers.inner.lock().insert(peer, (session, tx));
         tracing::debug!(%peer, "snap/1 session");
-        Snap1Connection { conn, commands: rx, pending: HashMap::new(), peers: self.peers, peer, session }
+        Snap1Connection { conn, commands: rx, pending: HashMap::new(), peers: self.peers, peer, session, replies: Default::default() }
     }
 }
 
@@ -144,6 +144,8 @@ pub(crate) struct Snap1Connection {
     peers: Snap1Peers,
     peer: PeerId,
     session: u64,
+    /// Answers to the peer's own requests, waiting to be sent.
+    replies: std::collections::VecDeque<BytesMut>,
 }
 
 impl Drop for Snap1Connection {
@@ -165,6 +167,28 @@ fn frame(id: u8, msg: &impl Encodable) -> BytesMut {
 
 pub(crate) fn fuzz_decode(raw: &[u8]) -> bool {
     decode_response(raw).is_some()
+}
+
+/// The answer to a request the peer sent: skim holds no state tries (an empty range with no
+/// proof is snap's "not available") and serves no code over snap/1, but answers at once, as on
+/// snap/2, rather than letting the peer time out. (Review: requests were dropped.)
+fn answer_request(raw: &[u8]) -> Option<BytesMut> {
+    let (&id, mut body) = raw.split_first()?;
+    Some(match id {
+        GET_ACCOUNT_RANGE => {
+            let m = GetAccountRangeMessage::decode(&mut body).ok()?;
+            frame(ACCOUNT_RANGE, &AccountRangeMessage { request_id: m.request_id, accounts: vec![], proof: vec![] })
+        }
+        GET_STORAGE_RANGES => {
+            let m = GetStorageRangesMessage::decode(&mut body).ok()?;
+            frame(STORAGE_RANGES, &StorageRangesMessage { request_id: m.request_id, slots: vec![], proof: vec![] })
+        }
+        GET_BYTE_CODES => {
+            let m = GetByteCodesMessage::decode(&mut body).ok()?;
+            frame(BYTE_CODES, &ByteCodesMessage { request_id: m.request_id, codes: vec![] })
+        }
+        _ => return None,
+    })
 }
 
 fn decode_response(raw: &[u8]) -> Option<(u64, Snap1Response)> {
@@ -200,11 +224,18 @@ impl Stream for Snap1Connection {
                         if let Some(tx) = this.pending.remove(&id) {
                             let _ = tx.send(resp);
                         }
+                    } else if this.replies.len() < 64
+                        && let Some(reply) = answer_request(&raw)
+                    {
+                        this.replies.push_back(reply);
                     }
                 }
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => break,
             }
+        }
+        if let Some(reply) = this.replies.pop_front() {
+            return Poll::Ready(Some(reply));
         }
         loop {
             let Poll::Ready(cmd) = this.commands.poll_recv(cx) else { return Poll::Pending };
@@ -224,5 +255,26 @@ impl Stream for Snap1Connection {
             this.pending.insert(id, response);
             return Poll::Ready(Some(out));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::B256;
+
+    #[test]
+    fn a_peers_request_gets_an_empty_answer_with_its_id() {
+        // Review: snap/1 requests were dropped, so Geth peers waited for their timeout.
+        let req = GetAccountRangeMessage { request_id: 42, root_hash: B256::ZERO, starting_hash: B256::ZERO, limit_hash: B256::repeat_byte(0xff), response_bytes: 1 << 19 };
+        let reply = answer_request(&frame(GET_ACCOUNT_RANGE, &req)).expect("answered");
+        match decode_response(&reply) {
+            Some((42, Snap1Response::AccountRange(m))) => assert!(m.accounts.is_empty() && m.proof.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        let codes = GetByteCodesMessage { request_id: 7, hashes: vec![B256::ZERO], response_bytes: 1 << 19 };
+        assert!(matches!(decode_response(&answer_request(&frame(GET_BYTE_CODES, &codes)).unwrap()), Some((7, Snap1Response::ByteCodes(_)))));
+        // Responses aren't requests.
+        assert!(answer_request(&frame(ACCOUNT_RANGE, &AccountRangeMessage { request_id: 1, accounts: vec![], proof: vec![] })).is_none());
     }
 }

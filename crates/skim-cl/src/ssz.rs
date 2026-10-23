@@ -301,7 +301,9 @@ impl BlockInfo {
         let start = u32_at(body, bid_pos);
         let end = u32_at(body, bid_pos + 4);
         let end = if end >= start && end <= body.len() { end } else { body.len() };
-        if start > end {
+        // A variable field starts after the fixed part. (Review: an offset into the fixed part
+        // was read as the bid.)
+        if start < fixed || start > end {
             return Err(SszError::BadOffset("signed_execution_payload_bid"));
         }
         let (m, _) = signed(&body[start..end], "SignedExecutionPayloadBid")?;

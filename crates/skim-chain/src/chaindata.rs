@@ -735,7 +735,8 @@ impl ChainData {
     /// Decodes, checks and gossips a signed transaction. `nonce`/`balance` are the sender's
     /// state at the head (for the same early errors a node's pool would give).
     pub fn decode_raw(&self, raw: &Bytes) -> Result<(SignedTx, Address), DataError> {
-        let tx = SignedTx::decode_2718(&mut raw.as_ref()).map_err(|e| DataError::Invalid(format!("invalid transaction: {e}")))?;
+        // Exact: trailing bytes are an invalid transaction, as in a node's pool, not ignored.
+        let tx = SignedTx::decode_2718_exact(raw.as_ref()).map_err(|e| DataError::Invalid(format!("invalid transaction: {e}")))?;
         if tx.is_eip4844() {
             return Err(DataError::Invalid("blob transactions are not supported (no sidecar gossip)".into()));
         }
@@ -1113,7 +1114,7 @@ impl ChainData {
                 tokio::time::sleep(PASS_BACKOFF * pass).await;
             }
             for p in self.peers().into_iter().take(6) {
-                let (r, d) = match self.el().block_receipts(p, hash).await {
+                let (r, d) = match self.el().block_receipts(p, hash, header.gas_used).await {
                     (Ok(r), d) => (r, d),
                     (Err(e), _) => {
                         tracing::debug!(peer = %p, number = header.number, "receipts: {e}");
@@ -1158,9 +1159,9 @@ impl ChainData {
             let chunks: Vec<Vec<(B256, Arc<Header>)>> = todo.chunks(PER_REQUEST).map(|c| c.to_vec()).collect();
             let got: Vec<Vec<(B256, Arc<Vec<Receipt>>)>> = futures::stream::iter(chunks)
                 .map(|chunk| async move {
-                    let hashes: Vec<B256> = chunk.iter().map(|(h, _)| *h).collect();
+                    let blocks: Vec<(B256, u64)> = chunk.iter().map(|(h, hd)| (*h, hd.gas_used)).collect();
                     for p in self.peers().into_iter().take(3) {
-                        let Ok(rs) = self.el().blocks_receipts(p, &hashes).await.0 else { continue };
+                        let Ok(rs) = self.el().blocks_receipts(p, &blocks).await.0 else { continue };
                         let roots: Vec<(B256, B256)> = chunk.iter().map(|(hash, h)| (*hash, h.receipts_root)).collect();
                         let ok: Vec<_> = cpu(move || {
                             rs.into_iter()
@@ -1284,7 +1285,8 @@ impl ChainData {
     }
 
     fn decode_any(raw: &Bytes) -> Result<(SignedTx, Address), DataError> {
-        let tx = SignedTx::decode_2718(&mut raw.as_ref()).map_err(|e| DataError::Unavailable(format!("decode: {e}")))?;
+        // Exact: trailing bytes are an invalid transaction, as in a node's pool, not ignored.
+        let tx = SignedTx::decode_2718_exact(raw.as_ref()).map_err(|e| DataError::Unavailable(format!("decode: {e}")))?;
         let from = tx.recover_signer().map_err(|e| DataError::Unavailable(format!("signer: {e}")))?;
         Ok((tx, from))
     }
@@ -1788,19 +1790,22 @@ impl ChainData {
         Ok(Scan { blocks, expired })
     }
 
-    /// Block range of a filter, with tags resolved against `head`.
-    pub fn range(filter: &Filter, head: u64) -> Result<(u64, u64), DataError> {
+    /// Block range of a filter, with tags resolved against `head`; `verified` resolves `safe` and
+    /// `finalized` (the light client's blocks). `toBlock` past the head is clamped to it;
+    /// `fromBlock` is not, so `from > head` means there is nothing to report yet. (Review: both were
+    /// clamped, and an indexer polling `last + 1 ..= latest` got the head block's logs again.)
+    pub fn range(filter: &Filter, head: u64, verified: impl Fn(alloy_rpc_types_eth::BlockNumberOrTag) -> Result<u64, DataError>) -> Result<(u64, u64), DataError> {
         use alloy_rpc_types_eth::BlockNumberOrTag as T;
         let tag = |t: Option<&T>| -> Result<u64, DataError> {
             match t {
                 None | Some(T::Latest) | Some(T::Pending) => Ok(head),
-                Some(t @ (T::Safe | T::Finalized)) => Err(DataError::Unavailable(format!("block tag {t} is not tracked yet"))),
-                Some(T::Number(n)) => Ok((*n).min(head)),
+                Some(t @ (T::Safe | T::Finalized)) => verified(*t),
+                Some(T::Number(n)) => Ok(*n),
                 Some(T::Earliest) => Ok(0),
             }
         };
         match &filter.block_option {
-            FilterBlockOption::Range { from_block, to_block } => Ok((tag(from_block.as_ref())?, tag(to_block.as_ref())?)),
+            FilterBlockOption::Range { from_block, to_block } => Ok((tag(from_block.as_ref())?, tag(to_block.as_ref())?.min(head))),
             FilterBlockOption::AtBlockHash(_) => Err(DataError::Invalid("blockHash filters are resolved by the caller".into())),
         }
     }
@@ -1860,6 +1865,22 @@ impl ChainData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_range_starting_past_the_head_is_not_pulled_back_onto_it() {
+        // Review: `fromBlock` was clamped to the head, so polling `last + 1 ..= latest` before a
+        // new block arrived returned the head block's logs a second time.
+        use alloy_rpc_types_eth::BlockNumberOrTag as T;
+        let f = |from: T, to: T| Filter::new().from_block(from).to_block(to);
+        let none = |_t: T| -> Result<u64, DataError> { Err(DataError::Unavailable("not verified".into())) };
+        assert_eq!(ChainData::range(&f(T::Number(101), T::Latest), 100, none).unwrap(), (101, 100));
+        assert_eq!(ChainData::range(&f(T::Number(90), T::Number(500)), 100, none).unwrap(), (90, 100));
+        // `safe`/`finalized` resolve through the light client's blocks instead of being refused.
+        let fin = |t: T| -> Result<u64, DataError> { Ok(if t == T::Finalized { 64 } else { 96 }) };
+        assert_eq!(ChainData::range(&f(T::Number(10), T::Finalized), 100, fin).unwrap(), (10, 64));
+        assert_eq!(ChainData::range(&f(T::Safe, T::Latest), 100, fin).unwrap(), (96, 100));
+        assert!(ChainData::range(&f(T::Number(10), T::Safe), 100, none).is_err());
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancelled_wait_keeps_its_cpu_slot_until_the_work_ends() {

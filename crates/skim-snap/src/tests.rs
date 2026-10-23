@@ -417,3 +417,18 @@ async fn hedging_under_injected_stalls_and_drops() {
     assert!(p99[0] < p99[1], "adaptive p99 {} vs fixed {}", p99[0], p99[1]);
 }
 
+
+#[tokio::test]
+async fn an_empty_code_answer_is_not_scored_as_a_success() {
+    // Review: a `GetByteCodes` reply without the codes counted as a fast success, so peers
+    // that lack code ranked best and kept getting code jobs.
+    let m = Mock::new(&[(1, Behav::Ok { ms: 1 })]);
+    let s = Scheduler::new(m.clone(), cfg());
+    let r = s.fetch(&[Key::Code(keccak256(b"no peer has this"))]).await;
+    assert!(r[0].is_err(), "{r:?}");
+    assert!(s.stats().empty_answers > 0);
+    assert_eq!(s.peer_stats()[&pid(1)].ok, 0, "no reward for an empty answer");
+    // A real answer still counts.
+    assert!(matches!(s.fetch(&[Key::Code(keccak256(CODES[0]))]).await[0], Ok(Value::Code(_))));
+    assert_eq!(s.peer_stats()[&pid(1)].ok, 1);
+}

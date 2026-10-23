@@ -6,7 +6,7 @@ skim implements Glamsterdam. On a network that schedules Hegota, it does one of 
 
 | | What skim does at Hegota |
 |---|---|
-| **Default** | **Stops.** It applies no block from Hegota's activation on. State answers stay at the last block before the fork, warnings start at startup, and `skim status` fails once the fork is reached. If Hegota is already active, `skim run` refuses to start. |
+| **Default** | **Stops.** It applies no block from Hegota's activation on. Once the fork is reached, `latest` and `pending` answer `-32002` with reason `fork_unsupported` instead of the frozen state; explicit blocks before the fork and `safe`/`finalized` still answer. Warnings start at startup, and `skim status` fails once the fork is reached. If Hegota is already active, `skim run` refuses to start. |
 | **`--experimental-hegota`** | **Follows it, under the assumptions below.** `skim status` warns after activation that answers rest on them. |
 
 Any other scheduled fork skim doesn't know is always a stop, flag or not:

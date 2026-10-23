@@ -98,6 +98,7 @@ mod serving;
 mod stats;
 mod status;
 mod stream;
+mod ws_feed;
 
 use clap::{Parser, Subcommand};
 

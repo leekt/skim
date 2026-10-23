@@ -7,7 +7,7 @@
 //! the whole simulation re-runs.
 
 use alloy_consensus::Header;
-use alloy_primitives::U256;
+use alloy_primitives::{B256, U256};
 use alloy_rpc_types_eth::{BlockOverrides, state::StateOverride};
 use alloy_rpc_types_trace::geth::{
     GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions, GethTrace, NoopFrame,
@@ -83,11 +83,32 @@ pub enum Placement {
 }
 
 const MAX_ROUNDS: usize = 8;
+/// Simulated blocks per request (geth's limit).
+pub const MAX_SIM_BLOCKS: usize = 256;
+/// Calls per request, over all blocks.
+pub const MAX_SIM_CALLS: usize = 1000;
+/// Gas all calls of one request may use together, in units of the per-call cap (the base
+/// block's gas limit, at least 30M): a request can't buy unbounded execution with many blocks,
+/// many calls or a raised `blockOverrides.gasLimit`. (Review.)
+const SIM_GAS_BUDGET_CALLS: u64 = 4;
+
+/// The most gas one call runs with: the block's gas limit, at least 30M (as `eth_call`).
+pub fn call_gas_cap(header: &Header) -> u64 {
+    header.gas_limit.max(30_000_000)
+}
 /// Replays of mined transactions can be deep (each round only discovers what execution reached
 /// before hitting unknown state); they get more rounds.
 const MAX_REPLAY_ROUNDS: usize = 32;
 
-fn apply_block_overrides(env: &mut BlockEnv, o: &BlockOverrides) {
+/// Applies block overrides to `env`. Every field that changes execution is applied or refused,
+/// never dropped: `blockHash` is applied by the caller's BLOCKHASH source ([`hash_overrides`]);
+/// `difficulty` has no effect after the merge (`DIFFICULTY` reads `prevRandao`). (Review:
+/// `blobBaseFee` and `blockHash` were accepted and ignored.)
+fn apply_block_overrides(env: &mut BlockEnv, o: &BlockOverrides) -> Result<(), SimError> {
+    if o.beacon_root.is_some() {
+        // It only feeds the EIP-4788 system call, which simulated blocks don't run.
+        return Err(SimError::Unsupported("blockOverrides.beaconRoot (no system calls run in simulated blocks)"));
+    }
     if let Some(n) = o.number {
         env.number = n;
     }
@@ -106,6 +127,23 @@ fn apply_block_overrides(env: &mut BlockEnv, o: &BlockOverrides) {
     if let Some(b) = o.base_fee {
         env.basefee = b.saturating_to();
     }
+    if let Some(f) = o.blob_base_fee {
+        let excess = env.blob_excess_gas_and_price.map_or(0, |b| b.excess_blob_gas);
+        env.blob_excess_gas_and_price = Some(revm::context_interface::block::BlobExcessGasAndPrice { excess_blob_gas: excess, blob_gasprice: f.saturating_to() });
+    }
+    Ok(())
+}
+
+/// `blockOverrides.blockHash`: what BLOCKHASH answers for these heights instead of the chain.
+fn hash_overrides(o: Option<&BlockOverrides>) -> std::collections::BTreeMap<u64, B256> {
+    o.and_then(|o| o.block_hash.clone()).unwrap_or_default()
+}
+
+/// BLOCKHASH of a block `eth_simulateV1` made up (after the base block): a stand-in derived from
+/// its number, as there is no real header. (Review: such reads were misses no fetch could fill,
+/// so the request failed as incomplete.)
+fn simulated_block_hash(n: u64) -> B256 {
+    alloy_primitives::keccak256([b"skim simulated block".as_slice(), &n.to_be_bytes()].concat())
 }
 
 /// Applies account overrides to the overlay. Partial overrides start from the account's
@@ -172,6 +210,9 @@ fn invalid_tx<E: std::fmt::Debug>(e: E) -> SimError {
 /// moved things), refuse rather than return a trace of guessed state.
 fn refuse_misses(sdb: &db::SnapDb<'_>) -> Result<(), SimError> {
     let a = sdb.access.lock().unwrap();
+    if let Some(e) = &a.snapshot_error {
+        return Err(SimError::State(e.clone()));
+    }
     if a.has_misses() {
         return Err(SimError::StateUnavailable(a.miss_accounts.len() + a.miss_storage.len() + a.miss_code.len()));
     }
@@ -369,7 +410,18 @@ impl Simulator {
         use revm::Database;
         use revm_inspectors::transfer::TransferInspector;
         let (store, at) = (self.store.clone(), *snap.block());
-        let block_hash = move |n: u64| store.block_hash_at(&at, n);
+        // The current simulated block's `blockHash` overrides (set per block below).
+        let overridden = std::sync::Mutex::new(std::collections::BTreeMap::<u64, B256>::new());
+        let base_number = header.number;
+        let block_hash = |n: u64| {
+            if let Some(h) = overridden.lock().unwrap().get(&n) {
+                return Some(*h);
+            }
+            if n > base_number {
+                return Some(simulated_block_hash(n));
+            }
+            store.block_hash_at(&at, n)
+        };
         let sdb = db::SnapDb { snap, block_hash: &block_hash, access: Default::default(), code_cache: &self.code_cache };
         let mut cache = CacheDB::new(&sdb);
         let base = env::block_env(header);
@@ -378,18 +430,25 @@ impl Simulator {
         // Parent of the next simulated block: (base fee, gas used, gas limit).
         let mut parent = (header.base_fee_per_gas.unwrap_or_default(), header.gas_used, header.gas_limit);
         let mut out = Vec::with_capacity(blocks.len());
-        for (i, blk) in blocks.iter().enumerate() {
+        let cap = call_gas_cap(header);
+        let mut budget = cap.saturating_mul(SIM_GAS_BUDGET_CALLS);
+        // Each simulated block follows the one before it, overrides included (geth: number + 1,
+        // time + 12). (Review: both came from the base block, so overriding block 1's time left
+        // block 2 earlier than block 1.)
+        let mut prev = (base.number, base.timestamp);
+        for blk in blocks {
             let mut benv = base.clone();
             if place == Placement::NextBlocks {
-                benv.number = base.number + U256::from(i as u64 + 1);
-                benv.timestamp = base.timestamp + U256::from(12 * (i as u64 + 1));
+                benv.number = prev.0 + U256::from(1);
+                benv.timestamp = prev.1 + U256::from(12);
                 // Validating blocks carry the EIP-1559 base fee their parent implies; otherwise
                 // simulated blocks don't charge one.
                 benv.basefee = if opts.validation { params.next_block_base_fee(parent.1, parent.2, parent.0) } else { 0 };
             }
             if let Some(o) = &blk.block {
-                apply_block_overrides(&mut benv, o);
+                apply_block_overrides(&mut benv, o)?;
             }
+            *overridden.lock().unwrap() = hash_overrides(blk.block.as_ref());
             if let Some(s) = &blk.state {
                 apply_state_overrides(&mut cache, s)?;
             }
@@ -400,6 +459,15 @@ impl Simulator {
                 if call.auto_gas {
                     tx.gas_limit = benv.gas_limit.saturating_sub(used);
                 }
+                if opts.validation && used.saturating_add(tx.gas_limit) > benv.gas_limit {
+                    // As a block would refuse it (geth: -38015). (Review: calls that each fit but
+                    // together exceeded the block passed.)
+                    return Err(SimError::Invalid { code: -38015, message: format!("block gas limit reached: {} used of {}, the call asks for {}", used, benv.gas_limit, tx.gas_limit) });
+                }
+                if budget == 0 {
+                    return Err(SimError::Invalid { code: -38026, message: format!("simulation gas budget ({} gas over all calls) exhausted", cap.saturating_mul(SIM_GAS_BUDGET_CALLS)) });
+                }
+                tx.gas_limit = tx.gas_limit.min(cap).min(budget);
                 if opts.validation {
                     if call.auto_nonce {
                         tx.nonce = cache.basic(tx.caller).map_err(|e| SimError::Evm(format!("{e:?}")))?.map_or(0, |a| a.nonce);
@@ -432,10 +500,12 @@ impl Simulator {
                     Err(e) => return Err(invalid_tx(e)),
                 };
                 used += r.result.tx_gas_used();
+                budget = budget.saturating_sub(r.result.tx_gas_used());
                 cache.commit(r.state);
                 results.push(r.result);
             }
             parent = (benv.basefee, used, benv.gas_limit);
+            prev = (benv.number, benv.timestamp);
             out.push(SimBlockResult { env: benv, calls: results });
         }
         drop(cache);
@@ -452,11 +522,21 @@ impl Simulator {
 
     /// [`Self::simulate`] with `eth_simulateV1` options.
     pub async fn simulate_with(&self, b: &BlockRef, blocks: &[SimBlock], place: Placement, opts: SimOptions) -> Result<Vec<SimBlockResult>, SimError> {
+        let calls: usize = blocks.iter().map(|b| b.calls.len()).sum();
+        if blocks.len() > MAX_SIM_BLOCKS || calls > MAX_SIM_CALLS {
+            return Err(SimError::Invalid {
+                code: -38026,
+                message: format!("too many blocks or calls: {} blocks, {calls} calls (at most {MAX_SIM_BLOCKS} and {MAX_SIM_CALLS})", blocks.len()),
+            });
+        }
         let (snap, header) = self.snapshot_ctx(b)?;
         let at = if self.miss_at_parent { self.store.block(b.number.saturating_sub(1)).unwrap_or(*b) } else { *b };
         let retention = *self.on_demand.read();
         for _ in 0..MAX_ROUNDS {
             let (out, access) = self.cpu(|| self.simulate_once(&snap, &header, blocks, place, opts)).await?;
+            if let Some(e) = access.snapshot_error {
+                return Err(SimError::State(e));
+            }
             if !access.has_misses() {
                 self.keep_warm(&access);
                 return Ok(out);
@@ -588,12 +668,13 @@ impl Simulator {
         let retention = *self.on_demand.read();
         let mut benv = env::block_env(&base.env);
         if let Some(o) = &base.block_overrides {
-            apply_block_overrides(&mut benv, o);
+            apply_block_overrides(&mut benv, o)?;
         }
         let cfg = if base.validating { env::validating_cfg() } else { env::call_cfg() };
         let wants_prestate = matches!(opts.tracer, Some(GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::PreStateTracer)));
         let (store, hash_at) = (self.store.clone(), *snap.block());
-        let block_hash = move |n: u64| store.block_hash_at(&hash_at, n);
+        let overridden = hash_overrides(base.block_overrides.as_ref());
+        let block_hash = move |n: u64| overridden.get(&n).copied().or_else(|| store.block_hash_at(&hash_at, n));
         // 1. Plain runs until nothing is missing (prestate traces also report the fee recipient).
         let mut plain = None;
         let rounds = if base.prestate.is_some() { MAX_REPLAY_ROUNDS } else { MAX_ROUNDS };
@@ -615,6 +696,9 @@ impl Simulator {
                     Ok::<_, SimError>((r, sdb.access.into_inner().unwrap()))
                 })
                 .await?;
+            if let Some(e) = access.snapshot_error {
+                return Err(SimError::State(e));
+            }
             if !access.has_misses() {
                 self.keep_warm(&access);
                 // Only now is a rejection meaningful: with unknown state (e.g. the sender not yet

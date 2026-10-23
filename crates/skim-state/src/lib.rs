@@ -184,6 +184,12 @@ impl Inner {
 
     /// Stops whole-storage tracking of `a`: the address is no longer tracked, and its keys'
     /// versions are dropped unless a key is watched individually.
+    /// Some archived account's code hash has (had) `h` as a version.
+    fn archived_code_hash(&self, h: &B256) -> bool {
+        let v = U256::from_be_bytes(h.0);
+        self.archived.iter().any(|k| matches!(k, StateKey::CodeHash(_)) && self.versions.get(k).is_some_and(|vs| vs.iter().any(|(_, x)| *x == v)))
+    }
+
     fn drop_complete(&mut self, a: &Address) {
         self.complete.remove(a);
         self.watched_addresses.remove(a);
@@ -781,19 +787,41 @@ impl Store {
     }
 
     pub fn rollback_to(&self, number: u64) {
+        self.rollback(number, number);
+    }
+
+    /// No common ancestor with the chain in the window: forget all in-memory state, so `anchor`
+    /// can be applied as a fresh start. The archive keeps every block below `anchor`. Only
+    /// blocks from `anchor` up are truncated (the new block must be writable there); the
+    /// archive's segment then doesn't link to the new chain, and the archive healer reconciles
+    /// the boundary against peers' chains, removing only an orphaned tail. (Review: a re-anchor
+    /// was `rollback_to(0)`, which truncated the whole archive, including backfilled history
+    /// that peers no longer serve.)
+    pub fn reanchor(&self, anchor: u64) {
+        self.rollback(0, anchor.saturating_sub(1));
+    }
+
+    fn rollback(&self, number: u64, archive_to: u64) {
         self.note_reorg();
         // Archive and memory roll back under the same lock as every other mutation of either.
         let mut st = self.inner.write();
         if let Some(ar) = &self.archive {
-            let r = ar.truncate_above(number);
+            let r = ar.truncate_above(archive_to);
             self.archive_try(r);
         }
         st.chain.retain(|n, _| *n <= number);
         st.hashes.retain(|n, _| *n <= number);
-        // A base written above the fork point was truncated with it.
+        // A base written above the fork point was truncated with it (bases the archive keeps
+        // below a re-anchor stay there, but the in-memory view starts afresh).
         st.based.retain(|_, b| *b <= number);
-        // A download taken at a block that's now orphaned is no longer this chain's state.
-        st.complete.retain(|_, c| c.block <= number);
+        // A download taken at a block that's now orphaned is no longer this chain's state, and
+        // its address no longer owns the contract's keys: released like any dropped download.
+        // (Review: only the download was dropped; the address stayed watched, so its writes
+        // kept being recorded outside the subscribed-key budget.)
+        let orphaned: Vec<Address> = st.complete.iter().filter(|(_, c)| c.block > number).map(|(a, _)| *a).collect();
+        for a in &orphaned {
+            st.drop_complete(a);
+        }
         st.recent.retain(|n, _| *n <= number);
         for v in st.versions.values_mut() {
             v.retain(|(n, _)| *n <= number);
@@ -916,6 +944,15 @@ impl Store {
                     st.based.insert(key, n);
                 }
                 self.archive_try(r);
+                // An archived code hash needs its code in the archive too.
+                if matches!(key, StateKey::CodeHash(_)) {
+                    for h in std::iter::once(v).chain(later.iter().map(|(_, _, x)| *x)).map(B256::from) {
+                        if let Some(c) = st.code.get(&h) {
+                            let r = ar.put_code(h, c);
+                            self.archive_try(r);
+                        }
+                    }
+                }
             }
         }
     }
@@ -956,11 +993,17 @@ impl Store {
 
     pub fn insert_code(&self, code: Bytes) -> B256 {
         let h = keccak256(&code);
-        if let Some(ar) = &self.archive {
+        let mut st = self.inner.write();
+        // Archived only if an archived account's code hash is (or was) this code. (Review:
+        // every contract any call fetched was archived forever, one commit each.) A code
+        // fetched before its account's base is archived when that base is.
+        if let Some(ar) = &self.archive
+            && st.archived_code_hash(&h)
+        {
             let r = ar.put_code(h, &code);
             self.archive_try(r);
         }
-        self.inner.write().code.insert(h, code);
+        st.code.insert(h, code);
         h
     }
 

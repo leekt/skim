@@ -147,7 +147,9 @@ skim run --config skim.yaml --archive data/my-app.redb --archive-backfill 1000
 - Reorgs arrive as `rewind`.
 - Blocks whose BAL is known but whose receipts expired still deliver their state changes (`logsAvailable: false`).
 
-**Examples:** deposit detection for an exchange or a payment processor, alerting on a treasury's balance, a keeper that triggers on a vault's state, accounting that needs every ETH movement.
+**Examples:** deposit detection for an exchange or a payment processor, alerting on a treasury's balance, a keeper that triggers on a vault's state.
+
+**Net changes, not every transfer:** a BAL records each transaction's post-values, so ETH that a contract receives and forwards within one transaction leaves its balance unchanged and appears in no balance change (EIP-7928 omits unchanged balances). BAL streams are net state monitoring. Accounting that needs every ETH movement needs events or call traces (`debug_traceTransaction` with `callTracer`) as well.
 
 **Limits:** BALs for older blocks come from peers (~2 weeks retention) and aren't stored by `--history local` yet.
 

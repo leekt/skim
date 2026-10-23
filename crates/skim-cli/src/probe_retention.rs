@@ -117,7 +117,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                     }),
                     Err(_) => false,
                 };
-                let receipts = match net.block_receipts(*id, hash).await.0 {
+                let receipts = match net.block_receipts(*id, hash, h.gas_used).await.0 {
                     Ok(r) if r.is_empty() && h.receipts_root != alloy_consensus::EMPTY_ROOT_HASH => false,
                     Ok(r) => Receipt::calculate_receipt_root_no_memo(&r) == h.receipts_root,
                     Err(_) => false,

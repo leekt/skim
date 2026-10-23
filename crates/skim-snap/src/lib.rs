@@ -187,6 +187,8 @@ pub struct Stats {
     pub requeued: u64,
     pub hedges: u64,
     pub late_answers_ignored: u64,
+    /// Answers that held none of the keys asked for (a peer without the code): not rewarded.
+    pub empty_answers: u64,
     pub failed: u64,
     pub code_batches: u64,
     pub low_jobs: u64,
@@ -705,6 +707,15 @@ impl<T: Transport> Inner<T> {
         }
 
         match outcome {
+            // An answer with none of the keys asked for (a `GetByteCodes` reply without the
+            // codes) is fast because it's empty: scoring it as a success made peers that lack
+            // code look like the best. (Review.)
+            Outcome::Values(values) if !values.iter().any(|(k, _)| keys.contains(k)) => {
+                st.stats.empty_answers += 1;
+                for k in &keys {
+                    Self::retry_or_fail(&self.cfg, &mut st, *k);
+                }
+            }
             Outcome::Values(values) => {
                 st.stats.ok += 1;
                 if let Some(p) = st.peers.get_mut(&peer) {

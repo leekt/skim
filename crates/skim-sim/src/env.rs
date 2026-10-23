@@ -1,4 +1,4 @@
-//! Execution environment for Sepolia under Amsterdam rules.
+//! Execution environment under Amsterdam rules, for the chain set at startup (Sepolia by default).
 
 use alloy_consensus::Header;
 use alloy_primitives::U256;
@@ -23,6 +23,25 @@ pub fn chain_id() -> u64 {
 }
 pub const SPEC: SpecId = SpecId::AMSTERDAM;
 
+type FractionAt = Box<dyn Fn(u64) -> Option<u64> + Send + Sync>;
+static BLOB_FRACTION: std::sync::OnceLock<FractionAt> = std::sync::OnceLock::new();
+
+/// Sets the blob base-fee update fraction in force at a timestamp, from the chain's blob
+/// schedule (once, at startup). Without it, Sepolia's.
+pub fn set_blob_update_fraction(f: impl Fn(u64) -> Option<u64> + Send + Sync + 'static) {
+    let _ = BLOB_FRACTION.set(Box::new(f));
+}
+
+/// Sepolia's (and mainnet's) since BPO2.
+pub const BPO2_UPDATE_FRACTION: u64 = 11_684_671;
+
+/// The blob base-fee update fraction at `timestamp`. (Review: `BLOBBASEFEE` used revm's Prague
+/// fraction, 5,007,716, whatever the chain's blob schedule said: wrong on BPO networks whenever
+/// `excess_blob_gas > 0`.)
+pub fn blob_update_fraction(timestamp: u64) -> u64 {
+    BLOB_FRACTION.get().and_then(|f| f(timestamp)).unwrap_or(BPO2_UPDATE_FRACTION)
+}
+
 /// Block context for executing *in* block `h` (post-state of its parent) or, for `eth_call` at
 /// `h`, on top of `h`'s post-state with `h`'s own header fields, as nodes do.
 pub fn block_env(h: &Header) -> BlockEnv {
@@ -34,7 +53,7 @@ pub fn block_env(h: &Header) -> BlockEnv {
         basefee: h.base_fee_per_gas.unwrap_or_default(),
         difficulty: U256::ZERO,
         prevrandao: Some(h.mix_hash),
-        blob_excess_gas_and_price: Some(BlobExcessGasAndPrice::new_with_spec(h.excess_blob_gas.unwrap_or_default(), SPEC)),
+        blob_excess_gas_and_price: Some(BlobExcessGasAndPrice::new(h.excess_blob_gas.unwrap_or_default(), blob_update_fraction(h.timestamp))),
         ..Default::default()
     }
 }

@@ -147,3 +147,23 @@ fn message_ids() {
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
+
+#[test]
+fn only_payloads_that_pass_the_commitment_check_are_relayed() {
+    // Review: payloads were relayed (gossipsub Accept) once they parsed, before the commitment
+    // check; blocks and attestations on a parse or length check. Peers that validate penalise
+    // whoever relays an invalid message.
+    use skim_cl::node::{SINGLE_ATTESTATION_LEN, check_gossip};
+    let lens = (0, 0);
+    let ok = check_gossip("execution_payload", ENVELOPE, lens);
+    assert!(ok.relay);
+    assert_eq!(ok.head, Some((11356920, Envelope::parse(ENVELOPE).unwrap().beacon_block_root)));
+    let mut raw = ENVELOPE.to_vec();
+    let env = Envelope::parse(ENVELOPE).unwrap();
+    let off = env.payload.block_access_list.as_ptr() as usize - ENVELOPE.as_ptr() as usize;
+    raw[off] ^= 1; // parses, fails the block hash
+    assert!(Envelope::parse(&raw).is_ok());
+    assert_eq!(check_gossip("execution_payload", &raw, lens), Default::default(), "not relayed, and no head from it");
+    assert!(!check_gossip("beacon_block", BLOCK, lens).relay);
+    assert!(!check_gossip("beacon_attestation_3", &[0u8; SINGLE_ATTESTATION_LEN], lens).relay);
+}

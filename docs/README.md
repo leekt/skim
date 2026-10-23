@@ -35,7 +35,7 @@
 
 - **Monitoring:** [Prometheus and Grafana setup](../metrics/README.md); `metrics/gen_dashboard.py` generates the dashboard
 - **Network testing:** [devnet walkthrough](../devnet/README.md): a local Glamsterdam devnet (minimal preset), `devnet/run.sh` and the differential check `devnet/check.py`
-- **Development:** [implemented architecture](../PROJECT.md), [contributor handoff](HANDOFF.md), [open work](TODO.md) and [fuzzing](../fuzz/README.md)
+- **Development:** [implemented architecture](../PROJECT.md), [contributor handoff](HANDOFF.md), [open work](TODO.md), [code review 2026-10-23](REVIEW.md) and [fuzzing](../fuzz/README.md)
 
 ## Experiment logs
 

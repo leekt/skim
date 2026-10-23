@@ -462,6 +462,47 @@ fn complete_storage_is_dropped_when_its_block_is_reorged_out_and_counts_toward_t
     assert!(matches!(r, Err(StateError::LimitReached(3))));
 }
 
+#[test]
+fn a_reorged_out_download_also_stops_its_address_being_watched() {
+    // Review: the rollback dropped the download but left the address watched, so every BAL
+    // write to the contract kept being recorded, outside the subscribed-key budget (which counts
+    // downloads only).
+    let s = Store::new(64);
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    s.apply_block(blk(2, 0), writes(&[])).unwrap();
+    let h = |i: u64| keccak256(U256::from(i).to_be_bytes::<32>());
+    s.install_complete_storage(&blk(2, 0), A, vec![(h(1), U256::from(10))]).unwrap();
+    assert!(s.pinned_addresses().contains(&A));
+    assert_eq!(s.sizes().watched_addresses, 1);
+    s.rollback_to(1);
+    assert!(!s.pinned_addresses().contains(&A));
+    assert!(!s.is_subscribed(&slot(7)));
+    assert_eq!(s.sizes().watched_addresses, 0);
+}
+
+#[test]
+fn a_reanchor_keeps_the_archive_below_the_new_block() {
+    // Review: a re-anchor rolled back to 0, which truncated the whole archive, including history
+    // that peers no longer serve.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::with_archive(64, archive::Archive::open(d.path().join("a.redb")).unwrap()).unwrap();
+    s.apply_block(blk(10, 0), writes(&[])).unwrap();
+    s.insert_base(&blk(10, 0), slot(1), U256::from(1)).unwrap();
+    s.archive_key(slot(1));
+    for n in 11..=14 {
+        s.apply_block(blk(n, 0), writes(&[(slot(1), n)])).unwrap();
+    }
+    // No common ancestor: a fresh start at block 14 of another chain.
+    s.reanchor(14);
+    assert!(s.head().is_none(), "in memory, a fresh start");
+    let ar = s.archive().unwrap();
+    assert_eq!(ar.get(&slot(1), 12).unwrap(), archive::ArchiveRead::Value(U256::from(12)), "history kept");
+    assert_eq!(ar.segments().unwrap(), vec![(10, 13)]);
+    s.apply_block(blk(14, 1), writes(&[])).unwrap();
+    // The new block starts its own segment (the healer reconciles the boundary).
+    assert_eq!(ar.segments().unwrap(), vec![(10, 13), (14, 14)]);
+}
+
 // ---- Third review: transitions between storage modes ----------------------------------------
 
 #[test]
@@ -948,4 +989,24 @@ fn a_reloaded_archived_key_promoted_after_seeding_gets_a_base_in_the_new_segment
     assert_eq!(ar.get(&slot(1), 20).unwrap(), archive::ArchiveRead::Value(U256::from(6)), "covered in the new segment");
     assert_eq!(ar.get(&slot(1), 35).unwrap(), archive::ArchiveRead::Value(U256::from(6)));
     assert_eq!(ar.get(&slot(1), 2).unwrap(), archive::ArchiveRead::Value(U256::from(4)), "the earlier segment is untouched");
+}
+
+#[test]
+fn only_code_an_archived_account_points_to_is_archived() {
+    // Review: every bytecode fetched for any call was archived forever.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::with_archive(64, archive::Archive::open(d.path().join("a.redb")).unwrap()).unwrap();
+    s.apply_block(blk(10, 0), writes(&[])).unwrap();
+    let (mine, other) = (Bytes::from_static(b"archived-code"), Bytes::from_static(b"someone-elses-code"));
+    // Fetched before the account's base: archived when the base is.
+    let h = s.insert_code(mine.clone());
+    s.archive_key(StateKey::CodeHash(A));
+    s.insert_base(&blk(10, 0), StateKey::CodeHash(A), U256::from_be_bytes(h.0)).unwrap();
+    let o = s.insert_code(other);
+    let ar = s.archive().unwrap();
+    assert_eq!(ar.code(&h).unwrap(), Some(mine));
+    assert_eq!(ar.code(&o).unwrap(), None, "no archived account points to it");
+    // Fetched after: archived at once.
+    let again = s.insert_code(Bytes::from_static(b"archived-code"));
+    assert_eq!(again, h);
 }

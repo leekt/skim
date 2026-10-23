@@ -83,8 +83,12 @@ pub struct NodeConfig {
     pub initial_status: Option<Status>,
     /// Gossip topic names to subscribe to (e.g. `beacon_block`, `execution_payload`).
     pub topics: Vec<String>,
-    /// Report parsed messages as `Accept` (forwarded) rather than `Ignore`.
+    /// Relay (report `Accept`) the messages [`check_gossip`] lets through, rather than `Ignore`
+    /// everything.
     pub forward: bool,
+    /// Also hand execution payloads that failed [`check_gossip`] to the consumer (diagnostics
+    /// that count failures); otherwise they're dropped here and never queue.
+    pub deliver_unchecked: bool,
     /// Peers to dial directly and redial when they drop (multiaddrs ending in `/p2p/<id>`).
     pub explicit_peers: Vec<Multiaddr>,
     /// Number of attestation subnets to join and advertise (ENR + MetaData `attnets`).
@@ -122,6 +126,7 @@ impl NodeConfig {
                 "light_client_optimistic_update".into(),
             ],
             forward: true,
+            deliver_unchecked: false,
             explicit_peers: Vec::new(),
             attestation_subnets: 2,
         }
@@ -226,6 +231,8 @@ pub struct NodeStats {
     pub peer_list: Vec<ClPeer>,
     pub goodbyes_received: u64,
     pub attestations: u64,
+    /// Gossip messages dropped because the consumer's queue was full.
+    pub gossip_dropped: u64,
     pub best_status: Option<Status>,
     pub local_enr: String,
     pub peer_id: String,
@@ -368,6 +375,85 @@ pub fn status_to_send(learned: Option<Status>, digest: [u8; 4]) -> Status {
     });
     s.fork_digest = digest;
     s
+}
+
+/// Distinct peers that must report the same finalized checkpoint before skim advertises it
+/// (a peer the operator named counts as enough on its own).
+pub const FINALIZED_QUORUM: usize = 2;
+
+/// Finalized checkpoints peers reported, by (epoch, root): who reported each.
+pub type FinalizedVotes = HashMap<(u64, B256), HashSet<PeerId>>;
+
+/// The Status skim should advertise after `peer` sent `s`, or `None` if `s` isn't on our fork or
+/// claims a head from the future. The head follows the best plausible head. The finalized
+/// checkpoint moves only forward, never past the current epoch, and only once
+/// `quorum` peers named the same root: peers drop a node whose finalized root
+/// disagrees with theirs at the same epoch, so one peer's made-up checkpoint, adopted and
+/// re-sent, cost skim every honest peer. (Review: an equal epoch replaced the root, and any epoch
+/// was taken from a single peer.)
+#[allow(clippy::too_many_arguments)]
+pub fn learn_status(best: Option<Status>, s: &Status, peer: PeerId, quorum: usize, now_slot: u64, slots_per_epoch: u64, digest: [u8; 4], votes: &mut FinalizedVotes) -> Option<Status> {
+    if s.fork_digest != digest || s.head_slot > now_slot + 1 {
+        return None;
+    }
+    let mut b = best.unwrap_or(Status { finalized_root: B256::ZERO, finalized_epoch: 0, ..*s });
+    if s.head_slot >= b.head_slot {
+        b.head_slot = s.head_slot;
+        b.head_root = s.head_root;
+    }
+    let now_epoch = now_slot / slots_per_epoch.max(1);
+    if s.finalized_epoch > b.finalized_epoch && s.finalized_epoch <= now_epoch && s.finalized_root != B256::ZERO {
+        if votes.len() >= 256 {
+            votes.retain(|(e, _), _| *e > b.finalized_epoch);
+            if votes.len() >= 256 {
+                votes.clear();
+            }
+        }
+        let who = votes.entry((s.finalized_epoch, s.finalized_root)).or_default();
+        who.insert(peer);
+        if who.len() >= quorum {
+            b.finalized_epoch = s.finalized_epoch;
+            b.finalized_root = s.finalized_root;
+            votes.retain(|(e, _), _| *e > b.finalized_epoch);
+        }
+    }
+    // We serve no history: claim nothing older than the head.
+    b.earliest_available_slot = Some(b.head_slot);
+    Some(b)
+}
+
+/// What skim can say about a gossip message on topic `name`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct GossipCheck {
+    /// Passed every check skim can make, so it may be relayed (reported `Accept`). Everything
+    /// else is reported `Ignore`: neither relayed nor held against the sender.
+    pub relay: bool,
+    /// A checked payload's (slot, beacon block root), to keep the advertised head current.
+    pub head: Option<(u64, B256)>,
+}
+
+/// Gossip validation. Only an execution payload whose rebuilt header hashes to its block hash
+/// (which commits to the BAL) is relayed; the builder signature can't be checked without beacon
+/// state. Beacon blocks (proposer signature) and attestations (BLS, committee) can't be checked
+/// at all, and light-client updates are verified later by the light client: none of these is
+/// relayed. (Review: payloads were relayed before their commitments were checked, and blocks
+/// and attestations on a parse or length check; peers that validate penalise whoever relays an
+/// invalid message.)
+pub fn check_gossip(name: &str, data: &[u8], lc_update_lens: (usize, usize)) -> GossipCheck {
+    match name {
+        "execution_payload" => match ssz::Envelope::parse(data) {
+            Ok(env) if crate::verify::verify_payload(&env).ok => {
+                GossipCheck { relay: true, head: Some((env.payload.slot_number, env.beacon_block_root)) }
+            }
+            _ => GossipCheck::default(),
+        },
+        "light_client_optimistic_update" | "light_client_finality_update" => {
+            let want = if name == "light_client_optimistic_update" { lc_update_lens.0 } else { lc_update_lens.1 };
+            tracing::debug!(len = data.len(), want, "{name} gossip");
+            GossipCheck::default()
+        }
+        _ => GossipCheck::default(),
+    }
 }
 
 /// How long topic subscriptions overlap around a fork-digest change, before and after (epochs).
@@ -615,7 +701,9 @@ impl ClNode {
             best_status: cfg.initial_status,
             ..Default::default()
         }));
-        let (tx, rx) = mpsc::channel(4096);
+        // Messages, not bytes: a few slots' worth (each slot brings a block, a payload and two
+        // light-client updates), so a stalled consumer can't pile up thousands of payloads.
+        let (tx, rx) = mpsc::channel(256);
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let runner = Runner {
             cmd_rx,
@@ -631,6 +719,7 @@ impl ClNode {
             last_dial: HashMap::new(),
             status_reqs: HashMap::new(),
             best: None,
+            finalized_votes: HashMap::new(),
             metadata: MetaData {
                 seq_number: 1,
                 attnets,
@@ -648,9 +737,25 @@ impl ClNode {
     }
 }
 
+/// Where a chunked request's response (or failure) goes.
+type ChunksReply = tokio::sync::oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>>;
+
+/// The request-response protocols whose replies share [`Runner::env_reqs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ReqProto {
+    Envelopes,
+    EnvelopesByRoot,
+    LcUpdates,
+    LcBootstrap,
+}
+
 struct Runner {
     cmd_rx: mpsc::Receiver<Cmd>,
-    env_reqs: HashMap<OutboundRequestId, tokio::sync::oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>>>,
+    /// Replies for outstanding requests, by protocol and id: each request-response behaviour
+    /// numbers its requests from 1, so an id alone collides across protocols. (Review: a
+    /// bootstrap and an envelope request in flight together dropped one reply and misrouted
+    /// the other.)
+    env_reqs: HashMap<(ReqProto, OutboundRequestId), ChunksReply>,
     env_rr: usize,
     served: crate::serve::EnvelopeCache,
     cfg: NodeConfig,
@@ -662,6 +767,7 @@ struct Runner {
     last_dial: HashMap<PeerId, Instant>,
     status_reqs: HashMap<OutboundRequestId, PeerId>,
     best: Option<Status>,
+    finalized_votes: FinalizedVotes,
     metadata: MetaData,
     pending_disconnect: Vec<(PeerId, Instant)>,
     seen_nodes: HashSet<NodeId>,
@@ -679,26 +785,15 @@ impl Runner {
         status_to_send(self.best.or(self.cfg.initial_status), self.cfg.fork_digest)
     }
 
-    /// Adopts a peer's status as ours if it is on our fork and has the best plausible head.
-    fn learn_status(&mut self, s: &Status) -> bool {
-        if s.fork_digest != self.cfg.fork_digest {
-            return false;
-        }
+    /// Adopts a peer's status as ours if it is on our fork and has the best plausible head
+    /// (see [`learn_status`]).
+    fn learn_status(&mut self, peer: PeerId, s: &Status) -> bool {
         let now = self.cfg.current_slot();
-        if s.head_slot > now + 1 {
+        let quorum = if self.is_explicit(&peer) { 1 } else { FINALIZED_QUORUM };
+        let base = self.best.or(self.cfg.initial_status);
+        let Some(b) = learn_status(base, s, peer, quorum, now, self.cfg.slots_per_epoch, self.cfg.fork_digest, &mut self.finalized_votes) else {
             return false;
-        }
-        let mut b = self.best.unwrap_or(*s);
-        if s.head_slot >= b.head_slot {
-            b.head_slot = s.head_slot;
-            b.head_root = s.head_root;
-        }
-        if s.finalized_epoch >= b.finalized_epoch {
-            b.finalized_epoch = s.finalized_epoch;
-            b.finalized_root = s.finalized_root;
-        }
-        // We serve no history: claim nothing older than the head.
-        b.earliest_available_slot = Some(b.head_slot);
+        };
         self.best = Some(b);
         self.stats.lock().unwrap().best_status = Some(b);
         true
@@ -803,7 +898,7 @@ impl Runner {
                 if let Some(a) = asked {
                     let _ = a.send(peer);
                 }
-                self.env_reqs.insert(id, reply);
+                self.env_reqs.insert((ReqProto::Envelopes, id), reply);
             }
             Cmd::EnvelopesByRoot { roots, reply } => {
                 let mut cands: Vec<PeerId> = self.peers.iter().filter(|(_, p)| p.status.is_some()).map(|(id, _)| *id).collect();
@@ -816,7 +911,7 @@ impl Runner {
                 let peer = cands[self.env_rr % cands.len()];
                 let req: Vec<u8> = roots.iter().take(rpc::MAX_REQUEST_PAYLOADS as usize).flat_map(|r| r.0).collect();
                 let id = self.swarm.behaviour_mut().envelopes_by_root.send_request(&peer, req);
-                self.env_reqs.insert(id, reply);
+                self.env_reqs.insert((ReqProto::EnvelopesByRoot, id), reply);
             }
             Cmd::Serve { slot, env } => {
                 self.served.insert(slot, env);
@@ -841,7 +936,7 @@ impl Runner {
                 req.extend_from_slice(&start_period.to_le_bytes());
                 req.extend_from_slice(&count.to_le_bytes());
                 let id = self.swarm.behaviour_mut().lc_updates.send_request(&peer, req);
-                self.env_reqs.insert(id, reply);
+                self.env_reqs.insert((ReqProto::LcUpdates, id), reply);
             }
             Cmd::Bootstrap { root, reply } => {
                 let mut cands: Vec<PeerId> = self.peers.iter().filter(|(_, p)| p.status.is_some()).map(|(id, _)| *id).collect();
@@ -853,7 +948,7 @@ impl Runner {
                 self.env_rr = self.env_rr.wrapping_add(1);
                 let peer = cands[self.env_rr % cands.len()];
                 let id = self.swarm.behaviour_mut().lc_bootstrap.send_request(&peer, root.to_vec());
-                self.env_reqs.insert(id, reply);
+                self.env_reqs.insert((ReqProto::LcBootstrap, id), reply);
             }
         }
     }
@@ -1075,7 +1170,7 @@ impl Runner {
     }
 
     fn on_peer_status(&mut self, peer: PeerId, s: Status) {
-        let relevant = self.learn_status(&s);
+        let relevant = self.learn_status(peer, &s);
         if let Some(p) = self.peers.get_mut(&peer) {
             p.status = Some(s);
         }
@@ -1097,32 +1192,11 @@ impl Runner {
                 let received = SystemTime::now();
                 let topic = message.topic.as_str().to_string();
                 let name = topic.split('/').nth(3).unwrap_or("").to_string();
-                let ok = match name.as_str() {
-                    "execution_payload" => match ssz::Envelope::parse(&message.data) {
-                        Ok(env) => {
-                            self.advance_head(env.payload.slot_number, env.beacon_block_root);
-                            true
-                        }
-                        Err(_) => false,
-                    },
-                    "beacon_block" => ssz::BlockInfo::parse(&message.data).is_ok(),
-                    // Size check only here; signatures are verified by the light client.
-                    "light_client_optimistic_update" => {
-                        tracing::debug!(len = message.data.len(), "light_client_optimistic_update gossip");
-                        message.data.len() == self.cfg.lc_update_lens.0
-                    }
-                    "light_client_finality_update" => {
-                        tracing::debug!(len = message.data.len(), "light_client_finality_update gossip");
-                        message.data.len() == self.cfg.lc_update_lens.1
-                    }
-                    // Syntactic check only: skim cannot verify attestations (no state/BLS).
-                    n if n.starts_with("beacon_attestation_") => {
-                        message.data.len() == SINGLE_ATTESTATION_LEN
-                    }
-                    _ => true,
-                };
-                // Light-client updates are received, not relayed: skim verifies them later.
-                let acc = if ok && self.cfg.forward && !name.starts_with("light_client") {
+                let check = check_gossip(&name, &message.data, self.cfg.lc_update_lens);
+                if let Some((slot, root)) = check.head {
+                    self.advance_head(slot, root);
+                }
+                let acc = if check.relay && self.cfg.forward {
                     gossipsub::MessageAcceptance::Accept
                 } else {
                     gossipsub::MessageAcceptance::Ignore
@@ -1139,6 +1213,9 @@ impl Runner {
                     self.stats.lock().unwrap().attestations += 1;
                     return;
                 }
+                if name == "execution_payload" && !check.relay && !self.cfg.deliver_unchecked {
+                    return; // the consumer would reject it too; it shouldn't take queue space
+                }
                 let ev = ClEvent::Gossip {
                     topic: name,
                     data: Arc::new(message.data),
@@ -1146,8 +1223,17 @@ impl Runner {
                     from: propagation_source,
                     message_id: message_id.0,
                 };
-                if self.tx.send(ev).await.is_err() {
-                    tracing::warn!("event receiver dropped");
+                // Never wait for the consumer: the swarm also answers Ping, Status and MetaData
+                // and runs gossipsub heartbeats, which a full queue would stop (peers then drop
+                // skim). A dropped payload is recovered like a missed one, from its successor.
+                // (Review: `send(..).await` here.)
+                match self.tx.try_send(ev) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        self.stats.lock().unwrap().gossip_dropped += 1;
+                        tracing::debug!("consumer behind: gossip message dropped");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => tracing::warn!("event receiver dropped"),
                 }
             }
             BehaviourEvent::Gossipsub(_) => {}
@@ -1231,42 +1317,42 @@ impl Runner {
                 let _ = self.swarm.behaviour_mut().envelopes_by_root.send_response(channel, out);
             }
             BehaviourEvent::Envelopes(R::Message { message: M::Response { request_id, response }, .. }) => {
-                if let Some(reply) = self.env_reqs.remove(&request_id) {
+                if let Some(reply) = self.env_reqs.remove(&(ReqProto::Envelopes, request_id)) {
                     let _ = reply.send(Ok(response));
                 }
             }
             BehaviourEvent::Envelopes(R::OutboundFailure { request_id, error, .. }) => {
-                if let Some(reply) = self.env_reqs.remove(&request_id) {
+                if let Some(reply) = self.env_reqs.remove(&(ReqProto::Envelopes, request_id)) {
                     let _ = reply.send(Err(anyhow::anyhow!("envelopes request failed: {error}")));
                 }
             }
             BehaviourEvent::EnvelopesByRoot(R::Message { message: M::Response { request_id, response }, .. }) => {
-                if let Some(reply) = self.env_reqs.remove(&request_id) {
+                if let Some(reply) = self.env_reqs.remove(&(ReqProto::EnvelopesByRoot, request_id)) {
                     let _ = reply.send(Ok(response));
                 }
             }
             BehaviourEvent::EnvelopesByRoot(R::OutboundFailure { request_id, error, .. }) => {
-                if let Some(reply) = self.env_reqs.remove(&request_id) {
+                if let Some(reply) = self.env_reqs.remove(&(ReqProto::EnvelopesByRoot, request_id)) {
                     let _ = reply.send(Err(anyhow::anyhow!("envelopes request failed: {error}")));
                 }
             }
             BehaviourEvent::LcUpdates(R::Message { message: M::Response { request_id, response }, .. }) => {
-                if let Some(reply) = self.env_reqs.remove(&request_id) {
+                if let Some(reply) = self.env_reqs.remove(&(ReqProto::LcUpdates, request_id)) {
                     let _ = reply.send(Ok(response));
                 }
             }
             BehaviourEvent::LcUpdates(R::OutboundFailure { request_id, error, .. }) => {
-                if let Some(reply) = self.env_reqs.remove(&request_id) {
+                if let Some(reply) = self.env_reqs.remove(&(ReqProto::LcUpdates, request_id)) {
                     let _ = reply.send(Err(anyhow::anyhow!("light client updates request failed: {error}")));
                 }
             }
             BehaviourEvent::LcBootstrap(R::Message { message: M::Response { request_id, response }, .. }) => {
-                if let Some(reply) = self.env_reqs.remove(&request_id) {
+                if let Some(reply) = self.env_reqs.remove(&(ReqProto::LcBootstrap, request_id)) {
                     let _ = reply.send(Ok(response));
                 }
             }
             BehaviourEvent::LcBootstrap(R::OutboundFailure { request_id, error, .. }) => {
-                if let Some(reply) = self.env_reqs.remove(&request_id) {
+                if let Some(reply) = self.env_reqs.remove(&(ReqProto::LcBootstrap, request_id)) {
                     let _ = reply.send(Err(anyhow::anyhow!("bootstrap request failed: {error}")));
                 }
             }
@@ -1282,6 +1368,43 @@ impl Runner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_peers_finalized_checkpoint_is_not_advertised_until_another_agrees() {
+        // Review: an equal epoch replaced our finalized root, and any one peer's checkpoint was
+        // re-sent to everyone; honest peers then dropped skim as irrelevant.
+        let digest = [1, 2, 3, 4];
+        let st = |fe: u64, fr: u8, hs: u64| Status {
+            fork_digest: digest,
+            finalized_root: B256::repeat_byte(fr),
+            finalized_epoch: fe,
+            head_root: B256::repeat_byte(0xee),
+            head_slot: hs,
+            earliest_available_slot: None,
+        };
+        let (a, b, c) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let mut votes = FinalizedVotes::new();
+        let now = 100 * 32;
+        let learn = |best, s: &Status, p, votes: &mut FinalizedVotes| learn_status(best, s, p, FINALIZED_QUORUM, now, 32, digest, votes).unwrap();
+        let s1 = learn(None, &st(98, 1, now), a, &mut votes);
+        assert_eq!((s1.finalized_epoch, s1.finalized_root, s1.head_slot), (0, B256::ZERO, now), "head learned, checkpoint not yet");
+        let s2 = learn(Some(s1), &st(98, 1, now), b, &mut votes);
+        assert_eq!((s2.finalized_epoch, s2.finalized_root), (98, B256::repeat_byte(1)), "two peers agree");
+        // The same epoch with another root, even from two peers, doesn't replace it.
+        let s3 = learn(Some(s2), &st(98, 9, now), c, &mut votes);
+        let s3 = learn(Some(s3), &st(98, 9, now), a, &mut votes);
+        assert_eq!(s3.finalized_root, B256::repeat_byte(1));
+        // A checkpoint past the current epoch is never adopted.
+        let s4 = learn(Some(s3), &st(500, 7, now), a, &mut votes);
+        let s4 = learn(Some(s4), &st(500, 7, now), b, &mut votes);
+        assert_eq!(s4.finalized_epoch, 98);
+        // Off-fork or future-head statuses are not learned at all.
+        assert!(learn_status(Some(s4), &Status { fork_digest: [9; 4], ..st(99, 1, now) }, a, 2, now, 32, digest, &mut votes).is_none());
+        assert!(learn_status(Some(s4), &st(99, 1, now + 5), a, 2, now, 32, digest, &mut votes).is_none());
+        // A peer the operator named is enough on its own (a devnet with one CL peer).
+        let s5 = learn_status(Some(s4), &st(99, 3, now), c, 1, now, 32, digest, &mut votes).unwrap();
+        assert_eq!(s5.finalized_epoch, 99);
+    }
 
     #[test]
     fn the_digest_follows_the_schedule_by_epoch() {

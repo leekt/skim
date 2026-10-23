@@ -265,6 +265,9 @@ impl Simulator {
             let t = Instant::now();
             let (result, access) = self.cpu(|| self.execute(&snap, &header, tx.clone())).await?;
             exec_us += t.elapsed().as_secs_f64() * 1e6;
+            if let Some(e) = access.snapshot_error {
+                return Err(SimError::State(e));
+            }
             fetched_accounts.extend_from_slice(&access.miss_accounts);
             fetched_storage.extend_from_slice(&access.miss_storage);
             if !access.has_misses() {
@@ -286,6 +289,8 @@ impl Simulator {
                 // One predicted wave is capped (keys come nearest-first); the rest, if the call
                 // needs them, arrive as ordinary miss rounds. An uncapped wave of hundreds of
                 // keys on a few peers can take longer than the call is worth (seen: 75 s).
+                // Accounts too: a learned set can hold many. (Review: only slots were capped.)
+                accts.truncate(MAX_PREDICTED_WAVE);
                 slots.truncate(MAX_PREDICTED_WAVE.saturating_sub(accts.len()));
                 for a in &access.miss_accounts {
                     if !accts.contains(a) {

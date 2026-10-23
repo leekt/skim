@@ -2,6 +2,8 @@
 //!
 //! - **Child of the head:** apply.
 //! - **One-block fork:** a block whose parent is the head's parent switches branches.
+//! - **Below the head on another branch:** waits (never a deep rollback on one envelope's word);
+//!   its branch's next block reconciles.
 //! - **Anything else** (a gap, a deeper fork, or a parent we don't know): reconcile with the EL
 //!   chain. Fetch recent headers, find the newest block both chains agree on, roll back only to
 //!   there, and replay the EL blocks (eth/71 BALs) up to the new block's parent. The store is
@@ -83,7 +85,16 @@ impl Chain {
                 Err(e) => Placed::Deferred(e.to_string()),
             };
         }
-        if b.number <= head.number
+        if b.number < head.number {
+            // Below the head on a branch we don't hold: a late block, or a forged one (an
+            // envelope is checked for consistency, not signatures). Switching to it would roll
+            // back to its parent, however deep. (Review: any stored parent was accepted, so one
+            // envelope with `parent = head - 200` rolled back 200 blocks.) If its branch is the
+            // canonical one, that branch's next block overtakes the head and reconciles against
+            // peers' chains, filling this block in.
+            return Placed::Deferred(format!("block {} is below the head ({}) on another branch; waiting for its branch to overtake", b.number, head.number));
+        }
+        if b.number == head.number
             && b.number > 0
             && self.store.block(b.number - 1).is_some_and(|p| p.hash == b.parent_hash)
         {
@@ -100,8 +111,11 @@ impl Chain {
             },
             Err(Reconcile::NoAncestor) => {
                 tracing::warn!(number = b.number, "no common ancestor in window; re-anchoring");
-                self.rollback(0);
-                // rollback_to(0) keeps block 0 entries only; start fresh at this block.
+                // The epoch first, as in `rollback`; chain data forgets everything above 0.
+                self.store.note_reorg();
+                (self.on_rollback)(0);
+                // In memory: a fresh start at this block. The archive keeps what's below it.
+                self.store.reanchor(b.number);
                 match self.apply(&h, writes) {
                     Ok(r) => Placed::Reanchored(r),
                     Err(e) => Placed::Deferred(e.to_string()),
@@ -120,9 +134,17 @@ impl Chain {
         if count == 0 {
             return Err(Reconcile::Defer("nothing to reconcile".into()));
         }
+        // Too far behind to replay block by block: start afresh at `b` (state is re-fetched;
+        // the archive keeps its history and the healer fills its gap).
+        if b.number.saturating_sub(head.number) > MAX_RECONCILE {
+            return Err(Reconcile::NoAncestor);
+        }
         let peers: Vec<_> = self.net.peers().into_iter().filter(|(_, p)| p.eth_version >= 71).map(|(id, _)| id).collect();
         for peer in peers {
-            let Ok(hs) = self.net.headers(peer, BlockHashOrNumber::Number(from), count).await.0 else { continue };
+            // In chunks: peers cap headers and BALs per response, so one request for the whole
+            // gap failed on every peer once the gap was large, and following stalled for good.
+            // (Review.)
+            let Some(hs) = self.headers_chunked(peer, from, count).await else { continue };
             // Must be a linked chain ending at b's parent.
             let linked = hs.windows(2).all(|w| w[1].parent_hash == w[0].hash_slow());
             if !linked || hs.last().map(|h| h.hash_slow()) != Some(b.parent_hash) {
@@ -132,14 +154,7 @@ impl Chain {
             let Some(ancestor) = ancestor.map(|h| h.number) else { return Err(Reconcile::NoAncestor) };
             let replay: Vec<&Header> = hs.iter().filter(|h| h.number > ancestor).collect();
             let hashes: Vec<B256> = replay.iter().map(|h| h.hash_slow()).collect();
-            let bals = if hashes.is_empty() {
-                Vec::new()
-            } else {
-                match self.net.bals(peer, hashes).await.0 {
-                    Ok(b) => b.0,
-                    Err(_) => continue,
-                }
-            };
+            let Some(bals) = self.bals_chunked(peer, &hashes).await else { continue };
             if bals.len() != replay.len() || bals.iter().any(|x| x.is_none()) {
                 continue;
             }
@@ -173,6 +188,36 @@ impl Chain {
         Err(Reconcile::Defer("no EL peer served a linked header chain + BALs yet".into()))
     }
 
+    /// `count` headers from `from`, ascending, fetched [`CHUNK`] at a time from one peer; `None`
+    /// if the peer stops short or answers out of order.
+    async fn headers_chunked(&self, peer: skim_el::Peer, from: u64, count: u64) -> Option<Vec<Header>> {
+        let mut hs: Vec<Header> = Vec::with_capacity(count as usize);
+        while (hs.len() as u64) < count {
+            let start = from + hs.len() as u64;
+            let n = (count - hs.len() as u64).min(CHUNK);
+            let part = self.net.headers(peer, BlockHashOrNumber::Number(start), n).await.0.ok()?;
+            if part.is_empty() || part.len() as u64 > n || part[0].number != start {
+                return None;
+            }
+            hs.extend(part);
+        }
+        Some(hs)
+    }
+
+    /// BALs for `hashes`, [`CHUNK`] per request, from one peer; `None` if any request fails or
+    /// comes back short.
+    async fn bals_chunked(&self, peer: skim_el::Peer, hashes: &[B256]) -> Option<Vec<Option<alloy_primitives::Bytes>>> {
+        let mut out = Vec::with_capacity(hashes.len());
+        for c in hashes.chunks(CHUNK as usize) {
+            let got = self.net.bals(peer, c.to_vec()).await.0.ok()?.0;
+            if got.len() != c.len() {
+                return None;
+            }
+            out.extend(got);
+        }
+        Some(out)
+    }
+
     /// Fills `b`'s missing ancestors from consensus peers: walks payload envelopes back from
     /// `b`'s slot until the collected blocks link (by hash) from a block the store holds to `b`'s
     /// parent, then rolls back to that block and applies them in order.
@@ -182,7 +227,9 @@ impl Chain {
         let mut found: Option<u64> = None;
         let mut trace = crate::persist::CatchupTrace::default();
         let expected = b.number.saturating_sub(head).max(1);
-        crate::persist::walk_envelopes(cl, slot.saturating_sub(1), self.lookback * 2 + 8, expected, &mut trace, |h, w| {
+        // Far enough back for the whole gap (with room for missed slots), not just the lookback.
+        let max_slots = (expected + self.lookback) * 2 + 8;
+        crate::persist::walk_envelopes(cl, slot.saturating_sub(1), max_slots, expected, &mut trace, |h, w| {
             if h.number < b.number {
                 got.insert(h.number, (h, w));
             }
@@ -213,6 +260,11 @@ impl Chain {
         Ok((ancestor, n_applied))
     }
 }
+
+/// Headers or BALs per request when reconciling (what peers serve in one response comfortably).
+const CHUNK: u64 = 64;
+/// The largest gap replayed block by block; beyond it the follower re-anchors.
+const MAX_RECONCILE: u64 = 1024;
 
 enum Reconcile {
     NoAncestor,
@@ -389,6 +441,26 @@ mod tests {
         assert!(ev[0].starts_with("applied 101"));
         assert_eq!(ev[1], "rollback 100 (store head 101)");
         assert!(ev[2].starts_with("applied 101") && ev[2] != ev[0], "the new fork's block: {ev:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_block_far_below_the_head_does_not_roll_the_chain_back() {
+        // Review: any envelope whose parent was stored switched branches, so one late or forged
+        // block with `parent = head - 3` rolled the chain back 3 blocks (up to `--window`).
+        let a = fork(B256::repeat_byte(0x99), 100, 5, 0xa);
+        let chain = chain_at(&a[0].0, &[], false).await;
+        for (h, _) in &a[1..] {
+            assert!(matches!(chain.place(h.clone(), Default::default()).await, Placed::Applied { .. }));
+        }
+        let epoch = chain.store.reorg_epoch();
+        let stale = fork(a[0].0.hash_slow(), 101, 1, 0xb);
+        let r = chain.place(stale[0].0.clone(), Default::default()).await;
+        assert!(matches!(r, Placed::Deferred(_)), "{r:?}");
+        assert_eq!(chain.store.head().map(|h| h.hash), Some(a[4].0.hash_slow()));
+        assert_eq!(chain.store.reorg_epoch(), epoch, "requests in flight aren't refused for it either");
+        // A sibling of the head still switches branches (one block).
+        let sib = fork(a[3].0.hash_slow(), 104, 1, 0xc);
+        assert!(matches!(chain.place(sib[0].0.clone(), Default::default()).await, Placed::Applied { reorged_to: Some(103), .. }));
     }
 
     #[tokio::test(flavor = "multi_thread")]

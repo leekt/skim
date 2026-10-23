@@ -112,6 +112,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     cfg.target_peers = args.target_peers;
     cfg.max_peers = args.target_peers + args.target_peers / 2;
     cfg.forward = !args.no_forward;
+    cfg.deliver_unchecked = true; // counts envelopes that fail the rebuild
     cfg.explicit_peers = args.peers.iter().map(|p| p.parse()).collect::<Result<_, _>>()?;
     let genesis = cfg.genesis_time;
     let slot_start_ms = |slot: u64| (genesis + slot * SECONDS_PER_SLOT) as f64 * 1e3;

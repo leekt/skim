@@ -68,8 +68,8 @@ pub struct Args {
     cl_port: u16,
     #[arg(long, default_value_t = 30388)]
     el_port: u16,
-    /// Blocks of history kept for reads and reorgs.
-    #[arg(long, default_value_t = 256)]
+    /// Blocks of history kept for reads and reorgs (at least 2: a block's parent must be held).
+    #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u64).range(2..))]
     window: u64,
     /// Never use these peers (hex node ids) for SNAP state, e.g. a node being benchmarked
     /// against skim on the same host. Repeatable.
@@ -86,8 +86,8 @@ pub struct Args {
     /// first write. 0 = off.
     #[arg(long, default_value_t = 0)]
     archive_backfill: u64,
-    /// Largest block range one `eth_getLogs` request may scan.
-    #[arg(long, default_value_t = 2048)]
+    /// Largest block range one `eth_getLogs` request may scan (at least 1).
+    #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u64).range(1..))]
     max_logs_range: u64,
     /// History beyond the in-memory window (about a day of headers): `off` keeps skim head-only
     /// (no history database; logs and block streams cover the in-memory window, older ranges
@@ -305,6 +305,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     tracing::info!(network = %cl_net.name, chain_id = el_net.chain_id(), preset = cl_net.preset.name, slot_ms = cl_net.slot_ms,
         gloas_epoch = cl_net.gloas_fork_epoch, cl_bootnodes = cl_net.bootnodes.len(), el_bootnodes = el_net.bootnodes.len(), "network");
     skim_sim::env::set_chain_id(el_net.chain_id());
+    let blob_schedule = el_net.clone();
+    skim_sim::env::set_blob_update_fraction(move |ts| blob_schedule.blob_update_fraction(ts));
     cl_net.experimental_hegota = args.experimental_hegota;
     let forks = crate::forks::ForkPlan::new(&cl_net, &el_net, args.experimental_hegota);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
@@ -500,7 +502,16 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         dash: dash.clone(),
     });
     crate::rpc::DEBUG_RPC.store(args.debug_rpc, std::sync::atomic::Ordering::Relaxed);
-    tokio::spawn(serve(rpc.clone(), args.rpc, (args.cors != "none").then(|| args.cors.clone())));
+    // Bound here, before anything else starts: a busy port is a startup error, not a node that
+    // follows the chain with no RPC. (Review: the spawned server's error was dropped.)
+    let listener = tokio::net::TcpListener::bind(args.rpc).await.map_err(|e| anyhow::anyhow!("--rpc {}: {e}", args.rpc))?;
+    let cors = (args.cors != "none").then(|| args.cors.clone());
+    let rpc_for_server = rpc.clone();
+    tokio::spawn(async move {
+        if let Err(e) = serve(rpc_for_server, listener, cors).await {
+            tracing::error!("JSON-RPC server stopped: {e}");
+        }
+    });
     if let (Some(addr), Some(handle)) = (args.metrics, metrics_handle) {
         let top = args.metrics_addresses;
         tokio::spawn(async move {
@@ -558,6 +569,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut stop_logged = false;
+    let mut deferred_in_a_row = 0u64;
+    let lc_slots = Arc::new(tokio::sync::Semaphore::new(4));
     loop {
         let ev = tokio::select! {
             ev = rx.recv() => match ev { Some(ev) => ev, None => break },
@@ -566,8 +579,19 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         };
         let ClEvent::Gossip { topic, data, received, .. } = ev else { continue };
         if topic.starts_with("light_client_") {
+            // Each costs a BLS check under the committee lock. Honest peers send about two per
+            // slot; with every slot busy, the rest are dropped rather than queued, so a flood
+            // of well-sized junk can't build a backlog that delays the real updates. (Review:
+            // a task per message, without bound.)
+            let Ok(permit) = lc_slots.clone().try_acquire_owned() else {
+                metrics::counter!("skim_light_client_gossip_dropped_total").increment(1);
+                continue;
+            };
             let (light, store) = (light.clone(), store.clone());
-            tokio::spawn(async move { light.on_gossip(&topic, &data, &store).await });
+            tokio::spawn(async move {
+                light.on_gossip(&topic, &data, &store).await;
+                drop(permit);
+            });
             continue;
         }
         if topic != "execution_payload" {
@@ -622,7 +646,26 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             Arc::new(bal),
             alloy_primitives::Bytes::copy_from_slice(env.payload.block_access_list),
         );
-        match chain.place(v.header, writes.clone()).await {
+        let had_head = store.head().is_some();
+        // A re-anchor (and the very first block, which anchors the empty store) is a new head
+        // like any applied block. (Review: it only logged a warning, so the first block of every
+        // run had no `NewHead`, no maintenance pass, no `light.on_block`, and restore and BAL
+        // seeding waited for the second block.)
+        let placed = match chain.place(v.header, writes.clone()).await {
+            Placed::Reanchored(ready) => {
+                if had_head {
+                    tracing::warn!(number, "re-anchored: no common ancestor with the chain in the window; in-memory state starts afresh");
+                }
+                Placed::Applied { ready, reorged_to: None, filled: 0 }
+            }
+            p => p,
+        };
+        if matches!(placed, Placed::Deferred(_)) {
+            deferred_in_a_row += 1;
+        } else {
+            deferred_in_a_row = 0;
+        }
+        match placed {
             Placed::Applied { ready, reorged_to, filled } => {
                 if let Some(p) = &mempool_probe {
                     p.on_block(&probe_hashes, &writes.writes);
@@ -662,8 +705,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 // Keep subscriptions current and their readiness fresh (one pass at a time).
                 let _ = maint_tx.send(Some(ready.block));
             }
-            Placed::Reanchored(_) => tracing::warn!(number, "re-anchored"),
-            Placed::Duplicate => {}
+            Placed::Reanchored(_) | Placed::Duplicate => {}
+            // One deferral is routine (a late sibling, peers a moment behind); a run of them means
+            // `latest` has stopped moving, which an operator must see. (Review: always debug.)
+            Placed::Deferred(why) if deferred_in_a_row % 8 == 3 => {
+                tracing::warn!(number, in_a_row = deferred_in_a_row, "blocks can't be placed on the chain; `latest` is not advancing: {why}")
+            }
             Placed::Deferred(why) => tracing::debug!(number, "deferred: {why}"),
         }
     }
@@ -721,11 +768,16 @@ async fn v3_tick(sim: Arc<Simulator>, cfg: Arc<V3Config>, st: Arc<V3State>, b: s
                 tracing::warn!(%pool, "uniswap_v3: not a V3 pool (or state unavailable yet); retrying next block");
                 continue;
             };
-            let Some(spacing) = skim_sim::prefetch::decode_spacing(&sp) else { continue };
+            // A contract that answers but isn't a V3 pool (spacing <= 0, a fee wider than uint24)
+            // is skipped, never a panic in the prediction path.
+            let (Some(spacing), Ok(fee)) = (skim_sim::prefetch::decode_spacing(&sp), u32::try_from(alloy_primitives::U256::from_be_slice(&fee))) else {
+                tracing::warn!(%pool, "uniswap_v3: tickSpacing() or fee() is not a V3 pool's; skipped");
+                continue;
+            };
             let p = skim_sim::prefetch::V3Pool { address: pool, spacing };
             let meta = skim_sim::predictor::V3Meta {
                 pool: p,
-                fee: alloy_primitives::U256::from_be_slice(&fee).to(),
+                fee,
                 token0: alloy_primitives::Address::from_slice(&t0[12..]),
                 token1: alloy_primitives::Address::from_slice(&t1[12..]),
             };

@@ -44,6 +44,12 @@ impl ForkPlan {
         self.stop.as_ref().filter(|(_, t)| timestamp >= *t).map(|(n, _)| n.as_str())
     }
 
+    /// The fork skim stopped at, once its time has passed (`now`, unix seconds): from then on
+    /// the chain has blocks skim doesn't apply.
+    pub fn stopped(&self, now: u64) -> Option<&str> {
+        self.stops(now)
+    }
+
     pub fn json(&self, now: u64) -> Value {
         json!({
             "hegota": self.hegota.map(|(at, on)| json!({"at": at, "support": if on { "experimental" } else { "none" }})),

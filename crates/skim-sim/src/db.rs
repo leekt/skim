@@ -19,6 +19,10 @@ pub struct Access {
     pub accounts: Vec<Address>,
     pub storage: Vec<(Address, U256)>,
     pub block_hashes: Vec<u64>,
+    /// The snapshot itself became unreadable (its block was reorged out or left the window):
+    /// no fetch can fix that, so the run ends with this error. (Review: such reads were misses,
+    /// re-fetched until the rounds ran out, then reported as incomplete state.)
+    pub snapshot_error: Option<skim_state::StateError>,
 }
 
 impl Access {
@@ -125,8 +129,11 @@ impl CodeCache {
 }
 
 impl SnapDb<'_> {
-    fn get(&self, k: StateKey) -> StateValue {
-        self.snap.get(&k).unwrap_or(StateValue::Unknown)
+    fn get(&self, k: StateKey, acc: &mut Access) -> StateValue {
+        self.snap.get(&k).unwrap_or_else(|e| {
+            acc.snapshot_error.get_or_insert(e);
+            StateValue::Unknown
+        })
     }
 }
 
@@ -136,7 +143,7 @@ impl DatabaseRef for SnapDb<'_> {
     fn basic_ref(&self, a: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let mut acc = self.access.lock().unwrap();
         acc.accounts.push(a);
-        match (self.get(StateKey::Balance(a)), self.get(StateKey::Nonce(a)), self.get(StateKey::CodeHash(a))) {
+        match (self.get(StateKey::Balance(a), &mut acc), self.get(StateKey::Nonce(a), &mut acc), self.get(StateKey::CodeHash(a), &mut acc)) {
             (StateValue::Known(balance), StateValue::Known(nonce), StateValue::Known(ch)) => {
                 let code_hash = B256::from(ch);
                 if balance.is_zero() && nonce.is_zero() && code_hash == KECCAK_EMPTY {
@@ -174,7 +181,7 @@ impl DatabaseRef for SnapDb<'_> {
     fn storage_ref(&self, a: Address, slot: U256) -> Result<U256, Self::Error> {
         let mut acc = self.access.lock().unwrap();
         acc.storage.push((a, slot));
-        match self.get(StateKey::Storage(a, slot)) {
+        match self.get(StateKey::Storage(a, slot), &mut acc) {
             StateValue::Known(v) => Ok(v),
             StateValue::Unknown => {
                 acc.miss_storage.push((a, slot));
@@ -234,5 +241,32 @@ mod code_cache_tests {
         }
         assert_eq!(c.len(), 16);
         assert!(c.get(&B256::repeat_byte(7)).is_some());
+    }
+}
+
+#[cfg(test)]
+mod snapshot_error_tests {
+    use super::*;
+    use skim_state::{BlockRef, StateError, Store};
+
+    #[test]
+    fn a_reorged_snapshot_ends_the_run_instead_of_reading_as_missing_state() {
+        // Review: a read of a snapshot whose block was reorged out was a miss, so callers
+        // re-fetched the same keys until their rounds ran out and reported `Incomplete`.
+        let b = |n: u64, fork: u8| BlockRef { number: n, hash: B256::repeat_byte(fork + n as u8), parent_hash: B256::repeat_byte(if n > 1 { fork + n as u8 - 1 } else { 0 }), state_root: B256::ZERO, timestamp: n };
+        let store = Store::new(64);
+        store.apply_block(b(1, 0), Default::default()).unwrap();
+        store.apply_block(b(2, 0), Default::default()).unwrap();
+        let snap = store.snapshot(&b(2, 0)).unwrap();
+        store.rollback_to(1);
+        let mut other = b(2, 0x40);
+        other.parent_hash = b(1, 0).hash;
+        store.apply_block(other, Default::default()).unwrap();
+        let no_hashes = |_: u64| None;
+        let cache = CodeCache::new(4);
+        let db = SnapDb { snap: &snap, block_hash: &no_hashes, access: Default::default(), code_cache: &cache };
+        let _ = db.storage_ref(Address::ZERO, U256::from(1));
+        let acc = db.access.into_inner().unwrap();
+        assert!(matches!(acc.snapshot_error, Some(StateError::Reorged { number: 2, .. })), "{:?}", acc.snapshot_error);
     }
 }

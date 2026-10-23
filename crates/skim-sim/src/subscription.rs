@@ -210,6 +210,8 @@ pub enum ConfigError {
     NoAddress(String),
     #[error("{0} declared keys exceed limits.max_subscribed_keys = {1}")]
     TooManyKeys(usize, usize),
+    #[error("subscription {0} is declared more than once; names identify subscriptions and must be unique")]
+    DuplicateName(String),
 }
 
 /// Code hashes among `keys` (known, non-empty) whose bytecode skim doesn't hold.
@@ -240,6 +242,11 @@ impl Subscriptions {
     pub fn new(specs: Vec<SubscriptionSpec>, max_keys: usize) -> Result<Self, ConfigError> {
         let mut required = BTreeMap::new();
         for s in &specs {
+            // Keyed by name below: a second spec with the same name would silently replace the
+            // first one's keys and status. (Review.)
+            if required.contains_key(&s.name) {
+                return Err(ConfigError::DuplicateName(s.name.clone()));
+            }
             let mut keys = HashSet::new();
             if (s.account || s.storage.is_some()) && s.address.is_none() {
                 return Err(ConfigError::NoAddress(s.name.clone()));
@@ -747,5 +754,12 @@ mod tests {
         assert!(matches!(Subscriptions::new(archived, 10), Err(ConfigError::StorageAllArchive(_))));
         let noaddr: Vec<SubscriptionSpec> = serde_yaml_ng::from_str("- name: y\n  account: true\n").unwrap();
         assert!(matches!(Subscriptions::new(noaddr, 10), Err(ConfigError::NoAddress(_))));
+        // Two subscriptions on different accounts under one name merged into one (3 keys, one
+        // status entry) instead of being refused.
+        let twice: Vec<SubscriptionSpec> = serde_yaml_ng::from_str(
+            "- name: x\n  address: \"0x0000000000000000000000000000000000000001\"\n  account: true\n- name: x\n  address: \"0x0000000000000000000000000000000000000002\"\n  account: true\n",
+        )
+        .unwrap();
+        assert!(matches!(Subscriptions::new(twice, 10), Err(ConfigError::DuplicateName(n)) if n == "x"));
     }
 }

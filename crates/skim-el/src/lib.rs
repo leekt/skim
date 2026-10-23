@@ -161,6 +161,12 @@ impl ElNetwork {
         self.spec.chain.id()
     }
 
+    /// The blob base-fee update fraction the chain's blob schedule sets at `timestamp`.
+    pub fn blob_update_fraction(&self, timestamp: u64) -> Option<u64> {
+        use reth_chainspec::EthChainSpec;
+        self.spec.blob_params_at_timestamp(timestamp).map(|p| p.update_fraction as u64)
+    }
+
     /// Bogota (Hegota's execution half), if scheduled: its activation time.
     pub fn bogota_time(&self) -> Option<u64> {
         self.spec.hardforks.get(reth_chainspec::EthereumHardfork::Bogota).and_then(|c| c.as_timestamp())
@@ -202,9 +208,15 @@ pub struct PendingTx {
 }
 
 impl PendingTx {
+    /// `None` for a frame transaction: its sender is claimed, not recovered from a signature
+    /// (frames authenticate in validation frames skim doesn't execute), so it says nothing about
+    /// that account's pending nonce or balance. (Review: it was recorded as the sender's.)
     fn from_tx(tx: &SignedTx) -> Option<Self> {
         use alloy_consensus::Transaction as _;
         use alloy_consensus::transaction::SignerRecoverable as _;
+        if tx.as_frame().is_some() {
+            return None;
+        }
         let sender = tx.recover_signer().ok()?;
         let max_cost = U256::from(tx.gas_limit()) * U256::from(tx.max_fee_per_gas()) + tx.value();
         Some(Self { hash: *tx.tx_hash(), sender, nonce: tx.nonce(), max_cost, ty: alloy_consensus::Typed2718::ty(tx) })
@@ -797,17 +809,24 @@ impl ElNet {
         (r.map(|b| b.0), d)
     }
 
-    /// All receipts of one block (eth/70+ `GetReceipts`, following `lastBlockIncomplete`).
-    /// Callers verify them against the header's `receipts_root`.
-    pub async fn block_receipts(&self, peer: PeerId, hash: B256) -> Timed<Vec<Receipt>> {
+    /// All receipts of one block (eth/70+ `GetReceipts`, following `lastBlockIncomplete`), within
+    /// what a block that used `gas_used` can hold ([`ReceiptBudget`]). Callers verify them
+    /// against the header's `receipts_root`.
+    pub async fn block_receipts(&self, peer: PeerId, hash: B256, gas_used: u64) -> Timed<Vec<Receipt>> {
         let start = Instant::now();
         let mut out = Vec::new();
+        let mut budget = ReceiptBudget::new(gas_used);
         for _ in 0..64 {
             let request = GetReceipts70 { first_block_receipt_index: out.len() as u64, block_hashes: vec![hash] };
             let (r, _) = self.send_counted(&requests::RECEIPTS, peer, |response| PeerRequest::GetReceipts70 { request, response }).await;
             match r {
                 Ok(mut m) => {
+                    // One block asked for: only the first list is an answer to it.
+                    m.receipts.truncate(1);
                     let got = m.receipts.pop().unwrap_or_default();
+                    if !budget.admit(&got) {
+                        return (Err(ReqError::Peer("receipts: more than the block's gas allows".into())), start.elapsed());
+                    }
                     let empty = got.is_empty();
                     out.extend(got);
                     if !m.last_block_incomplete || empty {
@@ -820,20 +839,23 @@ impl ElNet {
         (Err(ReqError::Peer("receipts: too many partial responses".into())), start.elapsed())
     }
 
-    /// Receipts of several blocks in one `GetReceipts` exchange (continuing partial responses).
-    /// Returns receipts for a prefix of `hashes`, in order: a peer may stop early (response size
-    /// limits, or blocks it doesn't have). Callers verify each against its `receipts_root`.
-    pub async fn blocks_receipts(&self, peer: PeerId, hashes: &[B256]) -> Timed<Vec<Vec<Receipt>>> {
+    /// Receipts of several blocks (hash, header `gas_used`) in one `GetReceipts` exchange
+    /// (continuing partial responses). Returns receipts for a prefix of `blocks`, in order: a peer
+    /// may stop early (response size limits, or blocks it doesn't have). Callers verify each
+    /// against its `receipts_root`.
+    pub async fn blocks_receipts(&self, peer: PeerId, blocks: &[(B256, u64)]) -> Timed<Vec<Vec<Receipt>>> {
         let start = Instant::now();
         let mut out: Vec<Vec<Receipt>> = Vec::new();
         let mut cur: Vec<Receipt> = Vec::new();
+        // The budget of the block `cur` is filling: blocks[at].
+        let mut budget: Option<(usize, ReceiptBudget)> = None;
         for _ in 0..256 {
-            if out.len() == hashes.len() {
+            if out.len() >= blocks.len() {
                 break;
             }
-            let request = GetReceipts70 { first_block_receipt_index: cur.len() as u64, block_hashes: hashes[out.len()..].to_vec() };
+            let request = GetReceipts70 { first_block_receipt_index: cur.len() as u64, block_hashes: blocks[out.len()..].iter().map(|b| b.0).collect() };
             let (r, _) = self.send_counted(&requests::RECEIPTS, peer, |response| PeerRequest::GetReceipts70 { request, response }).await;
-            let m = match r {
+            let mut m = match r {
                 Ok(m) => m,
                 Err(e) if out.is_empty() => return (Err(e), start.elapsed()),
                 Err(_) => break,
@@ -841,15 +863,26 @@ impl ElNet {
             if m.receipts.is_empty() {
                 break;
             }
+            // Lists beyond the blocks asked for answer nothing. (Review: they were kept, and the
+            // next request's `blocks[out.len()..]` panicked.)
+            m.receipts.truncate(blocks.len() - out.len());
             let k = m.receipts.len();
             let mut progressed = false;
             for (i, r) in m.receipts.into_iter().enumerate() {
                 progressed |= !r.is_empty() || i > 0;
-                if i == 0 {
-                    cur.extend(r);
-                } else {
-                    cur = r;
+                if i > 0 {
+                    cur = Vec::new();
                 }
+                let at = out.len();
+                let b = match &mut budget {
+                    Some((n, b)) if *n == at => b,
+                    _ => &mut budget.insert((at, ReceiptBudget::new(blocks[at].1))).1,
+                };
+                if !b.admit(&r) {
+                    // Past what the block can hold: what came before it still stands.
+                    return (Ok(out), start.elapsed());
+                }
+                cur.extend(r);
                 if i + 1 < k || !m.last_block_incomplete {
                     out.push(std::mem::take(&mut cur));
                 }
@@ -906,9 +939,87 @@ impl ElNet {
     }
 }
 
+/// What one block's receipts can plausibly hold, given its header's `gas_used`, checked as
+/// partial eth/70 responses accumulate. The `receipts_root` check comes only when a block is
+/// complete, so without this a peer that keeps answering "incomplete" grows the buffer without
+/// bound before anything is verified. (Review.) Every transaction costs at least 21,000 gas and
+/// every log byte 8 (plus 375 per log and per topic); the limits allow twice that, so a gas
+/// accounting change (refunds, EIP-7778) can't make an honest block exceed them.
+#[derive(Debug, Clone, Copy)]
+pub struct ReceiptBudget {
+    gas_used: u64,
+    receipts: u64,
+    last_cumulative: u64,
+    log_gas: u64,
+}
+
+impl ReceiptBudget {
+    const SLACK_GAS: u64 = 1_000_000;
+
+    pub fn new(gas_used: u64) -> Self {
+        Self { gas_used, receipts: 0, last_cumulative: 0, log_gas: 0 }
+    }
+
+    fn allowance(&self) -> u64 {
+        self.gas_used.saturating_mul(2).saturating_add(Self::SLACK_GAS)
+    }
+
+    /// Adds `rs`; false once they can't all belong to the block.
+    pub fn admit(&mut self, rs: &[Receipt]) -> bool {
+        for r in rs {
+            if r.cumulative_gas_used < self.last_cumulative || r.cumulative_gas_used > self.allowance() {
+                return false;
+            }
+            self.last_cumulative = r.cumulative_gas_used;
+            self.receipts += 1;
+            for l in &r.logs {
+                let cost = 375 + 375 * l.data.topics().len() as u64 + 8 * l.data.data.len() as u64;
+                self.log_gas = self.log_gas.saturating_add(cost);
+            }
+        }
+        self.receipts <= self.allowance() / 21_000 && self.log_gas <= self.allowance()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blob_fees_follow_the_chains_blob_schedule() {
+        // Review: BLOBBASEFEE used the Prague update fraction on every chain.
+        let sepolia = ElNetwork::sepolia();
+        // 2026-05: after Sepolia's BPO2 (2025-11).
+        assert_eq!(sepolia.blob_update_fraction(1_780_000_000), Some(11_684_671), "BPO2's");
+        assert_eq!(sepolia.blob_update_fraction(0), None, "before Cancun there is no blob fee");
+    }
+
+    #[test]
+    fn partial_receipts_stop_at_what_the_block_can_hold() {
+        // Review: partial eth/70 answers were appended until the final root check, so a peer
+        // always answering "incomplete" with junk grew the buffer by ~10 MiB per message.
+        let receipt = |cum: u64, log_bytes: usize| Receipt {
+            tx_type: 2,
+            success: true,
+            cumulative_gas_used: cum,
+            logs: vec![alloy_primitives::Log::new_unchecked(alloy_primitives::Address::ZERO, vec![B256::ZERO], vec![0u8; log_bytes].into())],
+            frame: None,
+        };
+        // An honest-looking 30M-gas block: 100 transactions with 1 KB logs.
+        let mut b = ReceiptBudget::new(30_000_000);
+        let honest: Vec<Receipt> = (1..=100).map(|i| receipt(i * 300_000, 1024)).collect();
+        assert!(b.admit(&honest[..50]) && b.admit(&honest[50..]));
+        // Junk: log data far beyond the block's gas, arriving in partial answers.
+        let mut b = ReceiptBudget::new(30_000_000);
+        let junk = receipt(21_000, 4 << 20);
+        let admitted = (0..64).take_while(|_| b.admit(std::slice::from_ref(&junk))).count();
+        assert!(admitted < 4, "{admitted} junk partials admitted");
+        // More receipts than transactions the gas could pay for, or a cumulative gas going back.
+        let mut b = ReceiptBudget::new(21_000);
+        assert!(!b.admit(&vec![receipt(21_000, 0); 200]));
+        let mut b = ReceiptBudget::new(30_000_000);
+        assert!(!b.admit(&[receipt(500_000, 0), receipt(400_000, 0)]));
+    }
 
     fn genesis(amsterdam: u64, bpo3: Option<u64>, cancun: Option<u64>) -> alloy_genesis::Genesis {
         let mut g = alloy_genesis::Genesis::default();

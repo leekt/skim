@@ -8,8 +8,9 @@
 //! Block tags: `latest` is the **state-ready** head. A block number inside the retained window
 //! and EIP-1898 `{blockHash}` / `{blockNumber}` are accepted. `pending` reads the latest state,
 //! except that `eth_getTransactionCount` counts transactions sent through skim and not yet
-//! included. `safe`, `finalized` and `earliest` are not tracked yet and answer `-32002`. Within
-//! one batch, `latest` is pinned to one block.
+//! included. `safe` and `finalized` are the light client's verified and finalized blocks;
+//! `earliest` is not tracked and answers `-32002`. Within one batch, `latest` is pinned to one
+//! block.
 //!
 //! Transactions, receipts and logs come from [`crate::chaindata`].
 
@@ -288,7 +289,16 @@ impl From<DataError> for RpcError {
 impl Rpc {
     fn resolve_block(&self, id: Option<BlockId>, latest: &Option<BlockRef>) -> Result<BlockRef, RpcError> {
         let store = &self.sim.store;
-        let latest = || latest.ok_or_else(|| RpcError::unavailable_because("not following the chain yet", "starting", true));
+        let latest = || {
+            // Past a fork skim doesn't implement, its head is frozen at the last block before
+            // it: `latest` would be stale state reported as current. Explicit blocks and the
+            // verified tags still answer. (Review: `latest` kept answering, with success.)
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            if let Some(fork) = crate::forks::get().and_then(|p| p.stopped(now)) {
+                return Err(RpcError::unavailable_because(format!("the chain passed {fork}, which skim doesn't implement: `latest` is no longer followed"), "fork_unsupported", false));
+            }
+            latest.ok_or_else(|| RpcError::unavailable_because("not following the chain yet", "starting", true))
+        };
         match id.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest)) {
             BlockId::Number(BlockNumberOrTag::Latest) => latest(),
             BlockId::Number(BlockNumberOrTag::Number(n)) => store
@@ -381,10 +391,13 @@ impl Rpc {
         let sim = &self.sim;
         let req: TransactionRequest = need(params, 0)?;
         let header = self.header(b)?;
-        if let Some(overrides) = param::<alloy_rpc_types_eth::state::StateOverride>(params, 2)? {
-            // State overrides: the call runs on an overlay; the store is never modified.
+        let state = param::<alloy_rpc_types_eth::state::StateOverride>(params, 2)?;
+        let block = param::<alloy_rpc_types_eth::BlockOverrides>(params, 3)?;
+        if state.is_some() || block.is_some() {
+            // Overrides: the call runs on an overlay; the store is never modified. (Review: block
+            // overrides, parameter 3, were ignored.)
             let to: Reads = req.to.and_then(|k| k.to().copied()).into_iter().collect();
-            let blocks = [skim_sim::multi::SimBlock { block: None, state: Some(overrides), calls: vec![self.tx_env(req, &header)?.into()] }];
+            let blocks = [skim_sim::multi::SimBlock { block, state, calls: vec![self.tx_env(req, &header)?.into()] }];
             let out = sim.simulate(b, &blocks, skim_sim::multi::Placement::SameBlock).await?;
             self.dash.record_hit(b.number, &to);
             return Ok((Self::exec_result(&out[0].calls[0]), to));
@@ -419,7 +432,7 @@ impl Rpc {
         if req.gas_price.is_some() && (req.max_fee_per_gas.is_some() || req.max_priority_fee_per_gas.is_some()) {
             return Err(RpcError::params("both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified"));
         }
-        let gas = req.gas.unwrap_or(header.gas_limit).min(header.gas_limit.max(30_000_000));
+        let gas = req.gas.unwrap_or(header.gas_limit).min(skim_sim::multi::call_gas_cap(header));
         let data = req.input.input().cloned().unwrap_or_default();
         let mut b = TxEnv::builder()
             .caller(req.from.unwrap_or_default())
@@ -568,7 +581,8 @@ impl Rpc {
             }
             "eth_call" => {
                 let b = self.resolve_block(param(params, 1)?, latest)?;
-                let key = (b.hash, alloy_primitives::keccak256(format!("{}|{}", params.get(0).unwrap_or(&Value::Null), params.get(2).unwrap_or(&Value::Null))));
+                let p = |i: usize| params.get(i).unwrap_or(&Value::Null);
+                let key = (b.hash, alloy_primitives::keccak256(format!("{}|{}|{}", p(0), p(2), p(3))));
                 if !self.cache_calls {
                     return self.eth_call_uncached(params, &b).await.0;
                 }
@@ -583,11 +597,18 @@ impl Rpc {
             }
             "eth_estimateGas" => {
                 let req: TransactionRequest = need(params, 0)?;
+                // Refused rather than estimated without them. (Review: state overrides were
+                // ignored.)
+                if params.get(2).is_some_and(|v| !v.is_null()) || params.get(3).is_some_and(|v| !v.is_null()) {
+                    return Err(RpcError::params("eth_estimateGas: state and block overrides are not supported"));
+                }
                 let b = self.resolve_block(param(params, 1)?, latest)?;
                 let header = self.header(&b)?;
-                let cap = req.gas.unwrap_or(header.gas_limit);
+                // The caller's `gas` within the same cap as `eth_call` (`tx_env`). (Review: it
+                // replaced the cap, so `gas = 2^64 - 1` on a looping contract ran without end,
+                // holding a CPU slot.)
                 let mut tx = self.tx_env(req, &header)?;
-                tx.gas_limit = cap;
+                let cap = tx.gas_limit;
                 let first = sim.call(&b, tx.clone(), Mode::Resolve { max_rounds: sim.max_rounds.load(std::sync::atomic::Ordering::Relaxed) }).await?;
                 Self::exec_result(&first.result)?;
                 // State is now local: binary-search the lowest gas limit that still succeeds.
@@ -639,8 +660,21 @@ impl Rpc {
                         let n = chain.number_of(&h).ok_or_else(|| RpcError::unavailable(format!("block {h} is not known")))?;
                         (n, n, Some(h))
                     }
-                    _ => {
-                        let (a, b) = ChainData::range(&filter, head)?;
+                    alloy_rpc_types_eth::FilterBlockOption::Range { from_block, to_block } => {
+                        // `safe`/`finalized` as every other method resolves them; this keeps their
+                        // own error reasons (`not_verified`).
+                        for t in [from_block, to_block].into_iter().flatten() {
+                            if matches!(t, BlockNumberOrTag::Safe | BlockNumberOrTag::Finalized) {
+                                self.resolve_block(Some(BlockId::Number(t)), latest)?;
+                            }
+                        }
+                        let verified = |t: BlockNumberOrTag| {
+                            self.resolve_block(Some(BlockId::Number(t)), latest).map(|b| b.number).map_err(|e| DataError::Unavailable(e.message))
+                        };
+                        let (a, b) = ChainData::range(&filter, head, verified)?;
+                        if a > head {
+                            return Ok(json!([])); // nothing past the head yet
+                        }
                         (a, b, None)
                     }
                 };
@@ -806,8 +840,17 @@ impl Rpc {
                 let chain = self.chain()?;
                 let req: crate::stream::Request = need(params, 0)?;
                 let finalized = self.light.as_ref().and_then(|l| l.status().finalized_block).map(|b| json!({"number": b.number, "hash": b.hash}));
-                let store = sim.store.clone();
-                Ok(crate::stream::next(chain, move || store.head().map(|h| h.number), self.events.subscribe(), finalized, req).await?)
+                // The stream's tip is `latest`: with `--require-verified`, the verified head.
+                // (Review: it was always the optimistic head.)
+                let (store, light, verified) = (sim.store.clone(), self.light.clone(), self.require_verified);
+                let tip = move || {
+                    if verified {
+                        light.as_ref().and_then(|l| l.status().verified_block).and_then(|v| crate::light::resolve(&store, &v)).map(|b| b.number)
+                    } else {
+                        store.head().map(|h| h.number)
+                    }
+                };
+                Ok(crate::stream::next(chain, tip, self.events.subscribe(), finalized, req).await?)
             }
             "skim_archiveCoverage" => {
                 let a: Address = need(params, 0)?;
@@ -846,7 +889,7 @@ impl Rpc {
         };
         let params = req.get("params").cloned().unwrap_or(json!([]));
         let t = std::time::Instant::now();
-        let res = reorg_guard(method, epoch, self.reorg_epoch(), self.dispatch(method, &params, latest).await);
+        let res = guarded(method, epoch, self.dispatch(method, &params, latest), || self.reorg_epoch()).await;
         let ms = t.elapsed().as_secs_f64() * 1e3;
         tracing::debug!(method, ms, ok = res.is_ok(), "rpc");
         if method != "skim_dashboard" {
@@ -885,6 +928,14 @@ const REORG_SAFE: &[&str] = &[
     // Streams carry their own cursor and rewind on reorgs.
     "skim_streamNext",
 ];
+
+/// Runs a request and applies the reorg guard with the epoch sampled after it finished. (Review:
+/// the epoch was an argument evaluated before the await, so a reorg during the request was
+/// never seen.)
+async fn guarded(method: &str, epoch: u64, req: impl std::future::Future<Output = R>, now: impl Fn() -> u64) -> R {
+    let res = req.await;
+    reorg_guard(method, epoch, now(), res)
+}
 
 /// A request that started before a reorg (`epoch` captured with its `latest`) and finished after
 /// it may have read the old fork in one place and the new one in another: refused as
@@ -1182,6 +1233,7 @@ async fn handle(State(rpc): State<Arc<Rpc>>, Json(body): Json<Value>) -> Json<Va
     let epoch = rpc.reorg_epoch();
     let latest = rpc.latest();
     match body {
+        Value::Array(reqs) if reqs.len() > MAX_BATCH => Json(batch_too_large()),
         Value::Array(reqs) => {
             let mut out = Vec::with_capacity(reqs.len());
             out.extend(rpc.batch(reqs.iter().collect(), &latest, epoch).await);
@@ -1191,9 +1243,20 @@ async fn handle(State(rpc): State<Arc<Rpc>>, Json(body): Json<Value>) -> Json<Va
     }
 }
 
+/// Requests per batch (HTTP or WebSocket), as geth's default. (Review: unlimited; only the 2 MB
+/// body limit applied, ~30k requests.)
+const MAX_BATCH: usize = 1000;
+/// Subscriptions per WebSocket connection. (Review: unlimited; every block ran a log scan for
+/// each `logs` subscription.)
+const MAX_WS_SUBSCRIPTIONS: usize = 128;
+
+fn batch_too_large() -> Value {
+    json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": format!("batch too large: at most {MAX_BATCH} requests")}})
+}
+
 /// `cors`: the `Access-Control-Allow-Origin` to send (browser dapps calling skim directly), or
 /// `None` to send none.
-pub async fn serve(rpc: Arc<Rpc>, addr: std::net::SocketAddr, cors: Option<String>) -> anyhow::Result<()> {
+pub async fn serve(rpc: Arc<Rpc>, listener: tokio::net::TcpListener, cors: Option<String>) -> anyhow::Result<()> {
     use axum::http::{HeaderValue, header};
     // HTTP POST and WebSocket on the same address; OPTIONS answers CORS preflights.
     let mut app = Router::new()
@@ -1213,7 +1276,7 @@ pub async fn serve(rpc: Arc<Rpc>, addr: std::net::SocketAddr, cors: Option<Strin
             }
         }));
     }
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
     tracing::info!(%addr, "JSON-RPC listening (HTTP and WebSocket)");
     axum::serve(listener, app).await?;
     Ok(())
@@ -1234,6 +1297,7 @@ async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
     let (mut tx, mut rx) = socket.split();
     let mut events = rpc.events.subscribe();
     let mut subs: std::collections::HashMap<String, Sub> = Default::default();
+    let mut heads = crate::ws_feed::HeadTrack::default();
     let mut next_id = 1u64;
     loop {
         tokio::select! {
@@ -1257,11 +1321,15 @@ async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
                     match method {
                         "eth_subscribe" => {
                             let kind = params.get(0).and_then(Value::as_str).unwrap_or("");
+                            if subs.len() >= MAX_WS_SUBSCRIPTIONS {
+                                return Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32005, "message": format!("too many subscriptions on this connection (at most {MAX_WS_SUBSCRIPTIONS})")}}));
+                            }
                             let sub = match kind {
                                 "newHeads" => Sub::NewHeads,
                                 "skim_subscriptions" => Sub::Skim,
                                 "logs" => match serde_json::from_value::<alloy_rpc_types_eth::Filter>(params.get(1).cloned().unwrap_or(json!({}))) {
-                                    Ok(f) => Sub::Logs(Box::new(f)),
+                                    // Logs from blocks after the one current now.
+                                    Ok(f) => Sub::Logs { filter: Box::new(f), since: latest.map_or(0, |b| b.number), delivered: Default::default() },
                                     Err(e) => return Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": format!("logs filter: {e}")}})),
                                 },
                                 other => return Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": format!("unsupported subscription {other:?} (newHeads, logs, skim_subscriptions)")}})),
@@ -1279,6 +1347,7 @@ async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
                     }
                 };
                 let reply = match &body {
+                    Value::Array(reqs) if reqs.len() > MAX_BATCH => batch_too_large(),
                     Value::Array(reqs) => {
                         // Subscription changes first (in order, they touch this session), then the
                         // other requests concurrently.
@@ -1302,48 +1371,107 @@ async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
             ev = events.recv() => {
                 let ev = match ev {
                     Ok(ev) => ev,
+                    // Missed heads are caught up on the next one (`HeadTrack` reports every block
+                    // since the last it reported); a missed subscriptions push is superseded.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => break,
                 };
-                for (sid, sub) in &subs {
-                    // Logs: one notification per log, as clients expect.
-                    if let (Sub::Logs(f), WsEvent::NewHead(b), Some(c)) = (sub, &ev, &rpc.chain) {
-                        if let Ok(Value::Array(logs)) = c.logs(f, b.number, b.number, Some(b.hash)).await {
-                            for log in logs {
-                                let msg = json!({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": sid, "result": log}});
-                                if tx.send(Message::Text(msg.to_string().into())).await.is_err() {
-                                    return;
-                                }
+                let sent = match ev {
+                    WsEvent::NewHead(b) => {
+                        // With `--require-verified`, pushes follow the verified head too, like every
+                        // read. (Review: they followed optimistic heads.)
+                        let head = if rpc.require_verified { rpc.latest() } else { Some(b) };
+                        match head {
+                            Some(head) => {
+                                let step = heads.advance((head.number, head.hash), |n| rpc.sim.store.block(n).map(|x| x.hash));
+                                push_heads(&rpc, &mut subs, &step, &mut tx).await
                             }
-                        }
-                        continue;
-                    }
-                    let result = match (sub, &ev) {
-                        (Sub::NewHeads, WsEvent::NewHead(b)) => match rpc.sim.header_arc(b) {
-                            Some(h) => serde_json::to_value(alloy_rpc_types_eth::Header::new((*h).clone())).ok(),
-                            None => None,
-                        },
-                        (Sub::Skim, WsEvent::Subscriptions(n)) => rpc
-                            .subs
-                            .as_ref()
-                            .map(|s| json!({"block": format!("{n:#x}"), "subscriptions": s.status()})),
-                        _ => None,
-                    };
-                    if let Some(result) = result {
-                        let msg = json!({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": sid, "result": result}});
-                        if tx.send(Message::Text(msg.to_string().into())).await.is_err() {
-                            return;
+                            None => true,
                         }
                     }
+                    WsEvent::Subscriptions(n) => match rpc.subs.as_ref() {
+                        Some(s) => {
+                            let result = json!({"block": format!("{n:#x}"), "subscriptions": s.status()});
+                            let mut ok = true;
+                            for (sid, _) in subs.iter().filter(|(_, s)| matches!(s, Sub::Skim)) {
+                                ok &= send_push(&mut tx, sid, result.clone()).await;
+                            }
+                            ok
+                        }
+                        None => true,
+                    },
+                };
+                if !sent {
+                    return;
                 }
             }
         }
     }
 }
 
+type WsSink = futures::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>;
+
+async fn send_push(tx: &mut WsSink, sid: &str, result: Value) -> bool {
+    use futures::SinkExt;
+    let msg = json!({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": sid, "result": result}});
+    tx.send(axum::extract::ws::Message::Text(msg.to_string().into())).await.is_ok()
+}
+
+/// One step of the session's chain view: `newHeads` gets each added block's header; `logs` gets
+/// the logs it reported for removed blocks again with `removed: true` (newest first), then the
+/// logs of each added block. False once the connection is gone.
+async fn push_heads(rpc: &Rpc, subs: &mut std::collections::HashMap<String, Sub>, step: &crate::ws_feed::Step, tx: &mut WsSink) -> bool {
+    for (sid, sub) in subs.iter_mut() {
+        match sub {
+            Sub::NewHeads => {
+                for &(n, hash) in &step.added {
+                    let Some(b) = rpc.sim.store.block(n).filter(|b| b.hash == hash) else { continue };
+                    let Some(h) = rpc.sim.header_arc(&b) else { continue };
+                    let Ok(v) = serde_json::to_value(alloy_rpc_types_eth::Header::new((*h).clone())) else { continue };
+                    if !send_push(tx, sid, v).await {
+                        return false;
+                    }
+                }
+            }
+            Sub::Logs { filter, since, delivered } => {
+                let Some(c) = &rpc.chain else { continue };
+                for &(n, hash) in &step.removed {
+                    let Some((h, logs)) = delivered.remove(&n) else { continue };
+                    if h != hash {
+                        continue;
+                    }
+                    for mut log in logs.into_iter().rev() {
+                        log["removed"] = json!(true);
+                        if !send_push(tx, sid, log).await {
+                            return false;
+                        }
+                    }
+                }
+                for &(n, hash) in step.added.iter().filter(|(n, _)| *n > *since) {
+                    let Ok(Value::Array(logs)) = c.logs(filter, n, n, Some(hash)).await else { continue };
+                    // Logs: one notification per log, as clients expect.
+                    for log in &logs {
+                        if !send_push(tx, sid, log.clone()).await {
+                            return false;
+                        }
+                    }
+                    delivered.insert(n, (hash, logs));
+                }
+                while delivered.len() as u64 > crate::ws_feed::KEEP {
+                    delivered.pop_first();
+                }
+            }
+            Sub::Skim => {}
+        }
+    }
+    true
+}
+
 enum Sub {
     NewHeads,
-    Logs(Box<alloy_rpc_types_eth::Filter>),
+    /// `since`: the head when it subscribed (only later blocks' logs are pushed); `delivered`:
+    /// the logs pushed per block, to withdraw if the block leaves the chain.
+    Logs { filter: Box<alloy_rpc_types_eth::Filter>, since: u64, delivered: std::collections::BTreeMap<u64, (B256, Vec<Value>)> },
     Skim,
 }
 
@@ -1409,5 +1537,21 @@ mod tests {
         // A broadcast already happened: reporting it as failed would be wrong.
         assert!(reorg_guard("eth_sendRawTransaction", 4, 5, ok()).is_ok());
         assert!(reorg_guard("eth_chainId", 4, 5, ok()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_reorg_while_the_request_is_pending_is_seen() {
+        // Review: the epoch to compare with was sampled before the request ran.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let epoch = AtomicU64::new(4);
+        let req = async {
+            tokio::task::yield_now().await;
+            epoch.fetch_add(1, Ordering::SeqCst); // a rollback while receipts were being fetched
+            Ok(json!("0x1"))
+        };
+        let e = guarded("eth_getTransactionReceipt", 4, req, || epoch.load(Ordering::SeqCst)).await.unwrap_err();
+        assert_eq!(e.data.unwrap()["reason"], "chain_changed");
+        let calm = async { Ok(json!("0x1")) };
+        assert!(guarded("eth_call", 5, calm, || epoch.load(Ordering::SeqCst)).await.is_ok());
     }
 }

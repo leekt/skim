@@ -127,8 +127,11 @@ pub(crate) fn handle(src: Option<&dyn ServeSource>, stats: &ServeStats, req: Inc
         }
         IncomingEthRequest::GetReceipts { request, response, .. } => {
             add(&stats.receipt_reqs, 1);
+            // A block with frame receipts can't be encoded for eth/66-68 (they travel on eth/69+
+            // only): the answer stops before it, as for a block skim doesn't hold. (Review: they
+            // were sent as legacy receipts, which don't match the block's receipts root.)
             let rs: Vec<Vec<ReceiptWithBloom<Receipt>>> = src
-                .map(|s| prefix(request.0.iter().take(MAX_RECEIPTS_SERVE), |h| s.receipts(*h)))
+                .map(|s| prefix(request.0.iter().take(MAX_RECEIPTS_SERVE), |h| s.receipts(*h).filter(|rs| rs.iter().all(|r| r.frame.is_none()))))
                 .unwrap_or_default()
                 .into_iter()
                 .map(|b| b.into_iter().map(ReceiptWithBloom::from).collect())
@@ -230,17 +233,25 @@ fn receipts70(src: &dyn ServeSource, req: GetReceipts70) -> Receipts70<Receipt> 
             continue;
         }
         // Too big: send what fits and mark the block incomplete; the peer asks for the rest.
+        // The first block always gets at least one receipt, so every answer makes progress.
+        // (Review: one receipt over the limit made an empty, incomplete answer, forever.)
+        let total = block.len();
         let mut part = Vec::new();
         for r in block {
             let n = r.length();
-            if bytes + n > SOFT_RESPONSE_LIMIT {
+            if bytes + n > SOFT_RESPONSE_LIMIT && !(receipts.is_empty() && part.is_empty()) {
                 break;
             }
             bytes += n;
             part.push(r);
         }
+        if part.is_empty() {
+            // Nothing of this block fits after earlier ones: they're complete; it comes next.
+            return Receipts70 { last_block_incomplete: false, receipts };
+        }
+        let incomplete = part.len() < total;
         receipts.push(part);
-        return Receipts70 { last_block_incomplete: true, receipts };
+        return Receipts70 { last_block_incomplete: incomplete, receipts };
     }
     Receipts70 { last_block_incomplete: false, receipts }
 }
@@ -386,5 +397,30 @@ mod tests {
         assert_eq!(r.receipts.len(), 1);
         assert_eq!(r.receipts[0].len(), 2, "first_block_receipt_index skips into the first block");
         assert!(!r.last_block_incomplete);
+    }
+
+    #[test]
+    fn a_receipt_larger_than_the_soft_limit_still_makes_progress() {
+        // Review: an empty partial marked incomplete, so a peer following eth/70 asked again
+        // at the same index forever.
+        let big = |cum: u64| Receipt {
+            tx_type: 2,
+            success: true,
+            cumulative_gas_used: cum,
+            logs: vec![alloy_primitives::Log::new_unchecked(alloy_primitives::Address::ZERO, vec![], vec![0u8; SOFT_RESPONSE_LIMIT + 1].into())],
+            frame: None,
+        };
+        let mut m = chain();
+        let (a, b) = (m.headers[0].hash_slow(), m.headers[1].hash_slow());
+        m.receipts.insert(a, vec![big(1), big(2)]);
+        let r = receipts70(&m, GetReceipts70 { first_block_receipt_index: 0, block_hashes: vec![a, b] });
+        assert_eq!((r.receipts.len(), r.receipts[0].len(), r.last_block_incomplete), (1, 1, true), "one receipt, more to come");
+        let r = receipts70(&m, GetReceipts70 { first_block_receipt_index: 1, block_hashes: vec![a, b] });
+        assert_eq!((r.receipts[0].len(), r.last_block_incomplete), (1, false), "the last one completes the block");
+        // After a complete block, a block whose first receipt doesn't fit comes next time.
+        m.receipts.insert(b, vec![big(1)]);
+        m.receipts.insert(a, vec![big(1)]);
+        let r = receipts70(&m, GetReceipts70 { first_block_receipt_index: 0, block_hashes: vec![a, b] });
+        assert_eq!((r.receipts.len(), r.last_block_incomplete), (1, false));
     }
 }

@@ -291,12 +291,13 @@ pub async fn refresh_pool(
 }
 
 /// `tickSpacing()` decoded from a call's output (int24 ABI-encoded).
+/// `tickSpacing()` as an int24. Only a positive spacing is a pool: `word_of` divides by it.
 pub fn decode_spacing(out: &Bytes) -> Option<i32> {
     (out.len() == 32).then(|| {
         let v = U256::from_be_slice(out);
         let raw = (v & U256::from(0xff_ffffu32)).to::<u32>();
         ((raw << 8) as i32) >> 8
-    })
+    }).filter(|s| *s > 0)
 }
 
 #[cfg(test)]

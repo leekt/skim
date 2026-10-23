@@ -286,21 +286,60 @@ impl EnvelopesCodec {
 }
 
 /// Decodes one `varint(len) ++ snappy_frames` payload from the start of `b`, returning it and
-/// how many input bytes it used (responses carry several chunks back to back).
+/// how many input bytes it used (responses carry several chunks back to back). The buffer grows
+/// with what actually decompresses, never to the peer's claimed length up front.
 pub fn decode_payload_len(b: &[u8], max: u64) -> io::Result<(Vec<u8>, usize)> {
     let (len, n) = read_varint(b)?;
     if len as u64 > max {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "chunk too large"));
     }
-    let mut out = vec![0u8; len];
+    let mut out = Vec::new();
     let mut cur = io::Cursor::new(&b[n..]);
-    snap::read::FrameDecoder::new(&mut cur).read_exact(&mut out)?;
+    snap::read::FrameDecoder::new(&mut cur).take(len as u64).read_to_end(&mut out)?;
+    if out.len() != len {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "chunk shorter than its length"));
+    }
     Ok((out, n + cur.position() as usize))
 }
 
-/// Splits a ByRange/ByRoot response into chunk payloads. Stops at the first error chunk.
-pub fn split_context_chunks(mut b: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+/// What one response of a chunked protocol may hold: chunks, bytes per decoded chunk, decoded
+/// bytes in all. (Review: any number of chunks of up to 16 MiB each were decoded, each buffer
+/// allocated at the peer's claimed size, so one answer could take gigabytes.)
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkLimits {
+    pub chunks: usize,
+    pub chunk_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl ChunkLimits {
+    /// Execution payload envelopes (by range or root): up to `MAX_REQUEST_PAYLOADS`, each at
+    /// most a gossip message's size.
+    pub const ENVELOPES: Self = Self { chunks: MAX_REQUEST_PAYLOADS as usize, chunk_bytes: 16 << 20, total_bytes: MAX_ENVELOPE_RESPONSE_BYTES };
+    /// Light-client bootstrap: one object of tens of KiB.
+    pub const BOOTSTRAP: Self = Self { chunks: 1, chunk_bytes: 1 << 20, total_bytes: 1 << 20 };
+    /// Light-client updates by range: up to `MAX_REQUEST_LIGHT_CLIENT_UPDATES` (128).
+    pub const UPDATES: Self = Self { chunks: 128, chunk_bytes: 1 << 20, total_bytes: 32 << 20 };
+
+    pub fn for_protocol(p: &str) -> Self {
+        match p {
+            LIGHT_CLIENT_BOOTSTRAP => Self::BOOTSTRAP,
+            LIGHT_CLIENT_UPDATES_BY_RANGE => Self::UPDATES,
+            _ => Self::ENVELOPES,
+        }
+    }
+}
+
+/// Splits a ByRange/ByRoot response into chunk payloads (within [`ChunkLimits::ENVELOPES`]).
+/// Stops at the first error chunk.
+pub fn split_context_chunks(b: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+    split_context_chunks_within(b, ChunkLimits::ENVELOPES)
+}
+
+/// [`split_context_chunks`] within `limits`.
+pub fn split_context_chunks_within(mut b: &[u8], limits: ChunkLimits) -> io::Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
+    let mut total = 0u64;
     while let Some((&code, rest)) = b.split_first() {
         if code != 0 {
             if out.is_empty() {
@@ -310,10 +349,14 @@ pub fn split_context_chunks(mut b: &[u8]) -> io::Result<Vec<Vec<u8>>> {
             }
             break; // error chunk after data: what came before is still valid
         }
+        if out.len() >= limits.chunks {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("more than {} chunks", limits.chunks)));
+        }
         if rest.len() < 4 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing context bytes"));
         }
-        let (ssz, used) = decode_payload_len(&rest[4..], 16 << 20)?;
+        let (ssz, used) = decode_payload_len(&rest[4..], limits.chunk_bytes.min(limits.total_bytes - total))?;
+        total += ssz.len() as u64;
         out.push(ssz);
         b = &rest[4 + used..];
     }
@@ -336,13 +379,15 @@ impl request_response::Codec for EnvelopesCodec {
         Ok(ssz)
     }
 
-    async fn read_response<T>(&mut self, _p: &StreamProtocol, io: &mut T) -> io::Result<Vec<Vec<u8>>>
+    async fn read_response<T>(&mut self, p: &StreamProtocol, io: &mut T) -> io::Result<Vec<Vec<u8>>>
     where
         T: AsyncRead + Unpin + Send,
     {
+        let limits = ChunkLimits::for_protocol(p.as_ref());
         let mut buf = Vec::new();
-        io.take(MAX_ENVELOPE_RESPONSE_BYTES).read_to_end(&mut buf).await?;
-        split_context_chunks(&buf)
+        // Compressed input can't exceed the decoded total by much (snappy expands little data).
+        io.take(limits.total_bytes + (limits.total_bytes >> 4) + 4096).read_to_end(&mut buf).await?;
+        split_context_chunks_within(&buf, limits)
     }
 
     async fn write_request<T>(&mut self, _p: &StreamProtocol, io: &mut T, ssz: Vec<u8>) -> io::Result<()>
@@ -408,6 +453,26 @@ mod tests {
         assert_eq!(enc[0], 92); // varint of the uncompressed length
         assert_eq!(&enc[1..5], &[0xff, 0x06, 0x00, 0x00]); // snappy stream identifier
         assert_eq!(decode_payload(&enc).unwrap(), ssz);
+    }
+
+    #[test]
+    fn a_response_is_bounded_by_its_protocols_limits() {
+        // Review: any number of chunks was decoded, each buffer allocated at the peer's claimed
+        // length before decompressing.
+        let chunk = |ssz: &[u8]| [&[0u8][..], &[1, 2, 3, 4], &encode_payload(ssz)].concat();
+        let two: Vec<u8> = [chunk(&[7; 100]), chunk(&[8; 100])].concat();
+        assert_eq!(split_context_chunks_within(&two, ChunkLimits::ENVELOPES).unwrap().len(), 2);
+        assert!(split_context_chunks_within(&two, ChunkLimits::BOOTSTRAP).is_err(), "a bootstrap is one chunk");
+        let lots: Vec<u8> = (0..=MAX_REQUEST_PAYLOADS).flat_map(|_| chunk(&[1; 8])).collect();
+        assert!(split_context_chunks(&lots).is_err(), "more chunks than a request may ask for");
+        // A claimed length the data doesn't back: refused, after decoding only what is there.
+        let mut short = Vec::new();
+        write_varint(15 << 20, &mut short);
+        short.extend_from_slice(&encode_payload(&[9; 64])[1..]);
+        assert!(decode_payload_len(&short, 16 << 20).is_err());
+        // The decoded total counts across chunks.
+        let tight = ChunkLimits { chunks: 8, chunk_bytes: 150, total_bytes: 150 };
+        assert!(split_context_chunks_within(&two, tight).is_err());
     }
 
     #[test]

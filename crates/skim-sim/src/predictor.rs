@@ -82,7 +82,8 @@ impl Predictor {
         let tin = Address::from_word(u256_word(&call.data, 0)?.into());
         let tout = Address::from_word(u256_word(&call.data, 1)?.into());
         let amount = u256_word(&call.data, 2)?;
-        let fee: u32 = u256_word(&call.data, 3)?.to();
+        // Calldata is the caller's: a fee that doesn't fit is no configured pool, not a panic.
+        let fee: u32 = u256_word(&call.data, 3)?.try_into().ok()?;
         let m = self.v3.iter().find(|m| {
             m.fee == fee && ((m.token0 == tin && m.token1 == tout) || (m.token0 == tout && m.token1 == tin))
         })?;
@@ -199,6 +200,26 @@ mod tests {
 
     fn slot0(sqrt_x96: U256, tick: i32) -> U256 {
         sqrt_x96 | (U256::from((tick as u32) & 0xff_ffff) << 160usize)
+    }
+
+    #[test]
+    fn a_quote_with_an_oversized_fee_is_no_pool_not_a_panic() {
+        // Review: `.to::<u32>()` on the caller's fee word panicked on any value >= 2^32.
+        let mut data = QUOTE_EXACT_INPUT_SINGLE.to_vec();
+        for w in 0..5 {
+            data.extend_from_slice(&if w == 3 { [0xffu8; 32] } else { [0u8; 32] });
+        }
+        let call = Call { to: Address::ZERO, data: data.into() };
+        let p = Predictor { learned: Learned::new(8, 0.5, 256), v3: vec![], base_words: 1, reach: Default::default() };
+        assert!(p.v3_for_quote(&call).is_none());
+    }
+
+    #[test]
+    fn a_non_positive_tick_spacing_is_not_a_pool() {
+        let word = |v: i32| alloy_primitives::Bytes::from(U256::from((v as u32) & 0xff_ffff).to_be_bytes::<32>().to_vec());
+        assert_eq!(prefetch::decode_spacing(&word(60)), Some(60));
+        assert_eq!(prefetch::decode_spacing(&word(0)), None, "word_of would divide by zero");
+        assert_eq!(prefetch::decode_spacing(&word(-10)), None);
     }
 
     #[test]
