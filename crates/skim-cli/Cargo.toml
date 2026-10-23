@@ -64,4 +64,5 @@ libc = "0.2.190"
 [dev-dependencies]
 skim-chain = { workspace = true, features = ["testkit"] }
 tempfile = "3"
+alloy-genesis = "2.5.0"
 skim-cl = { workspace = true, features = ["testkit"] }

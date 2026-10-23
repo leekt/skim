@@ -99,6 +99,9 @@ const OUT_OF_SCOPE: &[&str] = &[
 /// The EVM input for a mined transaction, exactly as signed.
 fn signed_tx_env(tx: &skim_el::SignedTx, from: Address) -> Result<TxEnv, RpcError> {
     use alloy_consensus::{Transaction as _, private::alloy_eips::Typed2718};
+    if tx.as_frame().is_some() {
+        return Err(RpcError::unavailable("an EIP-8141 frame transaction can't be replayed: skim's EVM has no Hegota rules (docs/guide/hegota.md)"));
+    }
     let mut b = TxEnv::builder()
         .caller(from)
         .kind(tx.kind())
@@ -774,6 +777,7 @@ impl Rpc {
                     "network": {
                         "name": skim_cl::network::current().name,
                         "glamsterdam_at": skim_cl::network::current().gloas_time(),
+                        "forks": crate::forks::get().map(|f| f.json(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()))),
                     },
                     "el_peers": peers.len(),
                     "snap_peers": peers.iter().filter(|(_, p)| p.snap1 || p.snap2).count(),

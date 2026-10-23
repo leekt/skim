@@ -6,6 +6,7 @@
 use alloy_primitives::{B256, b256};
 use skim_cl::{
     gossip,
+    network::BodyLayout,
     ssz::{BlockInfo, Envelope},
     verify,
 };
@@ -68,6 +69,54 @@ fn parses_block_and_bid_links_to_envelope() {
     let env = Envelope::parse(ENVELOPE).unwrap();
     assert_eq!(bid.parent_block_hash, env.payload.parent_hash);
     assert_eq!(bid.parent_block_root, env.parent_beacon_block_root);
+}
+
+/// The fixture's block re-laid out as a Heze body (EIP-8015: no `eth1_data`, no `deposits`).
+fn as_heze(block: &[u8]) -> Vec<u8> {
+    let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as usize;
+    let msg_start = u32_at(block, 0);
+    let msg = &block[msg_start..];
+    let body_start = u32_at(msg, 80);
+    let body = &msg[body_start..];
+    // Gloas fixed part: randao 96 | eth1_data 72 | graffiti 32 | offsets proposer_slashings,
+    // attester_slashings, attestations, deposits, voluntary_exits | sync_aggregate 160 | offsets.
+    let fixed = u32_at(body, 200);
+    let mut offs: Vec<usize> = vec![200, 204, 208, 212, 216];
+    offs.extend((380..fixed).step_by(4));
+    let starts: Vec<usize> = offs.iter().map(|&i| u32_at(body, i)).collect();
+    let deposits = starts[3]..starts[4];
+    let removed_fixed = 72 + 4;
+    let mut out = Vec::new();
+    out.extend_from_slice(&body[..96]); // randao_reveal
+    out.extend_from_slice(&body[168..200]); // graffiti
+    for (k, &start) in starts.iter().enumerate() {
+        if k == 3 {
+            continue;
+        }
+        let shift = removed_fixed + if start >= deposits.end { deposits.len() } else { 0 };
+        out.extend_from_slice(&((start - shift) as u32).to_le_bytes());
+        if k == 4 {
+            out.extend_from_slice(&body[220..380]); // sync_aggregate
+        }
+    }
+    out.extend_from_slice(&body[fixed..deposits.start]);
+    out.extend_from_slice(&body[deposits.end..]);
+    let mut b = block[..msg_start].to_vec();
+    b.extend_from_slice(&msg[..body_start]);
+    b.extend_from_slice(&out);
+    b
+}
+
+#[test]
+fn reads_the_bid_from_a_heze_body() {
+    let heze = as_heze(BLOCK);
+    assert_eq!(heze.len(), BLOCK.len() - 76, "the fixture has no deposits; eth1_data and an offset are gone");
+    let b = BlockInfo::parse_with(&heze, |_| BodyLayout::Heze).unwrap();
+    assert_eq!(b.bid, BlockInfo::parse(BLOCK).unwrap().bid);
+    assert_eq!(b.bid.unwrap().block_hash, BLOCK_HASH);
+    // Each layout rejects the other's bytes instead of misreading them.
+    assert_eq!(BlockInfo::parse_with(&heze, |_| BodyLayout::Gloas).unwrap().bid, None);
+    assert_eq!(BlockInfo::parse_with(BLOCK, |_| BodyLayout::Heze).unwrap().bid, None);
 }
 
 #[test]

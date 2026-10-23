@@ -7774,6 +7774,7 @@ name = "skim-cli"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-eth",
@@ -7833,8 +7834,10 @@ dependencies = [
  "reth-network",
  "reth-network-api",
  "reth-network-peers",
+ "reth-primitives-traits",
  "reth-storage-api",
  "reth-tasks",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",

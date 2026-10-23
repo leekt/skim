@@ -82,8 +82,8 @@ pub fn fuzz_snap1_response(raw: &[u8]) -> bool {
     snap1::fuzz_decode(raw)
 }
 
-/// A signed transaction as gossiped on the EL (no blob sidecars).
-pub type SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>;
+pub mod frame;
+pub use frame::{FRAME_TX_TYPE, FrameReceipt, FrameResult, Receipt, SignedTx, SkimNetworkPrimitives};
 /// A receipt as served by `GetReceipts` (the bloom is recomputed locally).
 /// EL session limits. reth's defaults (100 outbound, 30 inbound) are for a full node; skim
 /// reaches 30-40 sessions in practice, and each one holds buffers and peer state, so a ceiling
@@ -91,7 +91,6 @@ pub type SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip48
 pub const MAX_OUTBOUND_PEERS: usize = 40;
 pub const MAX_INBOUND_PEERS: usize = 15;
 
-pub type Receipt = alloy_consensus::EthereumReceipt;
 pub type BlockBody = alloy_consensus::BlockBody<SignedTx>;
 pub use reth_network_peers::TrustedPeer;
 
@@ -160,6 +159,33 @@ impl ElNetwork {
 
     pub fn chain_id(&self) -> u64 {
         self.spec.chain.id()
+    }
+
+    /// Bogota (Hegota's execution half), if scheduled: its activation time.
+    pub fn bogota_time(&self) -> Option<u64> {
+        self.spec.hardforks.get(reth_chainspec::EthereumHardfork::Bogota).and_then(|c| c.as_timestamp())
+    }
+
+    /// Timestamp forks in `genesis.json` that neither skim nor reth knows (`fooTime` keys, kept
+    /// as extra fields), with their activation times. Ascending.
+    pub fn unknown_forks(&self) -> Vec<(String, u64)> {
+        let mut v: Vec<(String, u64)> = self
+            .spec
+            .genesis
+            .config
+            .extra_fields
+            .iter()
+            .filter_map(|(k, v)| Some((k.strip_suffix("Time")?.to_string(), v.as_u64()?)))
+            .collect();
+        v.sort_by_key(|(_, t)| *t);
+        v
+    }
+
+    /// The first scheduled fork skim won't follow: `(name, activation time)`. Bogota counts
+    /// unless experimental Hegota support is on.
+    pub fn unsupported_fork(&self, experimental_hegota: bool) -> Option<(String, u64)> {
+        let bogota = self.bogota_time().filter(|_| !experimental_hegota).map(|t| ("bogota".to_string(), t));
+        bogota.into_iter().chain(self.unknown_forks()).min_by_key(|(_, t)| *t)
     }
 }
 
@@ -250,7 +276,7 @@ pub type Timed<T> = (Result<T, ReqError>, Duration);
 
 #[derive(Clone)]
 pub struct ElNet {
-    handle: NetworkHandle,
+    handle: NetworkHandle<SkimNetworkPrimitives>,
     head: Arc<RwLock<Option<Header>>>,
     snap1: snap1::Snap1Peers,
     peers: Arc<RwLock<HashMap<PeerId, PeerInfo>>>,
@@ -325,7 +351,7 @@ impl ElNet {
         };
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], listen_port));
         let snap1 = snap1::Snap1Peers::default();
-        let builder = NetworkConfig::builder(secret, reth_tasks::Runtime::test())
+        let builder = NetworkConfig::<(), SkimNetworkPrimitives>::builder(secret, reth_tasks::Runtime::test())
             .boot_nodes(network.bootnodes.clone())
             .listener_addr(addr)
             .discovery_addr(addr);
@@ -349,7 +375,7 @@ impl ElNet {
             .disable_tx_gossip(true)
             .set_head(head)
             .build(NoopProvider::eth(spec));
-        let mut manager = NetworkManager::eth(config).await?;
+        let mut manager = NetworkManager::<SkimNetworkPrimitives>::new(config).await?;
         if let Some(out) = mempool {
             let (tx, mut rx) = reth_metrics::common::mpsc::memory_bounded_channel(32 << 20, "skim_mempool");
             manager.set_transactions(tx);
@@ -357,7 +383,21 @@ impl ElNet {
                 use reth_network::transactions::NetworkTransactionEvent as E;
                 while let Some(ev) = rx.recv().await {
                     let ev = match ev {
-                        E::IncomingPooledTransactionHashes { peer_id, msg } => MempoolEvent::Announced { peer: peer_id, hashes: msg.iter_hashes().copied().collect() },
+                        E::IncomingPooledTransactionHashes { peer_id, msg } => {
+                            // Blob transactions come back wrapped with their sidecars, which skim's
+                            // transaction type doesn't decode: they're not requested (eth/68+ says
+                            // each announced hash's type; eth/66 announcements don't, and are skipped).
+                            let hashes = match &msg {
+                                reth_eth_wire_types::NewPooledTransactionHashes::Eth68(m) => {
+                                    m.hashes.iter().zip(&m.types).filter(|(_, t)| **t != 3).map(|(h, _)| *h).collect()
+                                }
+                                reth_eth_wire_types::NewPooledTransactionHashes::Eth72(m) => {
+                                    m.hashes.iter().zip(&m.types).filter(|(_, t)| **t != 3).map(|(h, _)| *h).collect()
+                                }
+                                reth_eth_wire_types::NewPooledTransactionHashes::Eth66(_) => Vec::new(),
+                            };
+                            MempoolEvent::Announced { peer: peer_id, hashes }
+                        }
                         E::IncomingTransactions { peer_id, msg } => {
                             MempoolEvent::Transactions { peer: peer_id, txs: msg.0.iter().filter_map(PendingTx::from_tx).collect() }
                         }
@@ -515,7 +555,7 @@ impl ElNet {
         self.handle.local_node_record().to_string()
     }
 
-    pub fn handle(&self) -> &NetworkHandle {
+    pub fn handle(&self) -> &NetworkHandle<SkimNetworkPrimitives> {
         &self.handle
     }
 
@@ -609,7 +649,7 @@ impl ElNet {
         &self,
         kind: &std::sync::atomic::AtomicU64,
         peer: PeerId,
-        make: impl FnOnce(oneshot::Sender<reth_network::p2p::error::RequestResult<T>>) -> PeerRequest,
+        make: impl FnOnce(oneshot::Sender<reth_network::p2p::error::RequestResult<T>>) -> PeerRequest<SkimNetworkPrimitives>,
     ) -> Timed<T> {
         requests::add(kind);
         self.send(peer, make).await
@@ -618,7 +658,7 @@ impl ElNet {
     async fn send<T>(
         &self,
         peer: PeerId,
-        make: impl FnOnce(oneshot::Sender<reth_network::p2p::error::RequestResult<T>>) -> PeerRequest,
+        make: impl FnOnce(oneshot::Sender<reth_network::p2p::error::RequestResult<T>>) -> PeerRequest<SkimNetworkPrimitives>,
     ) -> Timed<T> {
         let (tx, rx) = oneshot::channel();
         let start = Instant::now();
@@ -826,7 +866,7 @@ impl ElNet {
     pub async fn pooled_transactions(&self, peer: PeerId, hashes: Vec<B256>) -> Timed<Vec<PendingTx>> {
         let request = reth_eth_wire_types::GetPooledTransactions(hashes);
         let (r, d) = self.send(peer, |response| PeerRequest::GetPooledTransactions { request, response }).await;
-        (r.map(|p| p.0.into_iter().filter_map(|t| PendingTx::from_tx(&SignedTx::from(t))).collect()), d)
+        (r.map(|p| p.0.into_iter().filter_map(|t| PendingTx::from_tx(&t)).collect()), d)
     }
 
     /// Sends full transactions to every connected peer. Returns how many peers got them.
@@ -919,5 +959,23 @@ mod tests {
         assert_eq!(h.spec.fork_id(&at(pre)).hash, reth_chainspec::HOODI.fork_id(&at(pre)).hash);
         assert_eq!(h.spec.fork_id(&at(pre)).next, 1_793_036_568, "Amsterdam is next");
         assert_eq!(h.spec.fork_id(&at(1_793_036_568)).next, 0);
+        assert_eq!(h.unsupported_fork(false), None);
+        assert_eq!(ElNetwork::sepolia().unsupported_fork(false), None, "reth schedules nothing after Amsterdam on Sepolia");
+    }
+
+    #[test]
+    fn bogota_and_unknown_forks_in_a_genesis() {
+        let mut g: alloy_genesis::Genesis = serde_json::from_str(include_str!("../networks/hoodi/genesis.json")).unwrap();
+        g.config.bogota_time = Some(1_800_000_000);
+        g.config.extra_fields.insert("fooTime".into(), serde_json::json!(1_900_000_000u64));
+        let n = ElNetwork { spec: Arc::new(ElNetwork::spec_from_genesis(g).unwrap()), bootnodes: vec![], dns: None };
+        assert_eq!(n.bogota_time(), Some(1_800_000_000));
+        assert_eq!(n.unknown_forks(), vec![("foo".to_string(), 1_900_000_000)]);
+        assert_eq!(n.unsupported_fork(false), Some(("bogota".into(), 1_800_000_000)));
+        assert_eq!(n.unsupported_fork(true), Some(("foo".into(), 1_900_000_000)));
+        // reth knows Bogota: the fork id changes there, so peers past it stay compatible.
+        let at = |t: u64| Head { timestamp: t, ..Default::default() };
+        assert_eq!(n.spec.fork_id(&at(1_799_999_999)).next, 1_800_000_000);
+        assert_ne!(n.spec.fork_id(&at(1_799_999_999)).hash, n.spec.fork_id(&at(1_800_000_000)).hash);
     }
 }

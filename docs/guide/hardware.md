@@ -27,7 +27,7 @@ This section is the measurements and what fills when. Which knobs trade memory f
 | EL peers | 0 | 3 | 4 | 10 | 16 | 18 | 19 | 25 |
 
 - **Startup:** the first SNAP-serving peer connected after 10.8 s, the first block was applied within the first minute, and RPC answered from then on.
-- **Memory:** 179 MB at one hour, still rising slowly (+5 MB over the last 10 minutes, against +18 MB per 10 minutes in the first). skim's counted structures were 52 MB: recent-BAL writes 16, bodies 14, envelopes kept to serve peers 10.5, raw BALs 3.4. The window and block caches are full by ~51 minutes; BAL address sets keep filling until ~7 h and headers until ~27 h, so this is not a steady state. A 30-hour Linux soak in the same mode is running (TODO 6).
+- **Memory:** 179 MB at one hour, still rising slowly (+5 MB over the last 10 minutes, against +18 MB per 10 minutes in the first). skim's counted structures were 52 MB: recent-BAL writes 16, bodies 14, envelopes kept to serve peers 10.5, raw BALs 3.4. The window and block caches are full by ~51 minutes; BAL address sets keep filling until ~7 h and headers until ~27 h, so this is not a steady state. A 43-hour Linux soak in the same mode is under [long runs](#long-runs).
 - **CPU:** 13 min 43 s of CPU in 61 minutes: about 0.22 of a core on average.
 - **Network:** 152 MB in and 35 MB out in the first 10 minutes, then about 720 MB/h in and 170 MB/h out (~17 GB/day in, ~4 GB/day out), mostly gossip and serving peers; it grew with the peer count.
 - **Disk:** 184 KB (restart data only).
@@ -66,7 +66,21 @@ Both runs below are the production deployment: Linux aarch64, `--history local` 
 - **Where it is:** 305 of 339 MB was mimalloc's heap (skim's own allocations), 22 MB the binary, nothing else of note.
 - **The largest growing group was the transaction index** (index, per-block hash lists and BAL addresses: ~36 MB of payload). Since `9ed1f49`, transactions are indexed only if they change a pinned address (`--tx-index pinned`, the default), the index stores 8-byte hash prefixes, and the per-block lists hold those 8-byte keys instead of full hashes. Headers still fill until ~27 h (a few MB).
 
-A run on the pinned-index build started 2026-10-19; its numbers past 27 h are pending.
+**27 hours on the pinned-index build** (`9ed1f49`, mimalloc, the same deployment): RSS rose to ~370-400 MB by ~9 h and stayed there through 27.7 h (379 MB, peak 412). The production indexer's load is what puts it above the zero-config run below.
+
+**43 hours, zero config** (Linux aarch64, no subscriptions, head-only, mimalloc build `57478b6`; sampled every minute):
+
+| Hours | 3 | 6 | 12 | 18 | 24 | 30 | 36 | 43 |
+|---|---|---|---|---|---|---|---|---|
+| RSS (MB) | 225 | 268 | 266 | 274 | 282 | 290 | 295 | 307 |
+| Live heap counter (MB) | 52 | 56 | 53 | 58 | 51 | 57 | 63 | 62 |
+
+- **Peak RSS:** 314 MB. CPU: 29,500 s over 43.6 h, 0.19 of a core. EL peers 26-40, SNAP-serving 10-33.
+- **Most growth is in the first 6 hours** (block caches and BAL address sets). After that RSS creeps ~1 MB per hour.
+- **What still grows is bounded:** headers fill toward 8,192 (1.5 MB at 6 h, 7.1 MB at 43 h; full at ~27 h), BAL address sets +3 MB, bodies +2 MB. Counted structures went from 56 to 65 MB between 12 and 43 h while RSS went from 266 to 307 MB. The rest is allocator overhead.
+- **Allocators compared** (three builds of `57478b6` side by side on the same machine with production's config, 11.3 h): mimalloc (the default) 244 MB, glibc 229 MB, jemalloc 208 MB. jemalloc also used ~30% less CPU. Build it with `--features alloc-jemalloc`.
+
+**Production on jemalloc** (`df686b7` with `--features alloc-jemalloc`, from 2026-10-20 15:20 UTC): RSS 296 MB at 20 h (peak 321), against ~380-400 MB on mimalloc under the same load.
 
 ### What holds memory
 

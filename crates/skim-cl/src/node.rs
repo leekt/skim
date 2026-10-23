@@ -61,8 +61,9 @@ pub struct NodeConfig {
     /// `(activation epoch, digest)` for every digest the network may switch to while running
     /// (blob-parameter forks after Gloas). Empty: the digest never changes.
     pub digest_schedule: Vec<(u64, [u8; 4])>,
-    /// The fork version advertised in the ENR (`ENRForkID.next_fork_version`, no later fork).
-    pub fork_version: [u8; 4],
+    /// `ENRForkID.next_fork_version` / `next_fork_epoch` by epoch: the scheduled forks from the
+    /// Gloas fork on, `(activation epoch, version)` ascending. The last entry has no next fork.
+    pub fork_versions: Vec<(u64, [u8; 4])>,
     pub genesis_time: u64,
     pub slot_ms: u64,
     pub slots_per_epoch: u64,
@@ -102,7 +103,7 @@ impl NodeConfig {
         Self {
             fork_digest: n.current_fork_digest(),
             digest_schedule: n.digest_schedule(),
-            fork_version: n.gloas_fork_version,
+            fork_versions: std::iter::once((n.gloas_fork_epoch, n.gloas_fork_version)).chain(n.followed_heze().map(|h| (h.epoch, h.version))).collect(),
             genesis_time: n.genesis_time,
             slot_ms: n.slot_ms,
             slots_per_epoch: n.preset.slots_per_epoch,
@@ -124,6 +125,12 @@ impl NodeConfig {
             explicit_peers: Vec::new(),
             attestation_subnets: 2,
         }
+    }
+
+    /// `(next_fork_version, next_fork_epoch)` for the ENR at `epoch`.
+    pub fn next_fork(&self, epoch: u64) -> ([u8; 4], u64) {
+        let current = self.fork_versions.iter().rev().find(|(e, _)| epoch >= *e).or(self.fork_versions.first()).map(|(_, v)| *v).unwrap_or_default();
+        self.fork_versions.iter().find(|(e, _)| *e > epoch).map(|(e, v)| (*v, *e)).unwrap_or((current, FAR_FUTURE_EPOCH))
     }
 
     /// The digest in force at `slot` per [`Self::digest_schedule`] (else [`Self::fork_digest`]).
@@ -401,11 +408,11 @@ pub fn digest_plan(schedule: &[(u64, [u8; 4])], current: [u8; 4], epoch: u64, re
 }
 
 /// The ENR `eth2` value: SSZ `ENRForkID { fork_digest, next_fork_version, next_fork_epoch }`.
-pub fn enr_fork_id(digest: [u8; 4], fork_version: [u8; 4]) -> [u8; 16] {
+pub fn enr_fork_id(digest: [u8; 4], (next_version, next_epoch): ([u8; 4], u64)) -> [u8; 16] {
     let mut v = [0u8; 16];
     v[..4].copy_from_slice(&digest);
-    v[4..8].copy_from_slice(&fork_version);
-    v[8..].copy_from_slice(&FAR_FUTURE_EPOCH.to_le_bytes());
+    v[4..8].copy_from_slice(&next_version);
+    v[8..].copy_from_slice(&next_epoch.to_le_bytes());
     v
 }
 
@@ -443,6 +450,12 @@ pub fn enr_dial(enr: &Enr) -> Option<(PeerId, Vec<Multiaddr>)> {
     (!addrs.is_empty()).then_some((peer, addrs))
 }
 
+/// The TCP address to dial an `enr:` record's node at directly (`/ip4/…/tcp/…/p2p/…`).
+pub fn enr_tcp_multiaddr(enr: &str) -> Option<Multiaddr> {
+    let enr: Enr = enr.parse().ok()?;
+    enr_dial(&enr)?.1.into_iter().find(|a| a.iter().any(|p| matches!(p, Protocol::Tcp(_))))
+}
+
 /// The ENR's `quic` port (IPv4), if it announces one.
 fn enr_quic_port(enr: &Enr) -> Option<u16> {
     enr.get_decodable::<u16>("quic").and_then(Result::ok)
@@ -478,7 +491,7 @@ impl ClNode {
         if cfg.quic_port != 0 {
             b.add_value("quic", &cfg.quic_port);
         }
-        b.add_value("eth2", &Bytes::copy_from_slice(&enr_fork_id(cfg.fork_digest, cfg.fork_version)));
+        b.add_value("eth2", &Bytes::copy_from_slice(&enr_fork_id(cfg.fork_digest, cfg.next_fork(cfg.current_slot() / cfg.slots_per_epoch.max(1)))));
         b.add_value("attnets", &Bytes::copy_from_slice(&attnets));
         b.add_value("syncnets", &Bytes::copy_from_slice(&[0u8]));
         b.add_value("cgc", &CUSTODY_REQUIREMENT);
@@ -905,7 +918,7 @@ impl Runner {
             let old = self.cfg.fork_digest;
             self.cfg.fork_digest = new;
             self.envelopes_codec.digest.store(u32::from_be_bytes(new), std::sync::atomic::Ordering::Relaxed);
-            if let Err(e) = self.discv5.enr_insert("eth2", &Bytes::copy_from_slice(&enr_fork_id(new, self.cfg.fork_version))) {
+            if let Err(e) = self.discv5.enr_insert("eth2", &Bytes::copy_from_slice(&enr_fork_id(new, self.cfg.next_fork(epoch)))) {
                 tracing::warn!("updating the ENR's fork id: {e:?}");
             }
             self.retiring = Some((old, epoch + FORK_TOPIC_OVERLAP_EPOCHS));

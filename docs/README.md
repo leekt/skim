@@ -14,7 +14,8 @@
 10. [Memory and latency](guide/memory-and-latency.md): tuning, per-structure memory counters and the reasons behind defaults
 11. [Trust and correctness](guide/trust-and-correctness.md): what's verified, what isn't
 12. [Troubleshooting](guide/troubleshooting.md): starting with `skim status`
-13. [Future considerations](guide/future-considerations.md): participating in the network (light client, light mempool node with VOPS-style validation state, EIP-8288 aggregation), state-root checks from a minimal witness, embedding, peer privacy, RPC conformance
+13. [Hegota (experimental)](guide/hegota.md): what skim does at the fork after Glamsterdam (stop by default; `--experimental-hegota`), and the assumptions that will change
+14. [Future considerations](guide/future-considerations.md): participating in the network (light client, light mempool node with VOPS-style validation state, EIP-8288 aggregation), state-root checks from a minimal witness, embedding, peer privacy, RPC conformance
 
 ## Examples
 

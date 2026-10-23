@@ -104,14 +104,14 @@ fn add(a: &AtomicU64, n: usize) {
 pub(crate) type Source = Arc<RwLock<Option<Arc<dyn ServeSource>>>>;
 
 /// Runs until the network drops its sender. With no source set, every request gets the empty answer.
-pub(crate) async fn run(mut rx: mpsc::Receiver<IncomingEthRequest>, src: Source, stats: Arc<ServeStats>) {
+pub(crate) async fn run(mut rx: mpsc::Receiver<IncomingEthRequest<crate::SkimNetworkPrimitives>>, src: Source, stats: Arc<ServeStats>) {
     while let Some(req) = rx.recv().await {
         let s = src.read().clone();
         handle(s.as_deref(), &stats, req);
     }
 }
 
-pub(crate) fn handle(src: Option<&dyn ServeSource>, stats: &ServeStats, req: IncomingEthRequest) {
+pub(crate) fn handle(src: Option<&dyn ServeSource>, stats: &ServeStats, req: IncomingEthRequest<crate::SkimNetworkPrimitives>) {
     match req {
         IncomingEthRequest::GetBlockHeaders { request, response, .. } => {
             add(&stats.header_reqs, 1);

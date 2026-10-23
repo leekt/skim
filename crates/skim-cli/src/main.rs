@@ -84,6 +84,7 @@ mod light;
 mod mempool_probe;
 mod metrics;
 mod follow;
+mod forks;
 mod probe_cl;
 mod probe_clreq;
 mod probe_call;

@@ -12,6 +12,8 @@
 
 use alloy_primitives::{Address, B256, Bloom, Bytes, U256};
 
+use crate::network::BodyLayout;
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SszError {
     #[error("ssz: buffer too short ({what}: need {need}, have {have})")]
@@ -255,33 +257,49 @@ pub struct BidInfo {
     pub value_gwei: u64,
 }
 
-/// Offset of `signed_execution_payload_bid` inside the Gloas `BeaconBlockBody` fixed part:
-/// randao_reveal 96 + eth1_data 72 + graffiti 32 + 5 list offsets + sync_aggregate 160 +
-/// bls_to_execution_changes offset.
-const BODY_BID_OFFSET_POS: usize = 96 + 72 + 32 + 5 * 4 + 160 + 4;
+/// Where the `BeaconBlockBody` fixed part keeps the first list offset (`proposer_slashings`)
+/// and the `signed_execution_payload_bid` offset.
+///
+/// Gloas: randao_reveal 96 + eth1_data 72 + graffiti 32, then 5 list offsets + sync_aggregate
+/// 160 + bls_to_execution_changes offset.
+/// Heze (experimental, EIP-8015): no `eth1_data`, no `deposits` offset. The bid gains
+/// `inclusion_list_bits` (EIP-7805) after the fields read here.
+const fn body_offsets(layout: BodyLayout) -> (usize, usize) {
+    match layout {
+        BodyLayout::Gloas => (96 + 72 + 32, 96 + 72 + 32 + 5 * 4 + 160 + 4),
+        BodyLayout::Heze => (96 + 32, 96 + 32 + 4 * 4 + 160 + 4),
+    }
+}
 
 impl BlockInfo {
+    /// A block of the network this process follows (its layout from the block's slot).
     pub fn parse(b: &[u8]) -> Result<Self> {
+        Self::parse_with(b, |slot| crate::network::current().body_layout_at(slot))
+    }
+
+    pub fn parse_with(b: &[u8], layout: impl Fn(u64) -> BodyLayout) -> Result<Self> {
         let (msg, _) = signed(b, "SignedBeaconBlock")?;
         let v = var_fields(msg, 84, &[80], "BeaconBlock")?;
         let body = v[0];
+        let slot = u64_at(msg, 0);
         Ok(Self {
-            slot: u64_at(msg, 0),
+            slot,
             proposer_index: u64_at(msg, 8),
             parent_root: b256_at(msg, 16),
             state_root: b256_at(msg, 48),
-            bid: Self::bid(body).ok(),
+            bid: Self::bid(body, layout(slot)).ok(),
         })
     }
 
-    fn bid(body: &[u8]) -> Result<BidInfo> {
-        need(body, BODY_BID_OFFSET_POS + 8, "BeaconBlockBody")?;
-        let fixed = u32_at(body, 200); // first offset (proposer_slashings) == fixed length
-        if fixed < BODY_BID_OFFSET_POS + 8 || fixed > body.len() {
+    fn bid(body: &[u8], layout: BodyLayout) -> Result<BidInfo> {
+        let (first, bid_pos) = body_offsets(layout);
+        need(body, bid_pos + 8, "BeaconBlockBody")?;
+        let fixed = u32_at(body, first); // first offset (proposer_slashings) == fixed length
+        if fixed < bid_pos + 8 || fixed > body.len() {
             return Err(SszError::BadOffset("BeaconBlockBody"));
         }
-        let start = u32_at(body, BODY_BID_OFFSET_POS);
-        let end = u32_at(body, BODY_BID_OFFSET_POS + 4);
+        let start = u32_at(body, bid_pos);
+        let end = u32_at(body, bid_pos + 4);
         let end = if end >= start && end <= body.len() { end } else { body.len() };
         if start > end {
             return Err(SszError::BadOffset("signed_execution_payload_bid"));

@@ -268,6 +268,26 @@ pub fn bootstrap(b: &[u8], trusted_root: B256, cfg: &LcConfig) -> Result<(LcHead
     Ok((header, Committee { period: cfg.period(header.beacon.slot), pubkeys }))
 }
 
+/// The fork versions a network signs with: `(activation slot, version)`, ascending. Sync
+/// committee signatures use the version of the slot before the signature slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkVersions(pub Vec<(u64, [u8; 4])>);
+
+impl ForkVersions {
+    pub fn single(version: [u8; 4]) -> Self {
+        Self(vec![(0, version)])
+    }
+
+    pub fn at_slot(&self, slot: u64) -> [u8; 4] {
+        self.0.iter().rev().find(|(s, _)| slot >= *s).or(self.0.first()).map(|(_, v)| *v).unwrap_or_default()
+    }
+
+    /// `compute_fork_version(compute_epoch_at_slot(max(signature_slot, 1) - 1))`.
+    pub fn for_signature_slot(&self, signature_slot: u64) -> [u8; 4] {
+        self.at_slot(signature_slot.max(1) - 1)
+    }
+}
+
 fn signing_root(object_root: [u8; 32], fork_version: [u8; 4], gvr: [u8; 32]) -> [u8; 32] {
     let mut v = [0u8; 32];
     v[..4].copy_from_slice(&fork_version);
@@ -285,7 +305,7 @@ fn verify_sync_aggregate(
     attested: &BeaconHeader,
     agg: &[u8],
     signature_slot: u64,
-    fork_version: [u8; 4],
+    fv: &ForkVersions,
     min: usize,
 ) -> Result<usize, LcError> {
     let c = cs.for_signature_slot(signature_slot)?;
@@ -298,7 +318,7 @@ fn verify_sync_aggregate(
     }
     let apk = AggregatePublicKey::aggregate(&participants, false).map_err(|e| LcError::Bls(format!("{e:?}")))?;
     let sig = Signature::sig_validate(&agg[nbits..nbits + 96], true).map_err(|e| LcError::Bls(format!("{e:?}")))?;
-    let msg = signing_root(attested.root(), fork_version, cs.cfg.genesis_validators_root);
+    let msg = signing_root(attested.root(), fv.for_signature_slot(signature_slot), cs.cfg.genesis_validators_root);
     match sig.verify(true, &msg, BLS_DST, &[], &apk.to_public_key(), false) {
         blst::BLST_ERROR::BLST_SUCCESS => Ok(participants.len()),
         _ => Err(LcError::Signature),
@@ -310,7 +330,7 @@ pub const MIN_PARTICIPANTS: usize = SYNC_COMMITTEE_SIZE * 2 / 3 + 1;
 
 /// Verifies a `LightClientOptimisticUpdate`: returns the attested header (with its execution
 /// block hash proven) and how many members signed.
-pub fn optimistic_update(c: &Committees, b: &[u8], fork_version: [u8; 4]) -> Result<(LcHeader, usize), LcError> {
+pub fn optimistic_update(c: &Committees, b: &[u8], fv: &ForkVersions) -> Result<(LcHeader, usize), LcError> {
     let (want, agg_len) = (c.cfg.optimistic_update_len(), c.cfg.agg_len());
     if b.len() != want {
         return Err(LcError::Length(b.len(), want));
@@ -318,13 +338,13 @@ pub fn optimistic_update(c: &Committees, b: &[u8], fork_version: [u8; 4]) -> Res
     let attested = parse_header(&b[..HEADER_LEN])?;
     let agg = &b[HEADER_LEN..HEADER_LEN + agg_len];
     let signature_slot = u64::from_le_bytes(b[HEADER_LEN + agg_len..].try_into().unwrap());
-    let n = verify_sync_aggregate(c, &attested.beacon, agg, signature_slot, fork_version, c.cfg.min_participants())?;
+    let n = verify_sync_aggregate(c, &attested.beacon, agg, signature_slot, fv, c.cfg.min_participants())?;
     Ok((attested, n))
 }
 
 /// Verifies a `LightClientFinalityUpdate`: the attested header is signed, and its state commits
 /// to the finalized header. Returns `(attested, finalized)`.
-pub fn finality_update(c: &Committees, b: &[u8], fork_version: [u8; 4]) -> Result<(LcHeader, LcHeader), LcError> {
+pub fn finality_update(c: &Committees, b: &[u8], fv: &ForkVersions) -> Result<(LcHeader, LcHeader), LcError> {
     let (want, agg_len) = (c.cfg.finality_update_len(), c.cfg.agg_len());
     if b.len() != want {
         return Err(LcError::Length(b.len(), want));
@@ -338,7 +358,7 @@ pub fn finality_update(c: &Committees, b: &[u8], fork_version: [u8; 4]) -> Resul
     let o = 2 * HEADER_LEN + 32 * 9;
     let agg = &b[o..o + agg_len];
     let signature_slot = u64::from_le_bytes(b[o + agg_len..].try_into().unwrap());
-    verify_sync_aggregate(c, &attested.beacon, agg, signature_slot, fork_version, c.cfg.min_participants())?;
+    verify_sync_aggregate(c, &attested.beacon, agg, signature_slot, fv, c.cfg.min_participants())?;
     Ok((attested, finalized))
 }
 
@@ -355,7 +375,7 @@ pub struct FullUpdate {
 /// Verifies a `LightClientUpdate` (from `LightClientUpdatesByRange`): signed by the committee for
 /// its signature slot; the next sync committee and the finalized header proven against the
 /// attested state root.
-pub fn full_update(cs: &Committees, b: &[u8], fork_version: [u8; 4]) -> Result<FullUpdate, LcError> {
+pub fn full_update(cs: &Committees, b: &[u8], fv: &ForkVersions) -> Result<FullUpdate, LcError> {
     let (want, agg_len, committee_len) = (cs.cfg.update_len(), cs.cfg.agg_len(), cs.cfg.committee_len());
     if b.len() != want {
         return Err(LcError::Length(b.len(), want));
@@ -384,7 +404,7 @@ pub fn full_update(cs: &Committees, b: &[u8], fork_version: [u8; 4]) -> Result<F
     };
     let agg = &b[o..o + agg_len];
     let signature_slot = u64::from_le_bytes(b[o + agg_len..].try_into().unwrap());
-    verify_sync_aggregate(cs, &attested.beacon, agg, signature_slot, fork_version, cs.cfg.min_participants())?;
+    verify_sync_aggregate(cs, &attested.beacon, agg, signature_slot, fv, cs.cfg.min_participants())?;
     let attested_period = cs.cfg.period(attested.beacon.slot);
     let next = (attested_period == cs.current.period).then(|| Committee { period: attested_period + 1, pubkeys: next_keys });
     Ok(FullUpdate { attested, finalized, next })
@@ -410,10 +430,10 @@ pub struct Applied {
 /// in the next period rotates it to current, after which the same update's next committee is
 /// for the new current period. This lets a client that bootstrapped periods ago catch up to the
 /// live period, instead of holding P / P+1 while the network signs with P+2's committee.
-pub fn apply_updates(cs: &mut Committees, updates: &[Vec<u8>], fork_version: [u8; 4]) -> Applied {
+pub fn apply_updates(cs: &mut Committees, updates: &[Vec<u8>], fv: &ForkVersions) -> Applied {
     let mut out = Applied::default();
     for u in updates {
-        let up = match full_update(cs, u, fork_version) {
+        let up = match full_update(cs, u, fv) {
             Ok(up) => up,
             Err(e) => {
                 out.stopped = Some(e);
@@ -428,7 +448,7 @@ pub fn apply_updates(cs: &mut Committees, updates: &[Vec<u8>], fork_version: [u8
                 out.rotations += 1;
                 // The update's committee (proven against its attested state) is the next one now.
                 if cs.next.is_none()
-                    && let Ok(again) = full_update(cs, u, fork_version)
+                    && let Ok(again) = full_update(cs, u, fv)
                 {
                     cs.next = again.next;
                 }
@@ -454,6 +474,10 @@ pub mod testkit {
     pub use blst::min_pk::{AggregateSignature, SecretKey};
 
     pub const FV: [u8; 4] = [0x90, 0, 0, 0x76];
+
+    pub fn fv() -> ForkVersions {
+        ForkVersions::single(FV)
+    }
 
     /// The root `verify_branch` folds `leaf` and `branch` into for `gindex`.
     pub fn fold(leaf: [u8; 32], branch: &[[u8; 32]], gindex: u64) -> [u8; 32] {
@@ -645,6 +669,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sync_committee_signatures_use_the_fork_version_of_the_slot_before() {
+        let heze = [8, 0, 0, 0];
+        let fv = testkit::FV;
+        let f = ForkVersions(vec![(64, fv), (128, heze)]);
+        assert_eq!(f.for_signature_slot(128), fv, "signed at the first Heze slot: over the last Gloas slot");
+        assert_eq!(f.for_signature_slot(129), heze);
+        assert_eq!(f.for_signature_slot(0), fv, "before the first entry: the first version");
+        assert_eq!(ForkVersions::single(fv).for_signature_slot(1 << 40), fv);
+    }
+
+    #[test]
     fn branch_roundtrip_and_tamper() {
         // Build a depth-3 tree and prove leaf 5 (gindex 8 + 5 = 13).
         let leaves: Vec<[u8; 32]> = (0..8u8).map(|i| [i; 32]).collect();
@@ -683,12 +718,12 @@ mod tests {
         let mut agg_bytes = vec![0u8; SYNC_AGGREGATE_LEN];
         agg_bytes[0] = 0b111;
         agg_bytes[64..].copy_from_slice(&agg.to_bytes());
-        assert_eq!(verify_sync_aggregate(&c, &header, &agg_bytes, 101, fv, 3), Ok(3));
+        assert_eq!(verify_sync_aggregate(&c, &header, &agg_bytes, 101, &ForkVersions::single(fv), 3), Ok(3));
         // Wrong header, wrong fork version, too few signers: all rejected.
         let other = BeaconHeader { slot: 101, ..header };
-        assert_eq!(verify_sync_aggregate(&c, &other, &agg_bytes, 101, fv, 3), Err(LcError::Signature));
-        assert_eq!(verify_sync_aggregate(&c, &header, &agg_bytes, 101, [9, 9, 9, 9], 3), Err(LcError::Signature));
-        assert_eq!(verify_sync_aggregate(&c, &header, &agg_bytes, 101, fv, 4), Err(LcError::Participation(3, 4)));
+        assert_eq!(verify_sync_aggregate(&c, &other, &agg_bytes, 101, &ForkVersions::single(fv), 3), Err(LcError::Signature));
+        assert_eq!(verify_sync_aggregate(&c, &header, &agg_bytes, 101, &ForkVersions::single([9, 9, 9, 9]), 3), Err(LcError::Signature));
+        assert_eq!(verify_sync_aggregate(&c, &header, &agg_bytes, 101, &ForkVersions::single(fv), 4), Err(LcError::Participation(3, 4)));
     }
 
     // ---- Committee rollover (generated fixtures: `testkit`) ------------------------------------
@@ -701,24 +736,24 @@ mod tests {
         let mut cs = bootstrapped(&a);
         // Before the next committee is known, an update signed at the first slot of P + 1 is
         // rejected (it can't be checked), not misattributed to P's committee.
-        assert_eq!(optimistic_update(&cs, &optimistic(&bk, BOUNDARY - 1, BOUNDARY), FV).err(), Some(LcError::Period(P + 1, Some(P))));
+        assert_eq!(optimistic_update(&cs, &optimistic(&bk, BOUNDARY - 1, BOUNDARY), &fv()).err(), Some(LcError::Period(P + 1, Some(P))));
         // P's committee authenticates P + 1's.
-        let up = full_update(&cs, &update(&a, &bk, BOUNDARY - 50, BOUNDARY - 49, false), FV).unwrap();
+        let up = full_update(&cs, &update(&a, &bk, BOUNDARY - 50, BOUNDARY - 49, false), &fv()).unwrap();
         let next = up.next.expect("next committee learned");
         assert_eq!(next.period, P + 1);
         cs.next = Some(next);
         // The last slot of P is signed by P's committee ...
-        assert!(optimistic_update(&cs, &optimistic(&a, BOUNDARY - 2, BOUNDARY - 1), FV).is_ok());
+        assert!(optimistic_update(&cs, &optimistic(&a, BOUNDARY - 2, BOUNDARY - 1), &fv()).is_ok());
         // ... and the very first slot of P + 1 by P + 1's (the old code used signature_slot - 1
         // and checked it against P's committee).
-        assert!(optimistic_update(&cs, &optimistic(&bk, BOUNDARY - 1, BOUNDARY), FV).is_ok());
-        assert_eq!(optimistic_update(&cs, &optimistic(&a, BOUNDARY - 1, BOUNDARY), FV).err(), Some(LcError::Signature));
+        assert!(optimistic_update(&cs, &optimistic(&bk, BOUNDARY - 1, BOUNDARY), &fv()).is_ok());
+        assert_eq!(optimistic_update(&cs, &optimistic(&a, BOUNDARY - 1, BOUNDARY), &fv()).err(), Some(LcError::Signature));
         // Finality in P + 1 rotates: P + 1 is current, P's committee no longer signs anything.
         assert!(!cs.advance(BOUNDARY - 10));
         assert!(cs.advance(BOUNDARY + 5));
         assert_eq!((cs.current.period, cs.next.is_none()), (P + 1, true));
-        assert!(optimistic_update(&cs, &optimistic(&bk, BOUNDARY + 10, BOUNDARY + 11), FV).is_ok());
-        assert_eq!(optimistic_update(&cs, &optimistic(&a, BOUNDARY - 2, BOUNDARY - 1), FV).err(), Some(LcError::Period(P, Some(P + 1))));
+        assert!(optimistic_update(&cs, &optimistic(&bk, BOUNDARY + 10, BOUNDARY + 11), &fv()).is_ok());
+        assert_eq!(optimistic_update(&cs, &optimistic(&a, BOUNDARY - 2, BOUNDARY - 1), &fv()).err(), Some(LcError::Period(P, Some(P + 1))));
     }
 
     #[test]
@@ -726,11 +761,11 @@ mod tests {
         let (a, bk) = (key(1), key(2));
         let cs = bootstrapped(&a);
         // A next committee that isn't in the attested state is rejected.
-        assert_eq!(full_update(&cs, &update(&a, &bk, BOUNDARY - 50, BOUNDARY - 49, true), FV).err(), Some(LcError::Branch("next_sync_committee")));
+        assert_eq!(full_update(&cs, &update(&a, &bk, BOUNDARY - 50, BOUNDARY - 49, true), &fv()).err(), Some(LcError::Branch("next_sync_committee")));
         // Signed by a committee skim doesn't hold: rejected.
-        assert_eq!(full_update(&cs, &update(&bk, &bk, BOUNDARY - 50, BOUNDARY - 49, false), FV).err(), Some(LcError::Signature));
+        assert_eq!(full_update(&cs, &update(&bk, &bk, BOUNDARY - 50, BOUNDARY - 49, false), &fv()).err(), Some(LcError::Signature));
         // An attested header from an earlier period doesn't say what comes after P.
-        let up = full_update(&cs, &update(&a, &bk, BOUNDARY - SLOTS_PER_PERIOD - 10, BOUNDARY - 49, false), FV).unwrap();
+        let up = full_update(&cs, &update(&a, &bk, BOUNDARY - SLOTS_PER_PERIOD - 10, BOUNDARY - 49, false), &fv()).unwrap();
         assert!(up.next.is_none());
     }
 
@@ -745,21 +780,21 @@ mod tests {
         let p1 = BOUNDARY; // first slot of P + 1
         let p2 = BOUNDARY + SLOTS_PER_PERIOD;
         let live = optimistic(&c, p2 + 100, p2 + 101); // signed by P + 2's committee
-        assert!(optimistic_update(&cs, &live, FV).is_err());
+        assert!(optimistic_update(&cs, &live, &fv()).is_err());
         // LightClientUpdatesByRange(P, 3): one update per period, in order.
         let updates = vec![
             update_with_finality(&a, &b, p1 - 200, p1 - 300, p1 - 199), // P: teaches P + 1
             update_with_finality(&b, &c, p2 - 200, p2 - 300, p2 - 199), // P + 1: finality in P + 1, teaches P + 2
             update_with_finality(&c, &d, p2 + 50, p2 + 10, p2 + 51),    // P + 2: finality in P + 2, teaches P + 3
         ];
-        let r = apply_updates(&mut cs, &updates, FV);
+        let r = apply_updates(&mut cs, &updates, &fv());
         assert!(r.stopped.is_none(), "{:?}", r.stopped);
         assert_eq!((r.applied, r.rotations), (3, 2));
         assert_eq!(cs.current.period, P + 2);
         assert_eq!(cs.next.as_ref().map(|n| n.period), Some(P + 3));
         assert_eq!(r.finalized.map(|f| f.beacon.slot), Some(p2 + 10));
         // Live gossip from P + 2 verifies now.
-        assert!(optimistic_update(&cs, &live, FV).is_ok());
+        assert!(optimistic_update(&cs, &live, &fv()).is_ok());
     }
 
     #[test]
@@ -769,7 +804,7 @@ mod tests {
         let p2 = BOUNDARY + SLOTS_PER_PERIOD;
         // The update for P is missing: P + 1's update can't be checked (its committee is unknown).
         let updates = vec![update_with_finality(&b, &c, p2 - 200, p2 - 300, p2 - 199)];
-        let r = apply_updates(&mut cs, &updates, FV);
+        let r = apply_updates(&mut cs, &updates, &fv());
         assert_eq!(r.applied, 0);
         assert!(matches!(r.stopped, Some(LcError::Period(..))));
         assert_eq!((cs.current.period, cs.next.is_none()), (P, true));
@@ -786,13 +821,13 @@ mod tests {
         let mut cs = bootstrapped_with(&a, &MINIMAL);
         let edge = boundary(&MINIMAL);
         // Signed by a supermajority of 32 (22 members).
-        let (h, n) = optimistic_update(&cs, &optimistic_with(&a, edge - 3, edge - 2, &MINIMAL), FV).unwrap();
+        let (h, n) = optimistic_update(&cs, &optimistic_with(&a, edge - 3, edge - 2, &MINIMAL), &fv()).unwrap();
         assert_eq!((h.beacon.slot, n), (edge - 3, MINIMAL.min_participants()));
         assert_eq!(MINIMAL.min_participants(), 22);
         // The next committee, learned in period P, signs period P + 1 (64 slots later).
-        let up = full_update(&cs, &update_with(&a, &b, edge - 4, edge - 3, false, &MINIMAL), FV).unwrap();
+        let up = full_update(&cs, &update_with(&a, &b, edge - 4, edge - 3, false, &MINIMAL), &fv()).unwrap();
         cs.next = up.next;
-        assert!(optimistic_update(&cs, &optimistic_with(&b, edge + 1, edge + 2, &MINIMAL), FV).is_ok());
+        assert!(optimistic_update(&cs, &optimistic_with(&b, edge + 1, edge + 2, &MINIMAL), &fv()).is_ok());
         assert!(cs.advance(edge + 10));
         assert_eq!(cs.current.period, P + 1);
     }
@@ -805,9 +840,9 @@ mod tests {
         let edge = boundary(&MINIMAL);
         // A mainnet-sized update can't be read as a minimal one.
         let mainnet = optimistic(&a, edge - 3, edge - 2);
-        assert!(matches!(optimistic_update(&cs, &mainnet, FV), Err(LcError::Length(..))));
+        assert!(matches!(optimistic_update(&cs, &mainnet, &fv()), Err(LcError::Length(..))));
         // Signed over Sepolia's validators root: wrong domain for this chain.
         let other_chain = LcConfig { genesis_validators_root: SEPOLIA_GENESIS_VALIDATORS_ROOT, ..MINIMAL };
-        assert_eq!(optimistic_update(&cs, &optimistic_with(&a, edge - 3, edge - 2, &other_chain), FV), Err(LcError::Signature));
+        assert_eq!(optimistic_update(&cs, &optimistic_with(&a, edge - 3, edge - 2, &other_chain), &fv()), Err(LcError::Signature));
     }
 }

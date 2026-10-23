@@ -739,6 +739,9 @@ impl ChainData {
         if tx.is_eip4844() {
             return Err(DataError::Invalid("blob transactions are not supported (no sidecar gossip)".into()));
         }
+        if tx.as_frame().is_some() {
+            return Err(DataError::Invalid("EIP-8141 frame transactions can't be sent through skim yet: it can't check their validation frames before gossiping them".into()));
+        }
         if tx.chain_id().is_some_and(|c| c != self.chain_id) {
             return Err(DataError::Invalid(format!("wrong chain id {:?}", tx.chain_id())));
         }
@@ -1317,17 +1320,41 @@ impl ChainData {
             .enumerate()
             .map(|(k, l)| Self::log_json(l, bh, n, h.timestamp, hash, i as u32, first_log + k as u64))
             .collect();
-        let contract = tx.to().is_none().then(|| from.create(tx.nonce()));
-        Ok(json!({
+        // A frame transaction has no single `to` or creation; its frames have their own targets.
+        let to = if tx.as_frame().is_some() { None } else { tx.to() };
+        let contract = (tx.as_frame().is_none() && tx.to().is_none()).then(|| from.create(tx.nonce()));
+        let mut v = json!({
             "transactionHash": hash, "transactionIndex": format!("{i:#x}"),
             "blockHash": bh, "blockNumber": format!("{n:#x}"),
-            "from": from, "to": tx.to(), "contractAddress": contract,
+            "from": from, "to": to, "contractAddress": contract,
             "cumulativeGasUsed": format!("{:#x}", r.cumulative_gas_used),
             "gasUsed": format!("{:#x}", r.cumulative_gas_used - prev),
             "effectiveGasPrice": format!("{:#x}", tx.effective_gas_price(h.base_fee_per_gas)),
             "logs": logs, "logsBloom": r.bloom(),
             "type": format!("{:#x}", tx.ty()), "status": if r.success { "0x1" } else { "0x0" },
-        }))
+        });
+        // EIP-8141: who paid, and each frame's outcome with its own logs (as Hegota clients show it).
+        if let Some(f) = &r.frame {
+            let mut at = 0usize;
+            let frames: Vec<Value> = f
+                .frames
+                .iter()
+                .map(|fr| {
+                    let mine = &logs[at.min(logs.len())..(at + fr.logs).min(logs.len())];
+                    at += fr.logs;
+                    json!({
+                        "status": format!("{:#x}", fr.status),
+                        "gasUsed": format!("{:#x}", fr.execution_gas + fr.state_gas),
+                        "executionGasUsed": format!("{:#x}", fr.execution_gas),
+                        "stateGasUsed": format!("{:#x}", fr.state_gas),
+                        "logs": mine,
+                    })
+                })
+                .collect();
+            v["payer"] = json!(f.payer);
+            v["frameReceipts"] = Value::Array(frames);
+        }
+        Ok(v)
     }
 
     /// `eth_getBlockReceipts`: every receipt of a block (verified against `receiptsRoot`).
@@ -1857,7 +1884,7 @@ mod tests {
     fn legacy_tx(nonce: u64, to: Address) -> SignedTx {
         use alloy_consensus::{Signed, TxLegacy};
         let tx = TxLegacy { nonce, to: alloy_primitives::TxKind::Call(to), gas_limit: 21000, ..Default::default() };
-        SignedTx::Legacy(Signed::new_unhashed(tx, alloy_primitives::Signature::test_signature()))
+        SignedTx::Eth(skim_el::frame::EthTx::Legacy(Signed::new_unhashed(tx, alloy_primitives::Signature::test_signature())))
     }
 
     /// A block of legacy transactions (dummy signatures: decoded, never recovered), its header

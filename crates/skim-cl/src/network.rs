@@ -35,8 +35,29 @@ impl Preset {
     }
 }
 
-/// A consensus network skim can follow. skim follows only Gloas (Glamsterdam) blocks, so the
-/// network is described at its Gloas fork.
+/// A consensus fork after Gloas: when it activates and its fork version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fork {
+    pub epoch: u64,
+    pub version: [u8; 4],
+}
+
+/// The `BeaconBlockBody` layout skim reads the payload bid from (see [`crate::ssz::BlockInfo`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyLayout {
+    Gloas,
+    /// Experimental: Heze as consensus-specs drafts it (2026-10), without `eth1_data` and
+    /// `deposits` (EIP-8015). See `docs/guide/hegota.md`.
+    Heze,
+}
+
+/// The consensus forks skim implements: everything up to Gloas, and Heze (experimental).
+const KNOWN_FORKS: [&str; 8] = ["ALTAIR", "BELLATRIX", "CAPELLA", "DENEB", "ELECTRA", "FULU", "GLOAS", "HEZE"];
+
+pub use crate::node::FAR_FUTURE_EPOCH;
+
+/// A consensus network skim can follow. skim follows only Gloas (Glamsterdam) blocks and later,
+/// so the network is described from its Gloas fork on.
 #[derive(Debug, Clone)]
 pub struct ClNetwork {
     pub name: String,
@@ -52,6 +73,14 @@ pub struct ClNetwork {
     pub electra_fork_epoch: u64,
     pub electra_max_blobs: u64,
     pub bootnodes: Vec<String>,
+    /// Heze (Hegota's consensus half), if the config schedules it.
+    pub heze: Option<Fork>,
+    /// Follow Heze with skim's experimental support (`--experimental-hegota`). Off: Heze is an
+    /// unsupported fork, and skim stops at it ([`Self::unsupported_fork`]).
+    pub experimental_hegota: bool,
+    /// Scheduled forks skim doesn't implement at all (`*_FORK_EPOCH` keys it doesn't know), and
+    /// fork parameters it can't follow (a slot duration that changes at Heze).
+    pub unknown_forks: Vec<(String, u64)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -166,6 +195,31 @@ impl ClNetwork {
             Some(t) => t,
             None => num("MIN_GENESIS_TIME")? + get("GENESIS_DELAY").and_then(|v| v.parse().ok()).unwrap_or(0),
         };
+        let scheduled = |k: &str| get(k).and_then(|v| v.parse::<u64>().ok()).filter(|e| *e != FAR_FUTURE_EPOCH);
+        let heze = match scheduled("HEZE_FORK_EPOCH") {
+            Some(epoch) => Some(Fork {
+                epoch,
+                version: get("HEZE_FORK_VERSION").and_then(parse_hex4).ok_or_else(|| NetworkError::Config("HEZE_FORK_VERSION missing or not 4 hex bytes".into()))?,
+            }),
+            None => None,
+        };
+        // Forks skim has never heard of (`FOO_FORK_EPOCH`, or devnet feature forks like
+        // `EIP7805_FORK_EPOCH`) that are scheduled: skim can't follow past them.
+        let mut unknown_forks: Vec<(String, u64)> = kv
+            .iter()
+            .filter_map(|(k, _)| Some((k.strip_suffix("_FORK_EPOCH")?, k)))
+            .filter(|(name, _)| !KNOWN_FORKS.contains(name))
+            .filter_map(|(name, k)| Some((name.to_lowercase(), scheduled(k)?)))
+            .collect();
+        // skim's slot clock has one slot duration. A fork that changes it (an older Heze draft;
+        // EIP-8198) is not followable yet.
+        if let Some(h) = heze
+            && let Some(ms) = get("SLOT_DURATION_MS_HEZE").and_then(|v| v.parse::<u64>().ok())
+            && ms != slot_ms
+        {
+            unknown_forks.push((format!("heze slot duration {ms} ms"), h.epoch));
+        }
+        unknown_forks.sort_by_key(|(_, e)| *e);
         Ok(Self {
             name: name.to_string(),
             preset,
@@ -178,7 +232,62 @@ impl ClNetwork {
             electra_fork_epoch: get("ELECTRA_FORK_EPOCH").and_then(|v| v.parse().ok()).unwrap_or(0),
             electra_max_blobs: get("MAX_BLOBS_PER_BLOCK_ELECTRA").and_then(|v| v.parse().ok()).unwrap_or(9),
             bootnodes,
+            heze,
+            experimental_hegota: false,
+            unknown_forks,
         })
+    }
+
+    /// Unix time an epoch starts.
+    pub fn epoch_time(&self, epoch: u64) -> u64 {
+        self.genesis_time + epoch.saturating_mul(self.preset.slots_per_epoch * self.slot_ms / 1000)
+    }
+
+    /// Heze, if scheduled and followed (experimental Hegota support is on).
+    pub fn followed_heze(&self) -> Option<Fork> {
+        self.heze.filter(|_| self.experimental_hegota)
+    }
+
+    /// The first scheduled fork skim won't follow: `(name, epoch)`. skim stops applying blocks
+    /// there instead of serving state under rules it doesn't implement.
+    pub fn unsupported_fork(&self) -> Option<(String, u64)> {
+        let heze = self.heze.filter(|_| !self.experimental_hegota).map(|h| ("heze".to_string(), h.epoch));
+        heze.into_iter().chain(self.unknown_forks.iter().cloned()).min_by_key(|(_, e)| *e)
+    }
+
+    /// The fork version in force at `epoch` (Gloas, or Heze when followed).
+    pub fn fork_version_at(&self, epoch: u64) -> [u8; 4] {
+        match self.followed_heze() {
+            Some(h) if epoch >= h.epoch => h.version,
+            _ => self.gloas_fork_version,
+        }
+    }
+
+    /// The fork versions skim signs and verifies with: `(activation slot, version)`, ascending.
+    pub fn fork_versions(&self) -> crate::light::ForkVersions {
+        let spe = self.preset.slots_per_epoch;
+        let mut v = vec![(self.gloas_fork_epoch.saturating_mul(spe), self.gloas_fork_version)];
+        if let Some(h) = self.followed_heze() {
+            v.push((h.epoch.saturating_mul(spe), h.version));
+        }
+        crate::light::ForkVersions(v)
+    }
+
+    /// The next fork after `epoch` the ENR advertises (`ENRForkID.next_fork_version/epoch`):
+    /// the current version and `FAR_FUTURE_EPOCH` when none is scheduled.
+    pub fn next_fork(&self, epoch: u64) -> ([u8; 4], u64) {
+        match self.followed_heze() {
+            Some(h) if epoch < h.epoch => (h.version, h.epoch),
+            _ => (self.fork_version_at(epoch), FAR_FUTURE_EPOCH),
+        }
+    }
+
+    /// Where `BeaconBlockBody` keeps the payload bid at `slot`.
+    pub fn body_layout_at(&self, slot: u64) -> BodyLayout {
+        match self.followed_heze() {
+            Some(h) if self.epoch_of(slot) >= h.epoch => BodyLayout::Heze,
+            _ => BodyLayout::Gloas,
+        }
     }
 
     pub fn seconds_per_slot(&self) -> u64 {
@@ -201,11 +310,11 @@ impl ClNetwork {
     }
 
     /// The gossip fork digest at `epoch` (Fulu's `compute_fork_digest`: the fork data root XOR
-    /// the hash of the blob parameters in force), for the Gloas fork version.
+    /// the hash of the blob parameters in force), for the fork version in force then.
     pub fn fork_digest_at(&self, epoch: u64) -> [u8; 4] {
         use sha2::{Digest, Sha256};
         let mut v = [0u8; 32];
-        v[..4].copy_from_slice(&self.gloas_fork_version);
+        v[..4].copy_from_slice(&self.fork_version_at(epoch));
         let base: [u8; 32] = Sha256::new().chain_update(v).chain_update(self.genesis_validators_root).finalize().into();
         let (e, m) = self.blob_parameters(epoch);
         let h: [u8; 32] = Sha256::new().chain_update(e.to_le_bytes()).chain_update(m.to_le_bytes()).finalize().into();
@@ -217,10 +326,12 @@ impl ClNetwork {
     }
 
     /// Every digest skim may see on this network: `(activation epoch, digest)` from the Gloas
-    /// fork on, one more for each blob-parameter fork after it. Ascending.
+    /// fork on, one more for each blob-parameter fork after it and for Heze when followed.
+    /// Ascending.
     pub fn digest_schedule(&self) -> Vec<(u64, [u8; 4])> {
         let mut epochs: Vec<u64> = std::iter::once(self.gloas_fork_epoch)
             .chain(self.blob_schedule.iter().map(|(e, _)| *e).filter(|e| *e > self.gloas_fork_epoch))
+            .chain(self.followed_heze().map(|h| h.epoch))
             .collect();
         epochs.sort();
         epochs.dedup();
@@ -343,6 +454,47 @@ mod tests {
         assert_eq!(s[1].1, n.fork_digest_at(15));
         // Sepolia: its blob-parameter forks were before Gloas, so one digest.
         assert_eq!(ClNetwork::sepolia().digest_schedule().len(), 1);
+    }
+
+    const HEZE_DEVNET: &str = "PRESET_BASE: 'minimal'\nMIN_GENESIS_TIME: 0\nGLOAS_FORK_VERSION: 0x80000038\nGLOAS_FORK_EPOCH: 4\nHEZE_FORK_VERSION: 0x90000038\nHEZE_FORK_EPOCH: 12\nSLOT_DURATION_MS: 6000\nEIP7441_FORK_EPOCH: 18446744073709551615\nBLOB_SCHEDULE:\n  - EPOCH: 0\n    MAX_BLOBS_PER_BLOCK: 9\n";
+
+    #[test]
+    fn heze_is_a_stop_unless_experimental_hegota_is_on() {
+        let mut n = ClNetwork::from_config("devnet", HEZE_DEVNET, [1; 32], Some(0), vec![]).unwrap();
+        assert_eq!(n.heze, Some(Fork { epoch: 12, version: [0x90, 0, 0, 0x38] }));
+        assert!(n.unknown_forks.is_empty(), "a far-future feature fork is not scheduled");
+        // Off (the default): Heze is where skim stops; nothing about it is followed.
+        assert_eq!(n.unsupported_fork(), Some(("heze".into(), 12)));
+        assert_eq!(n.digest_schedule().len(), 1);
+        assert_eq!(n.next_fork(5), ([0x80, 0, 0, 0x38], FAR_FUTURE_EPOCH));
+        assert_eq!(n.body_layout_at(12 * 8), BodyLayout::Gloas);
+        // On: a digest, ENR next fork, signing version and body layout for Heze.
+        n.experimental_hegota = true;
+        assert_eq!(n.unsupported_fork(), None);
+        let s = n.digest_schedule();
+        assert_eq!(s.iter().map(|(e, _)| *e).collect::<Vec<_>>(), vec![4, 12]);
+        assert_ne!(s[0].1, s[1].1, "a new fork version, a new digest");
+        assert_eq!(n.next_fork(5), ([0x90, 0, 0, 0x38], 12));
+        assert_eq!(n.next_fork(12), ([0x90, 0, 0, 0x38], FAR_FUTURE_EPOCH));
+        assert_eq!((n.body_layout_at(12 * 8 - 1), n.body_layout_at(12 * 8)), (BodyLayout::Gloas, BodyLayout::Heze));
+        assert_eq!(n.fork_versions().for_signature_slot(12 * 8 + 1), [0x90, 0, 0, 0x38]);
+        assert_eq!(n.epoch_time(12), 12 * 8 * 6);
+    }
+
+    #[test]
+    fn forks_skim_does_not_know_are_stops_even_with_experimental_hegota() {
+        let cfg = format!("{HEZE_DEVNET}FOO_FORK_VERSION: 0x0a000000\nFOO_FORK_EPOCH: 20\nEIP8198_FORK_EPOCH: 16\n");
+        let mut n = ClNetwork::from_config("devnet", &cfg, [1; 32], Some(0), vec![]).unwrap();
+        n.experimental_hegota = true;
+        assert_eq!(n.unknown_forks, vec![("eip8198".into(), 16), ("foo".into(), 20)]);
+        assert_eq!(n.unsupported_fork(), Some(("eip8198".into(), 16)), "the earliest one");
+        // A Heze that changes the slot duration can't be followed by skim's slot clock.
+        let cfg = format!("{HEZE_DEVNET}SLOT_DURATION_MS_HEZE: 4000\n");
+        let mut n = ClNetwork::from_config("devnet", &cfg, [1; 32], Some(0), vec![]).unwrap();
+        n.experimental_hegota = true;
+        assert_eq!(n.unsupported_fork(), Some(("heze slot duration 4000 ms".into(), 12)));
+        // The published Sepolia and Hoodi configs schedule nothing after Gloas.
+        assert_eq!((ClNetwork::sepolia().unsupported_fork(), ClNetwork::hoodi().unsupported_fork()), (None, None));
     }
 
     #[test]

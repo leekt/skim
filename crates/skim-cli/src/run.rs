@@ -47,6 +47,12 @@ pub struct Args {
     /// `genesis.json` (with `amsterdamTime`) and optionally `enodes.txt`.
     #[arg(long, default_value = "sepolia")]
     network: String,
+    /// Follow Hegota (Heze + Bogotá) when the network schedules it, under assumptions that will
+    /// change with its spec: Glamsterdam's EVM rules, the draft Heze block layout, EIP-8141 frame
+    /// transactions decoded but not executed (docs/guide/hegota.md). Off: skim stops applying
+    /// blocks at Hegota.
+    #[arg(long)]
+    experimental_hegota: bool,
     /// Extra EL bootnodes (`enode://…`), for networks without a DNS tree or `enodes.txt`.
     #[arg(long = "el-bootnode")]
     el_bootnode: Vec<String>,
@@ -283,7 +289,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     }
     // Which network: everything chain-specific (chain id, fork schedule, preset, bootnodes,
     // genesis) comes from here.
-    let (cl_net, el_net) = if let Some(cl) = skim_cl::network::ClNetwork::built_in(&args.network) {
+    let (mut cl_net, el_net) = if let Some(cl) = skim_cl::network::ClNetwork::built_in(&args.network) {
         let mut el = if args.network == "hoodi" { skim_el::ElNetwork::hoodi() } else { skim_el::ElNetwork::sepolia() };
         for b in &args.el_bootnode {
             el.bootnodes.push(b.parse().map_err(|e| anyhow::anyhow!("--el-bootnode {b}: {e}"))?);
@@ -299,9 +305,24 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     tracing::info!(network = %cl_net.name, chain_id = el_net.chain_id(), preset = cl_net.preset.name, slot_ms = cl_net.slot_ms,
         gloas_epoch = cl_net.gloas_fork_epoch, cl_bootnodes = cl_net.bootnodes.len(), el_bootnodes = el_net.bootnodes.len(), "network");
     skim_sim::env::set_chain_id(el_net.chain_id());
+    cl_net.experimental_hegota = args.experimental_hegota;
+    let forks = crate::forks::ForkPlan::new(&cl_net, &el_net, args.experimental_hegota);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    if let Some(m) = &forks.hegota_mismatch {
+        tracing::warn!(network = %cl_net.name, "Hegota's halves activate at different times: {m}");
+    }
+    if let Some((fork, at)) = &forks.stop {
+        let hint = if forks.hegota.is_some_and(|(t, on)| !on && t == *at) { " (--experimental-hegota follows Hegota under assumptions; docs/guide/hegota.md)" } else { "" };
+        anyhow::ensure!(now < *at, "{fork} activated on {} at {at}: skim doesn't implement it, so it can't follow this network{hint}", cl_net.name);
+        tracing::warn!(network = %cl_net.name, %fork, at, in_hours = (at - now) / 3600,
+            "a scheduled fork skim doesn't implement: skim applies no block from it on (state reads answer with the last block before it){hint}");
+    }
+    if let Some((at, true)) = forks.hegota {
+        tracing::warn!(network = %cl_net.name, at, "experimental Hegota support: Heze blocks per the 2026-10 draft, Bogotá executed with Glamsterdam's EVM rules, frame transactions decoded but not executed; answers after the fork rest on these assumptions (docs/guide/hegota.md)");
+    }
+    crate::forks::set(forks.clone());
     skim_cl::network::set_current(cl_net.clone());
     let checkpoint_url = args.checkpoint_url.clone().or_else(|| cl_net.default_checkpoint_url().map(str::to_string));
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
     if now < cl_net.gloas_time() {
         let left = cl_net.gloas_time() - now;
         tracing::warn!(network = %cl_net.name, gloas_epoch = cl_net.gloas_fork_epoch, in_hours = left / 3600,
@@ -327,6 +348,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let net = ElNet::start_with(&el_net, args.el_port, args.trusted_peer.clone(), false, node_key, mempool_tx)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // A network from a directory is usually a devnet whose `enodes.txt` lists its own clients,
+    // and devnet clients may not answer discovery (bogota-devnet-1's don't): dial them directly.
+    if skim_cl::network::ClNetwork::built_in(&args.network).is_none() && !el_net.bootnodes.is_empty() {
+        let direct: Vec<_> = el_net.bootnodes.iter().map(|n| (n.id, std::net::SocketAddr::new(n.address, n.tcp_port))).collect();
+        tracing::info!(n = direct.len(), "dialing the network's listed EL nodes directly");
+        net.add_peers(&direct);
+    }
     let saved = match &persist {
         Some(p) => {
             let known = crate::persist::load_peers(p);
@@ -414,6 +442,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     }
     let mut ncfg = NodeConfig::from_network(&cl_net, args.cl_port);
     ncfg.explicit_peers.extend(args.cl_peer.iter().cloned());
+    // As for its EL nodes: a devnet's listed consensus nodes are dialed directly, so it's
+    // followed even when they don't answer discovery from this address.
+    if skim_cl::network::ClNetwork::built_in(&args.network).is_none() {
+        let direct: Vec<_> = cl_net.bootnodes.iter().filter_map(|e| skim_cl::node::enr_tcp_multiaddr(e)).collect();
+        tracing::info!(n = direct.len(), "dialing the network's listed consensus nodes directly");
+        ncfg.explicit_peers.extend(direct);
+    }
     ncfg.mesh_n = args.cl_mesh;
     ncfg.target_peers = args.cl_peers;
     ncfg.max_peers = args.cl_peers + args.cl_peers / 4;
@@ -522,6 +557,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     tracing::info!(network = %cl_net.name, "following the chain from CL gossip; RPC answers once the first block is applied");
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut stop_logged = false;
     loop {
         let ev = tokio::select! {
             ev = rx.recv() => match ev { Some(ev) => ev, None => break },
@@ -541,6 +577,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         let v = verify::verify_payload(&env);
         if !v.ok {
             tracing::warn!(number = env.payload.block_number, "payload hash mismatch; ignored");
+            continue;
+        }
+        if let Some(fork) = forks.stops(v.header.timestamp) {
+            if !stop_logged {
+                stop_logged = true;
+                tracing::error!(number = v.header.number, fork, "reached a fork skim doesn't implement: no block from here on is applied; state answers stay at the last block before it");
+            }
             continue;
         }
         let Ok(bal) = skim_bal::decode(env.payload.block_access_list) else { continue };

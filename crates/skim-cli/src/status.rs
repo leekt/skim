@@ -56,6 +56,29 @@ pub fn assess(status: &Value, subs: &Value, head_ts: Option<u64>, now: u64) -> V
         _ => Check { what: "chain", level: Level::Warn, detail: "no block applied yet".into(), hint: Some("starting: the first block usually arrives within a minute") },
     });
 
+    let forks = &status["network"]["forks"];
+    let when = |at: u64| if at > now { format!("in {}d {}h", (at - now) / 86400, (at - now) % 86400 / 3600) } else { "active".into() };
+    if let Some(at) = n(&forks["stops_at"]["at"]) {
+        let fork = forks["stops_at"]["fork"].as_str().unwrap_or("a fork");
+        out.push(Check {
+            what: "forks",
+            level: if now >= at { Level::Fail } else { Level::Warn },
+            detail: if now >= at { format!("stopped at {fork}: skim doesn't implement it, no block after it is applied") } else { format!("{fork} {}: skim doesn't implement it and stops there", when(at)) },
+            hint: Some(if fork.starts_with("hegota") {
+                "Hegota: run a skim release that supports it, or --experimental-hegota (assumptions in docs/guide/hegota.md)"
+            } else {
+                "run a skim release that implements this fork"
+            }),
+        });
+    } else if let Some(at) = n(&forks["hegota"]["at"]).filter(|_| forks["hegota"]["support"] == "experimental") {
+        out.push(Check {
+            what: "forks",
+            level: if now >= at { Level::Warn } else { Level::Ok },
+            detail: format!("Hegota {}: followed with experimental support", when(at)),
+            hint: (now >= at).then_some("answers after Hegota rest on assumptions its final spec may change (docs/guide/hegota.md)"),
+        });
+    }
+
     let el = n(&status["el_peers"]).unwrap_or(0);
     let snap = n(&status["snap_peers"]).unwrap_or(0);
     out.push(match (el, snap) {
@@ -199,5 +222,21 @@ mod tests {
         let status = json!({"head": null, "el_peers": 2, "snap_peers": 2, "light_client": {}, "history": {"mode": "off"}, "network": {"name": "hoodi", "glamsterdam_at": 1_000 + 6 * 86400 + 3 * 3600}});
         let c = assess(&status, &json!([]), None, 1_000);
         assert_eq!(c[0].detail, "waiting for Glamsterdam on hoodi: in 6d 3h");
+    }
+
+    #[test]
+    fn a_fork_skim_stops_at_is_a_warning_then_a_failure() {
+        let st = |forks: Value| json!({"head": 100, "el_peers": 5, "snap_peers": 3, "light_client": {}, "history": {"mode": "off"}, "network": {"name": "devnet", "forks": forks}});
+        let stop = st(json!({"hegota": {"at": 5_000, "support": "none"}, "stops_at": {"fork": "hegota", "at": 5_000}}));
+        let by = |c: Vec<Check>| c.into_iter().find(|c| c.what == "forks").unwrap();
+        let before = by(assess(&stop, &json!([]), Some(1_000), 1_000));
+        assert_eq!((before.level, before.detail.as_str()), (Level::Warn, "hegota in 0d 1h: skim doesn't implement it and stops there"));
+        assert!(before.hint.unwrap().contains("--experimental-hegota"));
+        assert_eq!(by(assess(&stop, &json!([]), Some(5_000), 5_000)).level, Level::Fail);
+        let on = st(json!({"hegota": {"at": 5_000, "support": "experimental"}, "stops_at": null}));
+        assert_eq!(by(assess(&on, &json!([]), Some(1_000), 1_000)).level, Level::Ok);
+        assert_eq!(by(assess(&on, &json!([]), Some(5_000), 5_000)).detail, "Hegota active: followed with experimental support");
+        // Nothing scheduled: no forks check at all.
+        assert!(assess(&st(json!({"hegota": null, "stops_at": null})), &json!([]), Some(1_000), 1_000).iter().all(|c| c.what != "forks"));
     }
 }

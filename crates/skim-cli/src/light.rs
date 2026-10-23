@@ -130,14 +130,14 @@ impl Light {
     /// A gossiped light-client update. Verified against the committee; results are stored as
     /// execution block hashes and resolved to numbers by [`Self::on_block`].
     pub async fn on_gossip(self: &Arc<Self>, topic: &str, data: &[u8], store: &Store) {
-        let fv = skim_cl::network::current().gloas_fork_version;
+        let fv = skim_cl::network::current().fork_versions();
         tracing::debug!(topic, len = data.len(), "light client update received");
         let res = {
             let c = self.committee.lock();
             let Some(c) = c.as_ref() else { return };
             match topic {
-                "light_client_optimistic_update" => light::optimistic_update(c, data, fv).map(|(a, _)| (a, None)),
-                "light_client_finality_update" => light::finality_update(c, data, fv).map(|(a, f)| (a, Some(f))),
+                "light_client_optimistic_update" => light::optimistic_update(c, data, &fv).map(|(a, _)| (a, None)),
+                "light_client_finality_update" => light::finality_update(c, data, &fv).map(|(a, f)| (a, Some(f))),
                 _ => return,
             }
         };
@@ -178,7 +178,7 @@ impl Light {
         }
         let me = self.clone();
         tokio::spawn(async move {
-            let fv = skim_cl::network::current().gloas_fork_version;
+            let fv = skim_cl::network::current().fork_versions();
             for attempt in 0..120 {
                 let net = skim_cl::network::current();
                 let live = skim_cl::NodeConfig::from_network(net, 0).current_slot() / net.preset.slots_per_period();
@@ -190,7 +190,7 @@ impl Light {
                 let Some(cl) = &me.cl else { break };
                 match cl.light_client_updates(period, count).await {
                     Ok(updates) => {
-                        if !me.apply_range(&updates, fv) {
+                        if !me.apply_range(&updates, &fv) {
                             break;
                         }
                         // Progress (a rotation or a newly learned committee): more periods may follow
@@ -211,7 +211,7 @@ impl Light {
 
     /// Applies a `LightClientUpdatesByRange` response (`light::apply_updates`) and publishes what
     /// it verified, like gossip does. False if no committee is held.
-    fn apply_range(&self, updates: &[Vec<u8>], fv: [u8; 4]) -> bool {
+    fn apply_range(&self, updates: &[Vec<u8>], fv: &light::ForkVersions) -> bool {
         let r = {
             let mut g = self.committee.lock();
             let Some(cs) = g.as_mut() else { return false };
@@ -362,7 +362,7 @@ mod tests {
             update_with_finality(&b, &c, p2 - 200, p2 - 300, p2 - 199),
             update_with_finality(&c, &d, p2 + 50, p2 + 10, p2 + 51),
         ];
-        assert!(lc.apply_range(&updates, FV));
+        assert!(lc.apply_range(&updates, &fv()));
         // The execution blocks the newest headers commit to: finalized at 2, attested at 3.
         let store = Store::new(64);
         let mut parent = B256::repeat_byte(1);

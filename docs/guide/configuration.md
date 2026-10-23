@@ -85,7 +85,9 @@ The directory supplies:
 | `bootstrap_nodes.txt` (optional) | CL discovery ENRs. Direct peers can also be supplied with `--cl-peer`. |
 | `enodes.txt` (optional) | EL bootnodes, one `enode://` per line; `--el-bootnode` adds more. |
 
-The `mainnet` preset names consensus constants; it is not a built-in `--network mainnet` option. The network must provide post-Glamsterdam payloads and BALs. Fork digests follow the configured blob schedule: Status carries the current fork digest, and gossip topics overlap two epochs either side of a transition. A live blob-parameter fork crossing has been verified on the devnet. The EL fork id also covers forks scheduled after Amsterdam.
+skim dials the nodes in `bootstrap_nodes.txt` and `enodes.txt` directly as well as through discovery: a devnet's listed nodes are its clients, and they may not answer discovery.
+
+The `mainnet` preset names consensus constants; it is not a built-in `--network mainnet` option. The network must provide post-Glamsterdam payloads and BALs. Fork digests follow the configured blob schedule: Status carries the current fork digest, and gossip topics overlap two epochs either side of a transition. A live blob-parameter fork crossing has been verified on the devnet. The EL fork id also covers forks scheduled after Amsterdam. A scheduled fork skim doesn't implement (Hegota without `--experimental-hegota`, or any fork it doesn't know) is a stop: skim applies no block from it on, and refuses to start if it's already active ([Hegota](hegota.md)).
 
 Consensus bootstrap uses `--checkpoint`, then a saved verified finalized root, then `--checkpoint-url`. Only built-in Sepolia supplies a default checkpoint URL. With no checkpoint source on another network, the node follows gossip optimistically and records the bootstrap error in `skim_status.light_client`; `--require-verified` refuses `latest` until verification succeeds. See the [devnet example](../../devnet/README.md) and [trust guide](trust-and-correctness.md).
 
@@ -98,6 +100,7 @@ Only `skim run` follows networks other than Sepolia (`--network`). The other sub
 |---|---|---|
 | `--config <path>` | none | the YAML above |
 | `--network <sepolia\|dir>` | `sepolia` | the chain to follow: `sepolia` (built in), or a network-config directory as consensus clients use (`config.yaml` with its `PRESET_BASE` (`mainnet` or `minimal`), `genesis.ssz` or `genesis_validators_root.txt`, `bootstrap_nodes.txt`) plus the execution `genesis.json` (with `amsterdamTime`) and optionally `enodes.txt`. Chain id, fork schedule, preset, slot duration and bootnodes all come from it; the data dir defaults to `~/.skim/<network>` |
+| `--experimental-hegota` | off | follow Hegota (Heze + Bogotá) when the network schedules it, under assumptions that will change with its spec: Glamsterdam's EVM rules, the drafted Heze block layout, frame transactions decoded but not executed. Off: skim stops applying blocks at Hegota ([Hegota](hegota.md)) |
 | `--el-bootnode <enode>` | none | extra EL bootnodes, for networks without a DNS tree or `enodes.txt` (repeatable) |
 | `--cl-peer <multiaddr>` | none | CL peers to dial directly and keep (`/ip4/…/tcp/…/p2p/<peer id>`), e.g. a devnet's beacon nodes (repeatable) |
 | `--hub <url>` | none | attach to a skim-hub: **not supported yet**, skim refuses to start with it |
