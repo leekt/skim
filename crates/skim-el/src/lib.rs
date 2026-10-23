@@ -951,13 +951,15 @@ pub struct ReceiptBudget {
     receipts: u64,
     last_cumulative: u64,
     log_gas: u64,
+    /// What the accepted receipts hold in memory (fields, logs, frame results).
+    bytes: u64,
 }
 
 impl ReceiptBudget {
     const SLACK_GAS: u64 = 1_000_000;
 
     pub fn new(gas_used: u64) -> Self {
-        Self { gas_used, receipts: 0, last_cumulative: 0, log_gas: 0 }
+        Self { gas_used, receipts: 0, last_cumulative: 0, log_gas: 0, bytes: 0 }
     }
 
     fn allowance(&self) -> u64 {
@@ -972,12 +974,23 @@ impl ReceiptBudget {
             }
             self.last_cumulative = r.cumulative_gas_used;
             self.receipts += 1;
+            let mut bytes = std::mem::size_of::<Receipt>() as u64;
             for l in &r.logs {
                 let cost = 375 + 375 * l.data.topics().len() as u64 + 8 * l.data.data.len() as u64;
                 self.log_gas = self.log_gas.saturating_add(cost);
+                bytes += (std::mem::size_of::<alloy_primitives::Log>() + 32 * l.data.topics().len() + l.data.data.len()) as u64;
             }
+            // Frame results are metadata no gas pays for directly: counted by size. (Review:
+            // only receipts and logs were counted.)
+            if let Some(f) = &r.frame {
+                bytes += (f.frames.len() * std::mem::size_of::<FrameResult>()) as u64;
+            }
+            self.bytes = self.bytes.saturating_add(bytes);
         }
-        self.receipts <= self.allowance() / 21_000 && self.log_gas <= self.allowance()
+        // Bytes: an honest block's receipts are mostly log data, at most `gas_used / 8`, so the
+        // allowance (twice the gas, plus slack) is ample, and it bounds what a peer can make
+        // skim hold for one block.
+        self.receipts <= self.allowance() / 21_000 && self.log_gas <= self.allowance() && self.bytes <= self.allowance()
     }
 }
 
@@ -992,6 +1005,30 @@ mod tests {
         // 2026-05: after Sepolia's BPO2 (2025-11).
         assert_eq!(sepolia.blob_update_fraction(1_780_000_000), Some(11_684_671), "BPO2's");
         assert_eq!(sepolia.blob_update_fraction(0), None, "before Cancun there is no blob fee");
+    }
+
+    #[test]
+    fn frame_results_count_toward_what_a_block_can_hold() {
+        // Review P2: the budget counted receipts and logs only; frame results, kept until the
+        // receipts root is checked, were free.
+        let frame = |frames: usize| Receipt {
+            tx_type: FRAME_TX_TYPE,
+            success: true,
+            cumulative_gas_used: 21_000,
+            logs: vec![],
+            frame: Some(FrameReceipt { payer: alloy_primitives::Address::ZERO, frames: vec![FrameResult { status: 1, ..Default::default() }; frames] }),
+        };
+        // Decoding refuses more frames than a transaction may have.
+        let mut buf = Vec::new();
+        alloy_rlp::Encodable::encode(&frame(frame::MAX_FRAMES_PER_TX + 1), &mut buf);
+        assert!(<Receipt as alloy_rlp::Decodable>::decode(&mut buf.as_slice()).is_err());
+        let mut ok = Vec::new();
+        alloy_rlp::Encodable::encode(&frame(3), &mut ok);
+        assert_eq!(<Receipt as alloy_rlp::Decodable>::decode(&mut ok.as_slice()).unwrap(), frame(3));
+        // And the bytes they hold count: a small block can't be made to hold thousands of them.
+        let mut b = ReceiptBudget::new(21_000);
+        let admitted = (0..1_000).take_while(|_| b.admit(&[frame(frame::MAX_FRAMES_PER_TX)])).count();
+        assert!(admitted < 40, "{admitted} frame-heavy receipts admitted for a 21k-gas block");
     }
 
     #[test]

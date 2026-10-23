@@ -843,11 +843,14 @@ impl Rpc {
                 // The stream's tip is `latest`: with `--require-verified`, the verified head.
                 // (Review: it was always the optimistic head.)
                 let (store, light, verified) = (sim.store.clone(), self.light.clone(), self.require_verified);
+                // With `--require-verified` the tip keeps its authenticated hash: the stream checks
+                // the range it captures against it.
                 let tip = move || {
                     if verified {
-                        light.as_ref().and_then(|l| l.status().verified_block).and_then(|v| crate::light::resolve(&store, &v)).map(|b| b.number)
+                        let v = light.as_ref().and_then(|l| l.status().verified_block).and_then(|v| crate::light::resolve(&store, &v))?;
+                        Some(crate::stream::Tip { number: v.number, hash: Some(v.hash) })
                     } else {
-                        store.head().map(|h| h.number)
+                        store.head().map(|h| crate::stream::Tip { number: h.number, hash: None })
                     }
                 };
                 Ok(crate::stream::next(chain, tip, self.events.subscribe(), finalized, req).await?)
@@ -1297,7 +1300,6 @@ async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
     let (mut tx, mut rx) = socket.split();
     let mut events = rpc.events.subscribe();
     let mut subs: std::collections::HashMap<String, Sub> = Default::default();
-    let mut heads = crate::ws_feed::HeadTrack::default();
     let mut next_id = 1u64;
     loop {
         tokio::select! {
@@ -1325,11 +1327,16 @@ async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
                                 return Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32005, "message": format!("too many subscriptions on this connection (at most {MAX_WS_SUBSCRIPTIONS})")}}));
                             }
                             let sub = match kind {
-                                "newHeads" => Sub::NewHeads,
+                                "newHeads" => Sub::NewHeads { track: crate::ws_feed::HeadTrack::seeded(latest.map(|b| (b.number, b.hash))) },
                                 "skim_subscriptions" => Sub::Skim,
                                 "logs" => match serde_json::from_value::<alloy_rpc_types_eth::Filter>(params.get(1).cloned().unwrap_or(json!({}))) {
-                                    // Logs from blocks after the one current now.
-                                    Ok(f) => Sub::Logs { filter: Box::new(f), since: latest.map_or(0, |b| b.number), delivered: Default::default() },
+                                    // Logs from blocks after the one current now (or replacing it).
+                                    Ok(f) => Sub::Logs {
+                                        filter: Box::new(f),
+                                        track: crate::ws_feed::HeadTrack::seeded(latest.map(|b| (b.number, b.hash))),
+                                        delivered: Default::default(),
+                                        failures: 0,
+                                    },
                                     Err(e) => return Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": format!("logs filter: {e}")}})),
                                 },
                                 other => return Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": format!("unsupported subscription {other:?} (newHeads, logs, skim_subscriptions)")}})),
@@ -1382,10 +1389,7 @@ async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
                         // read. (Review: they followed optimistic heads.)
                         let head = if rpc.require_verified { rpc.latest() } else { Some(b) };
                         match head {
-                            Some(head) => {
-                                let step = heads.advance((head.number, head.hash), |n| rpc.sim.store.block(n).map(|x| x.hash));
-                                push_heads(&rpc, &mut subs, &step, &mut tx).await
-                            }
+                            Some(head) => push_heads(&rpc, &mut subs, (head.number, head.hash), &mut tx).await,
                             None => true,
                         }
                     }
@@ -1417,24 +1421,42 @@ async fn send_push(tx: &mut WsSink, sid: &str, result: Value) -> bool {
     tx.send(axum::extract::ws::Message::Text(msg.to_string().into())).await.is_ok()
 }
 
-/// One step of the session's chain view: `newHeads` gets each added block's header; `logs` gets
-/// the logs it reported for removed blocks again with `removed: true` (newest first), then the
-/// logs of each added block. False once the connection is gone.
-async fn push_heads(rpc: &Rpc, subs: &mut std::collections::HashMap<String, Sub>, step: &crate::ws_feed::Step, tx: &mut WsSink) -> bool {
+/// Blocks in a row a `logs` subscription may fail to deliver (receipts not fetched) before it
+/// ends with an error, rather than stall or skip silently.
+const MAX_LOG_DELIVERY_FAILURES: u32 = 8;
+
+/// Moves every head-following subscription to `head`: `newHeads` gets each added block's header;
+/// `logs` gets the logs it reported for removed blocks again with `removed: true` (newest
+/// first), then the logs of each added block. A subscription's position advances per block
+/// delivered. A `logs` subscription that can't be told everything (a gap too long to report, or
+/// receipts that keep failing) ends with an error notification instead of skipping silently.
+/// False once the connection is gone.
+async fn push_heads(rpc: &Rpc, subs: &mut std::collections::HashMap<String, Sub>, head: (u64, B256), tx: &mut WsSink) -> bool {
+    let canon = |n: u64| rpc.sim.store.block(n).map(|x| x.hash);
+    let mut ended = Vec::new();
     for (sid, sub) in subs.iter_mut() {
         match sub {
-            Sub::NewHeads => {
+            Sub::NewHeads { track } => {
+                // Heads more than `KEEP` behind are skipped, as geth skips them for a slow reader.
+                let step = track.step(head, canon);
+                if let Some((_, to)) = step.skipped
+                    && let Some(h) = canon(to)
+                {
+                    track.skip_to(to, h);
+                }
                 for &(n, hash) in &step.added {
-                    let Some(b) = rpc.sim.store.block(n).filter(|b| b.hash == hash) else { continue };
-                    let Some(h) = rpc.sim.header_arc(&b) else { continue };
-                    let Ok(v) = serde_json::to_value(alloy_rpc_types_eth::Header::new((*h).clone())) else { continue };
+                    let Some(b) = rpc.sim.store.block(n).filter(|b| b.hash == hash) else { break };
+                    let Some(h) = rpc.sim.header_arc(&b) else { break };
+                    let Ok(v) = serde_json::to_value(alloy_rpc_types_eth::Header::new((*h).clone())) else { break };
                     if !send_push(tx, sid, v).await {
                         return false;
                     }
+                    track.mark(n, hash);
                 }
             }
-            Sub::Logs { filter, since, delivered } => {
+            Sub::Logs { filter, track, delivered, failures } => {
                 let Some(c) = &rpc.chain else { continue };
+                let step = track.step(head, canon);
                 for &(n, hash) in &step.removed {
                     let Some((h, logs)) = delivered.remove(&n) else { continue };
                     if h != hash {
@@ -1447,15 +1469,37 @@ async fn push_heads(rpc: &Rpc, subs: &mut std::collections::HashMap<String, Sub>
                         }
                     }
                 }
-                for &(n, hash) in step.added.iter().filter(|(n, _)| *n > *since) {
-                    let Ok(Value::Array(logs)) = c.logs(filter, n, n, Some(hash)).await else { continue };
-                    // Logs: one notification per log, as clients expect.
-                    for log in &logs {
-                        if !send_push(tx, sid, log.clone()).await {
-                            return false;
+                if let Some((from, to)) = step.skipped {
+                    ended.push((sid.clone(), format!("logs of blocks {from}..={to} can't be delivered (more than {} blocks behind); subscribe again", crate::ws_feed::KEEP)));
+                    continue;
+                }
+                for &(n, hash) in &step.added {
+                    match c.logs(filter, n, n, Some(hash)).await {
+                        Ok(Value::Array(logs)) => {
+                            // Logs: one notification per log, as clients expect.
+                            for log in &logs {
+                                if !send_push(tx, sid, log.clone()).await {
+                                    return false;
+                                }
+                            }
+                            delivered.insert(n, (hash, logs));
+                            track.mark(n, hash);
+                            *failures = 0;
+                        }
+                        // Not delivered: the position stays, and the next head tries it again.
+                        // (Review: the block was skipped for good.)
+                        other => {
+                            *failures += 1;
+                            if *failures >= MAX_LOG_DELIVERY_FAILURES {
+                                let why = match other {
+                                    Err(e) => RpcError::from(e).message,
+                                    Ok(_) => "unexpected result".into(),
+                                };
+                                ended.push((sid.clone(), format!("logs of block {n} couldn't be fetched ({why}); subscribe again")));
+                            }
+                            break;
                         }
                     }
-                    delivered.insert(n, (hash, logs));
                 }
                 while delivered.len() as u64 > crate::ws_feed::KEEP {
                     delivered.pop_first();
@@ -1464,14 +1508,23 @@ async fn push_heads(rpc: &Rpc, subs: &mut std::collections::HashMap<String, Sub>
             Sub::Skim => {}
         }
     }
+    for (sid, why) in ended {
+        subs.remove(&sid);
+        let msg = json!({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": sid, "error": {"code": -32002, "message": why}}});
+        use futures::SinkExt;
+        if tx.send(axum::extract::ws::Message::Text(msg.to_string().into())).await.is_err() {
+            return false;
+        }
+    }
     true
 }
 
 enum Sub {
-    NewHeads,
-    /// `since`: the head when it subscribed (only later blocks' logs are pushed); `delivered`:
-    /// the logs pushed per block, to withdraw if the block leaves the chain.
-    Logs { filter: Box<alloy_rpc_types_eth::Filter>, since: u64, delivered: std::collections::BTreeMap<u64, (B256, Vec<Value>)> },
+    NewHeads { track: crate::ws_feed::HeadTrack },
+    /// `track`: the blocks delivered, from the head when it subscribed; `delivered`: the logs
+    /// pushed per block, to withdraw if the block leaves the chain; `failures`: deliveries failed
+    /// in a row.
+    Logs { filter: Box<alloy_rpc_types_eth::Filter>, track: crate::ws_feed::HeadTrack, delivered: std::collections::BTreeMap<u64, (B256, Vec<Value>)>, failures: u32 },
     Skim,
 }
 

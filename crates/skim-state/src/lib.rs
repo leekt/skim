@@ -478,8 +478,23 @@ impl Store {
             None => ar.add_keys(&[k]),
         };
         self.archive_try(r);
+        self.archive_code_of(&st, &k);
         drop(st);
         true
+    }
+
+    /// An archived code hash needs its code on disk: historical calls run it after a restart,
+    /// when nothing is cached. Copies the cached bytecode of every version `k` holds. Called on
+    /// every path that archives a code hash's versions. (Review: promotion to archive retention
+    /// wrote the hash's coverage but never the code already cached.)
+    fn archive_code_of(&self, st: &Inner, k: &StateKey) {
+        let (Some(ar), StateKey::CodeHash(_)) = (&self.archive, k) else { return };
+        for (_, v) in st.versions.get(k).map(|v| v.as_slice()).unwrap_or_default() {
+            if let Some(c) = st.code.get(&B256::from(*v)) {
+                let r = ar.put_code(B256::from(*v), c);
+                self.archive_try(r);
+            }
+        }
     }
 
     /// Writes `k`'s in-memory versions to the archive as its base (hash-checked against the
@@ -496,6 +511,7 @@ impl Store {
             }
             self.archive_try(r);
         }
+        self.archive_code_of(st, k);
     }
 
     fn watch_key_unchecked(&self, k: StateKey) -> bool {
@@ -944,15 +960,7 @@ impl Store {
                     st.based.insert(key, n);
                 }
                 self.archive_try(r);
-                // An archived code hash needs its code in the archive too.
-                if matches!(key, StateKey::CodeHash(_)) {
-                    for h in std::iter::once(v).chain(later.iter().map(|(_, _, x)| *x)).map(B256::from) {
-                        if let Some(c) = st.code.get(&h) {
-                            let r = ar.put_code(h, c);
-                            self.archive_try(r);
-                        }
-                    }
-                }
+                self.archive_code_of(st, &key);
             }
         }
     }

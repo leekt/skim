@@ -1010,3 +1010,21 @@ fn only_code_an_archived_account_points_to_is_archived() {
     let again = s.insert_code(Bytes::from_static(b"archived-code"));
     assert_eq!(again, h);
 }
+
+#[test]
+fn promoting_a_code_hash_to_the_archive_also_archives_its_cached_code() {
+    // Review P2: a call subscription fetches code on demand, then promotes the learned keys to
+    // archive retention; the code hash got archived coverage, the cached code never reached disk,
+    // so historical calls failed once memory was gone.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::with_archive(64, archive::Archive::open(d.path().join("a.redb")).unwrap()).unwrap();
+    s.apply_block(blk(10, 0), writes(&[])).unwrap();
+    let code = Bytes::from_static(b"learned-contract-code");
+    // On demand first: the code hash and the code, neither archived.
+    let h = s.insert_code(code.clone());
+    s.insert_base_with(&blk(10, 0), StateKey::CodeHash(A), U256::from_be_bytes(h.0), Retention::Ttl(4)).unwrap();
+    assert_eq!(s.archive().unwrap().code(&h).unwrap(), None);
+    // Then promoted to archive retention.
+    s.archive_key(StateKey::CodeHash(A));
+    assert_eq!(s.archive().unwrap().code(&h).unwrap(), Some(code));
+}

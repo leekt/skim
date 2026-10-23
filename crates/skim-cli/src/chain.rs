@@ -52,6 +52,32 @@ pub struct Chain {
     /// serves them. A missed gossip payload must not stall the follower until an eth/71 peer
     /// shows up (measured: 5 minutes with only crawlers connected on the EL side).
     pub cl: Option<Arc<dyn crate::persist::EnvelopeSource>>,
+    /// How many distinct EL peers serve the header with a given hash ([`peers_know`]): the
+    /// independent evidence a re-anchor or a switch to a lower branch needs, since a gossiped
+    /// envelope is only self-consistent, not signed.
+    pub peers_know: PeersKnow,
+}
+
+/// See [`Chain::peers_know`].
+pub type PeersKnow = Arc<dyn Fn(B256) -> futures::future::BoxFuture<'static, usize> + Send + Sync>;
+
+/// Distinct EL peers that must serve a block's header before skim re-anchors on it, or leaves
+/// its head for it.
+pub const CORROBORATION: usize = 2;
+
+/// [`Chain::peers_know`] over EL peers: asks up to six of them for the header by hash.
+pub fn peers_know(net: ElNet) -> PeersKnow {
+    Arc::new(move |hash| {
+        let net = net.clone();
+        Box::pin(async move {
+            let peers: Vec<_> = net.peers().into_iter().map(|(id, _)| id).take(6).collect();
+            let asks = peers.into_iter().map(|p| {
+                let net = net.clone();
+                async move { matches!(net.headers(p, BlockHashOrNumber::Hash(hash), 1).await.0, Ok(hs) if hs.first().is_some_and(|h| h.hash_slow() == hash)) }
+            });
+            futures::future::join_all(asks).await.into_iter().filter(|known| *known).count()
+        })
+    })
 }
 
 impl Chain {
@@ -85,7 +111,8 @@ impl Chain {
                 Err(e) => Placed::Deferred(e.to_string()),
             };
         }
-        if b.number < head.number {
+        let below = b.number < head.number;
+        if below && !self.head_left_behind(&head, &b).await {
             // Below the head on a branch we don't hold: a late block, or a forged one (an
             // envelope is checked for consistency, not signatures). Switching to it would roll
             // back to its parent, however deep. (Review: any stored parent was accepted, so one
@@ -93,6 +120,19 @@ impl Chain {
             // canonical one, that branch's next block overtakes the head and reconciles against
             // peers' chains, filling this block in.
             return Placed::Deferred(format!("block {} is below the head ({}) on another branch; waiting for its branch to overtake", b.number, head.number));
+        }
+        if below {
+            // The head is on no peer's chain and this block's is: the head was a made-up block
+            // (a forged envelope far ahead, say). Back to the peers' chain. (Review: a forged
+            // high block stranded the follower, every honest block being "below the head".)
+            tracing::warn!(head = head.number, number = b.number, "the head is on no peer's chain and this block is; leaving it");
+            return match self.reconcile(&b).await {
+                Ok((ancestor, filled)) => match self.apply(&h, writes) {
+                    Ok(ready) => Placed::Applied { ready, reorged_to: Some(ancestor), filled },
+                    Err(e) => Placed::Deferred(e.to_string()),
+                },
+                Err(_) => self.reanchor(&h, writes),
+            };
         }
         if b.number == head.number
             && b.number > 0
@@ -110,19 +150,37 @@ impl Chain {
                 Err(e) => Placed::Deferred(e.to_string()),
             },
             Err(Reconcile::NoAncestor) => {
-                tracing::warn!(number = b.number, "no common ancestor in window; re-anchoring");
-                // The epoch first, as in `rollback`; chain data forgets everything above 0.
-                self.store.note_reorg();
-                (self.on_rollback)(0);
-                // In memory: a fresh start at this block. The archive keeps what's below it.
-                self.store.reanchor(b.number);
-                match self.apply(&h, writes) {
-                    Ok(r) => Placed::Reanchored(r),
-                    Err(e) => Placed::Deferred(e.to_string()),
+                // Starting afresh at a block is trusting it: only on peers' word, never on one
+                // envelope's. (Review: a gap over the replay limit re-anchored at once, so a
+                // forged envelope numbered far ahead became the head.)
+                if (self.peers_know)(b.parent_hash).await < CORROBORATION {
+                    return Placed::Deferred(format!("block {} doesn't connect to the head and fewer than {CORROBORATION} peers know its parent; not re-anchoring on it", b.number));
                 }
+                tracing::warn!(number = b.number, "no common ancestor in window; re-anchoring");
+                self.reanchor(&h, writes)
             }
             Err(Reconcile::Defer(why)) => Placed::Deferred(why),
         }
+    }
+
+    /// A fresh start at `h`: in memory, everything else is forgotten; the archive keeps what's
+    /// below it.
+    fn reanchor(&self, h: &Header, writes: Arc<BlockWrites>) -> Placed {
+        // The epoch first, as in `rollback`; chain data forgets everything above 0.
+        self.store.note_reorg();
+        (self.on_rollback)(0);
+        self.store.reanchor(h.number);
+        match self.apply(h, writes) {
+            Ok(r) => Placed::Reanchored(r),
+            Err(e) => Placed::Deferred(e.to_string()),
+        }
+    }
+
+    /// Whether skim's head is on no peer's chain while `b`'s is. Asked about the parents: a new
+    /// honest head may not have reached peers yet, its parent has; a made-up head's parent is
+    /// made up too.
+    async fn head_left_behind(&self, head: &BlockRef, b: &BlockRef) -> bool {
+        (self.peers_know)(b.parent_hash).await >= CORROBORATION && (self.peers_know)(head.parent_hash).await == 0
     }
 
     /// Makes the store's head the EL-canonical parent of `b`. Returns the common ancestor and
@@ -350,6 +408,15 @@ mod tests {
         }
     }
 
+    /// EL peers (three of them) that all serve exactly these headers.
+    fn known_to_peers(hashes: &[B256]) -> PeersKnow {
+        let known: std::collections::HashSet<B256> = hashes.iter().copied().collect();
+        Arc::new(move |h| {
+            let n = if known.contains(&h) { 3 } else { 0 };
+            Box::pin(async move { n })
+        })
+    }
+
     async fn chain_at(head: &Header, envelopes: &[(Header, Vec<u8>)], with_cl: bool) -> Chain {
         let store = Store::new(64);
         store.apply_block(block_ref(head), Default::default()).unwrap();
@@ -364,6 +431,7 @@ mod tests {
             on_rollback: Box::new(|_| {}),
             lookback: 4,
             cl: with_cl.then(|| Arc::new(source) as Arc<dyn crate::persist::EnvelopeSource>),
+            peers_know: known_to_peers(&[]),
         }
     }
 
@@ -461,6 +529,40 @@ mod tests {
         // A sibling of the head still switches branches (one block).
         let sib = fork(a[3].0.hash_slow(), 104, 1, 0xc);
         assert!(matches!(chain.place(sib[0].0.clone(), Default::default()).await, Placed::Applied { reorged_to: Some(103), .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_block_numbered_far_ahead_is_not_anchored_on_without_peers_behind_it() {
+        // Review P1: a gap over the replay limit re-anchored at once, so one self-consistent
+        // envelope numbered far ahead became the head, and every honest block after it was
+        // "below the head".
+        let a = fork(B256::repeat_byte(0x99), 100, 2, 0xa);
+        let forged = fork(B256::repeat_byte(0x66), 5_000, 1, 0xf);
+        let mut chain = chain_at(&a[0].0, &[], false).await;
+        assert!(matches!(chain.place(forged[0].0.clone(), Default::default()).await, Placed::Deferred(_)));
+        assert_eq!(chain.store.head().map(|h| h.number), Some(100));
+        assert!(matches!(chain.place(a[1].0.clone(), Default::default()).await, Placed::Applied { .. }), "honest blocks still apply");
+        // Far ahead with peers that know its parent (skim was offline a long time): re-anchor.
+        let far = fork(B256::repeat_byte(0x55), 5_000, 1, 0xa);
+        chain.peers_know = known_to_peers(&[far[0].0.parent_hash]);
+        assert!(matches!(chain.place(far[0].0.clone(), Default::default()).await, Placed::Reanchored(_)));
+        assert_eq!(chain.store.head().map(|h| h.number), Some(5_000));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_head_no_peer_knows_is_left_for_the_peers_chain() {
+        // Review P1: recovery from an incorrect optimistic head. The store's head is a made-up
+        // block far ahead; honest blocks arrive below it, their parents known to peers, the
+        // head's parent to none: the follower returns to the peers' chain.
+        let forged = fork(B256::repeat_byte(0x66), 5_000, 1, 0xf);
+        let a = fork(B256::repeat_byte(0x99), 100, 2, 0xa);
+        let mut chain = chain_at(&forged[0].0, &[], false).await;
+        // A late or forged block below an honest head: nobody vouches for leaving it.
+        assert!(matches!(chain.place(a[1].0.clone(), Default::default()).await, Placed::Deferred(_)));
+        chain.peers_know = known_to_peers(&[a[1].0.parent_hash]);
+        let r = chain.place(a[1].0.clone(), Default::default()).await;
+        assert!(matches!(r, Placed::Reanchored(_) | Placed::Applied { .. }), "{r:?}");
+        assert_eq!(chain.store.head().map(|h| h.hash), Some(a[1].0.hash_slow()));
     }
 
     #[tokio::test(flavor = "multi_thread")]

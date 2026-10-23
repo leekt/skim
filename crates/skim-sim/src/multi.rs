@@ -449,6 +449,9 @@ impl Simulator {
                 apply_block_overrides(&mut benv, o)?;
             }
             *overridden.lock().unwrap() = hash_overrides(blk.block.as_ref());
+            // The overlay caches BLOCKHASH answers across the sequence: each block asks again,
+            // under its own overrides. (Review: block 2 got block 1's overridden hash.)
+            cache.cache.block_hashes.clear();
             if let Some(s) = &blk.state {
                 apply_state_overrides(&mut cache, s)?;
             }
@@ -459,7 +462,17 @@ impl Simulator {
                 if call.auto_gas {
                     tx.gas_limit = benv.gas_limit.saturating_sub(used);
                 }
-                if opts.validation && used.saturating_add(tx.gas_limit) > benv.gas_limit {
+                let over_block = opts.validation && used.saturating_add(tx.gas_limit) > benv.gas_limit;
+                if (over_block || budget == 0) && sdb.access.lock().unwrap().has_misses() {
+                    // `used` came from runs on incomplete state: no verdict yet. End the pass so
+                    // the caller fetches what was missing and runs it again. (Review: -38015 was
+                    // returned while cold for a sequence that fit once the state was known.)
+                    drop(cache);
+                    let mut access = sdb.access.into_inner().unwrap();
+                    access.dedup();
+                    return Ok((out, access));
+                }
+                if over_block {
                     // As a block would refuse it (geth: -38015). (Review: calls that each fit but
                     // together exceeded the block passed.)
                     return Err(SimError::Invalid { code: -38015, message: format!("block gas limit reached: {} used of {}, the call asks for {}", used, benv.gas_limit, tx.gas_limit) });

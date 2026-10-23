@@ -440,6 +440,9 @@ impl<'de> serde::Deserialize<'de> for SignedTx {
 
 /// One frame's outcome in an EIP-8141 receipt. Its logs are in [`Receipt::logs`], in frame
 /// order: `logs` says how many are this frame's.
+/// Frames one receipt may carry; above any EIP-8141 draft's per-transaction limit.
+pub const MAX_FRAMES_PER_TX: usize = 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrameResult {
     /// 1 success, 0 failure, 2 skipped (an atomic batch failed).
@@ -529,6 +532,11 @@ impl Receipt {
         *buf = rest;
         let (mut frames, mut logs) = (Vec::new(), Vec::new());
         while !frames_buf.is_empty() {
+            // A receipt from a peer can't carry more frames than a transaction may have: each is
+            // kept until the receipts root is checked. (Review: unbounded.)
+            if frames.len() >= MAX_FRAMES_PER_TX {
+                return Err(alloy_rlp::Error::Custom("frame receipt: too many frames"));
+            }
             let fh = Header::decode(&mut frames_buf)?;
             if !fh.list {
                 return Err(alloy_rlp::Error::UnexpectedString);

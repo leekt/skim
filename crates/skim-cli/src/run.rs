@@ -564,6 +564,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         on_rollback: Box::new(move |n| cd3.rollback_to(n)),
         lookback: 32,
         cl: Some(Arc::new(cl.clone())),
+        peers_know: crate::chain::peers_know(net.clone()),
     };
     tracing::info!(network = %cl_net.name, "following the chain from CL gossip; RPC answers once the first block is applied");
 

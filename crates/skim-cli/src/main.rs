@@ -194,13 +194,18 @@ mod tests {
 
     #[test]
     fn the_live_heap_counter_follows_allocations() {
-        // Other test threads allocate too: a large allocation dominates the noise.
-        let before = heap::live();
-        let v = vec![1u8; 64 << 20];
-        let during = heap::live();
-        assert!(during >= before + (64 << 20) - (1 << 20), "{before} -> {during}");
-        drop(v);
-        assert!(heap::live() < during - (60 << 20));
+        // Other test threads allocate and free too (the counter is process-wide), so one
+        // measurement can be off by whatever they freed meanwhile: a large allocation dominates
+        // the noise, and one clean measurement out of a few shows the counter follows it.
+        let clean = (0..5).any(|_| {
+            let before = heap::live();
+            let v = vec![1u8; 64 << 20];
+            let during = heap::live();
+            drop(std::hint::black_box(v));
+            let after = heap::live();
+            during >= before + (64 << 20) - (1 << 20) && after < during - (60 << 20)
+        });
+        assert!(clean, "the live-heap counter didn't follow a 64 MiB allocation in 5 tries");
     }
 
     #[test]

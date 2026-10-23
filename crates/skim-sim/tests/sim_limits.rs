@@ -97,3 +97,55 @@ async fn simulated_blocks_follow_each_other_and_answer_blockhash_for_earlier_one
     assert!(r.is_success(), "{r:?}");
     assert_ne!(B256::from_slice(&r.output().unwrap()[..32]), B256::ZERO, "a stand-in hash, never zero");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_simulated_block_reads_blockhash_under_its_own_overrides() {
+    // Review P2: the overlay cached BLOCKHASH answers across the sequence, so a second block's
+    // override of the same height was ignored.
+    let (sim, head, tx) = setup().await;
+    let mut call = tx.clone();
+    call.kind = TxKind::Call(HASHER);
+    call.gas_limit = 100_000;
+    let with_hash = |h: u8| BlockOverrides { block_hash: Some([(101u64, B256::repeat_byte(h))].into()), ..Default::default() };
+    let blocks = [
+        SimBlock { block: None, state: None, calls: vec![] }, // 101
+        SimBlock { block: Some(with_hash(0x11)), state: None, calls: vec![SimCall { tx: call.clone(), ..Default::default() }] },
+        SimBlock { block: Some(with_hash(0x22)), state: None, calls: vec![SimCall { tx: call, ..Default::default() }] },
+    ];
+    let out = sim.simulate(&head, &blocks, Placement::NextBlocks).await.expect("simulates");
+    let word = |i: usize| B256::from_slice(&out[i].calls[0].output().unwrap()[..32]);
+    assert_eq!((word(1), word(2)), (B256::repeat_byte(0x11), B256::repeat_byte(0x22)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gas_verdict_waits_for_the_state_the_calls_read() {
+    // Review P2: with `validation: true`, gas used on unknown state (a slot read as zero for now)
+    // could exceed the block's gas limit and answer -38015, though the same request fit once the
+    // slot was fetched. Missing state must be fetched before any gas verdict.
+    let (sim, head, tx) = setup().await;
+    *sim.state_wait.write() = std::time::Duration::from_millis(200);
+    // SLOAD(0); nonzero: stop; zero: loop until out of gas. Its slot 0 is not known locally.
+    const COLD: [u8; 12] = [0x60, 0x00, 0x54, 0x60, 0x0a, 0x57, 0x5b, 0x60, 0x06, 0x56, 0x5b, 0x00];
+    let cold = Address::repeat_byte(0xc0);
+    sim.store.insert_code(Bytes::from_static(&COLD));
+    for (k, v) in [(StateKey::Balance(cold), U256::ZERO), (StateKey::Nonce(cold), U256::from(1)), (StateKey::CodeHash(cold), U256::from_be_bytes(keccak256(COLD).0))] {
+        sim.store.insert_base(&head, k, v).unwrap();
+    }
+    let mut tx = tx;
+    tx.chain_id = Some(skim_sim::env::chain_id());
+    let mut first = tx.clone();
+    first.kind = TxKind::Call(cold);
+    let mut second = tx.clone();
+    second.gas_limit = 20_000_000;
+    let blocks = [SimBlock {
+        block: None,
+        state: None,
+        calls: vec![SimCall { tx: first, auto_nonce: true, auto_fee: false, auto_gas: true }, SimCall { tx: second, auto_nonce: true, auto_fee: false, auto_gas: false }],
+    }];
+    let opts = skim_sim::multi::SimOptions { validation: true, ..Default::default() };
+    match sim.simulate_with(&head, &blocks, Placement::NextBlocks, opts).await {
+        // No peer serves the slot here: the request waits for state, never judges gas on a guess.
+        Err(SimError::NoStatePeers(_)) | Err(SimError::Incomplete(_)) => {}
+        other => panic!("expected a wait for the missing slot, got {other:?}"),
+    }
+}

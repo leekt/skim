@@ -70,9 +70,23 @@ pub struct Request {
     pub wait_ms: Option<u64>,
 }
 
-pub async fn next(
+/// Where a stream may read up to: a block number, and with `--require-verified` the
+/// authenticated hash there, which the captured range must lead to.
+#[derive(Debug, Clone, Copy)]
+pub struct Tip {
+    pub number: u64,
+    pub hash: Option<B256>,
+}
+
+impl From<u64> for Tip {
+    fn from(number: u64) -> Self {
+        Self { number, hash: None }
+    }
+}
+
+pub async fn next<T: Into<Tip>>(
     chain: &ChainData,
-    head: impl Fn() -> Option<u64>,
+    head: impl Fn() -> Option<T>,
     mut new_heads: tokio::sync::broadcast::Receiver<crate::rpc::WsEvent>,
     finalized: Option<Value>,
     req: Request,
@@ -82,7 +96,8 @@ pub async fn next(
         return Err(DataError::Invalid("give log filters, bal addresses, or both".into()));
     }
     let mut events = Vec::new();
-    let Some(mut tip) = head() else { return Err(DataError::Unavailable("not following the chain yet".into())) };
+    let head = || head().map(Into::<Tip>::into);
+    let Some(Tip { number: mut tip, hash: mut tip_hash }) = head() else { return Err(DataError::Unavailable("not following the chain yet".into())) };
 
     // Where the module is (`pos`) and the hash it applied there (`anchor`), checked against the
     // chain: a cursor that isn't canonical any more rewinds to the newest canonical `recent` block.
@@ -139,7 +154,9 @@ pub async fn next(
                 Ok(Ok(_)) => continue,
                 Ok(Err(_)) | Err(_) => break,
             }
-            tip = head().unwrap_or(tip);
+            if let Some(t) = head() {
+                (tip, tip_hash) = (t.number, t.hash);
+            }
         }
         // The chain may have reorganized while waiting, possibly at the same height: re-check the
         // module's position before answering, and rewind if it isn't canonical any more.
@@ -168,6 +185,15 @@ pub async fn next(
             && headers.first().is_none_or(|(_, _, h)| h.parent_hash != a)
         {
             return Err(DataError::ChainChanged("the chain reorganized during the request; retry".into()));
+        }
+        // An authenticated tip: the captured range must lead to it. The selected chain holds the
+        // tip's hash at its height and the range's last block at its own, checked together after
+        // capture, so a sibling that replaced a verified block while the range was captured is
+        // refused, never streamed. (Review: only the tip's number was kept.)
+        if let Some(h) = tip_hash
+            && (chain.canonical_hash(tip) != Some(h) || headers.last().is_some_and(|(n, bh, _)| chain.canonical_hash(*n) != Some(*bh)))
+        {
+            return Err(DataError::ChainChanged("the verified chain changed during the request; retry".into()));
         }
         let scan = if req.filters.is_empty() { None } else { Some(chain.scan_headers(&req.filters, &headers, true).await?) };
         #[cfg(test)]
@@ -552,6 +578,29 @@ mod tests {
         assert_eq!(applied(&r), vec![(101, a[2], vec![0xa])], "{r}");
         assert_eq!(changes(&r), vec![(101, a[2], vec![0xa])], "{r}");
         assert_eq!(r["cursor"]["hash"].as_str().unwrap().parse::<B256>().unwrap(), a[2]);
+    }
+
+    #[tokio::test]
+    async fn a_verified_stream_never_returns_a_sibling_that_replaced_the_verified_block() {
+        // Review P1: the verified tip was reduced to its number, so a sibling B101 that replaced
+        // verified A101 while the range was captured (same parent, so the cursor check passes)
+        // was streamed under --require-verified.
+        let cd = ChainData::offline(2048);
+        let a = extend(&cd, 99, 101, B256::repeat_byte(0x99), 0xa);
+        let cd2 = cd.clone();
+        let a100 = a[1];
+        cd.test_hooks.lock().insert("before_capture", Box::new(move || {
+            extend(&cd2, 101, 101, a100, 0xb);
+        }));
+        let verified = || Some(Tip { number: 101, hash: Some(a[2]) });
+        let r = next(&cd, verified, tokio::sync::broadcast::channel(1).1, None, req(Some(id(100, a[1])), vec![id(99, a[0])], None)).await;
+        assert!(matches!(r, Err(DataError::ChainChanged(_))), "{:?}", r.map(|v| v.to_string()));
+        // Without a reorg, the verified block streams as usual.
+        let cd = ChainData::offline(2048);
+        let a = extend(&cd, 99, 101, B256::repeat_byte(0x99), 0xa);
+        let verified = || Some(Tip { number: 101, hash: Some(a[2]) });
+        let r = next(&cd, verified, tokio::sync::broadcast::channel(1).1, None, req(Some(id(100, a[1])), vec![id(99, a[0])], None)).await.unwrap();
+        assert_eq!(applied(&r), vec![(101, a[2], vec![0xa])], "{r}");
     }
 
     #[tokio::test]

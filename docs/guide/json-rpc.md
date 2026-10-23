@@ -41,7 +41,7 @@ Every method works over WebSocket too. In addition, `eth_subscribe` / `eth_unsub
 | `logs` (with an `address` / `topics` filter) | each matching log of each new block, one notification per log. When a reorg removes a block whose logs were pushed, those logs are pushed again with `removed: true` (newest first), then the new branch's logs, as geth does |
 | `skim_subscriptions` | after each block: every subscription's `ready`, `missing_keys`, `calls_ok`, `error` and latest `on_block` `results` |
 
-A connection reports up to the last 64 blocks it missed (a long gap, or a slow reader the broadcast left behind) when the next block arrives. With `--require-verified`, `newHeads` and `logs` follow the verified head, like every read. Limits: 128 subscriptions per connection (`-32005`) and 1,000 requests per batch, HTTP or WebSocket (`-32600`).
+Each subscription starts at the head current when it was made and reports every block after it, up to the last 64 blocks it missed (a gap fill, or a slow reader the broadcast left behind), when the next block arrives. A `logs` subscription moves on only once a block's logs were delivered: a block whose receipts can't be fetched is tried again on the next block. If it can't be told everything (more than 64 blocks behind, or receipts failing 8 blocks in a row), it ends with an error notification (`params.error`, code `-32002`) rather than skipping blocks silently; subscribe again. With `--require-verified`, `newHeads` and `logs` follow the verified head, like every read. Limits: 128 subscriptions per connection (`-32005`) and 1,000 requests per batch, HTTP or WebSocket (`-32600`).
 
 viem's `watch*` helpers use these automatically with `webSocket(...)`.
 

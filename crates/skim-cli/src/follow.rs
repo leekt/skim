@@ -419,6 +419,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         on_rollback: Box::new(|_| {}),
         lookback: 32,
         cl: None,
+        peers_know: crate::chain::peers_know(ctx.net.clone()),
     };
 
     // 0 = not started, 1 = running, 2 = done. Blocks are applied from the first envelope on, so
