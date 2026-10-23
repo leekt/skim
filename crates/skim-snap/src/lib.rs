@@ -31,7 +31,7 @@ pub type PeerId = alloy_primitives::B512;
 pub const EMPTY_ROOT_HASH: B256 =
     alloy_primitives::b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421");
 
-/// What a lookup asks for. Account and storage keys are pinned to a state root.
+/// What a lookup asks for. Account and storage keys are tied to a state root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Key {
     Account { root: B256, address: Address },

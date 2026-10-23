@@ -18,7 +18,7 @@ The measured Linux deployment uses two aarch64 cores. These are sizing recommend
 This section is the measurements and what fills when. Which knobs trade memory for latency, and why the defaults are what they are: [memory and latency](memory-and-latency.md).
 
 ### Zero config: no subscriptions, head-only
-`skim` with no config file (nothing pinned, `--history off`, default 256-block window), following Sepolia over public peers on macOS (Apple silicon), build `c704325` (run as `skim run` with no config; same behaviour as plain `skim` since `e899046`), 2026-10-19. A fresh data dir; a few read-only example scripts queried it in the first half hour, otherwise idle.
+`skim` with no config file (no subscriptions, `--history off`, default 256-block window), following Sepolia over public peers on macOS (Apple silicon), build `c704325` (run as `skim run` with no config; same behaviour as plain `skim` since `e899046`), 2026-10-19. A fresh data dir; a few read-only example scripts queried it in the first half hour, otherwise idle.
 
 | Minutes | 1 | 5 | 10 | 20 | 30 | 40 | 50 | 60 |
 |---|---|---|---|---|---|---|---|---|
@@ -43,7 +43,7 @@ This section is the measurements and what fills when. Which knobs trade memory f
 
 ### Long runs
 
-Both runs below are the production deployment: Linux aarch64, `--history local` plus an indexer, 20 subscriptions, default window, on builds that indexed every transaction (before `--tx-index pinned` became the default). "Counted structures" is the sum of what `skim_status.memory` counts.
+Both runs below are the production deployment: Linux aarch64, `--history local` plus an indexer, 20 subscriptions, default window, on builds that indexed every transaction (before `--tx-index subscribed` became the default). "Counted structures" is the sum of what `skim_status.memory` counts.
 
 **Three hours** (huge pages off):
 
@@ -64,9 +64,9 @@ Both runs below are the production deployment: Linux aarch64, `--history local` 
 
 - **It levels off with the caches.** The counted structures reached ~91 MB by ~6-7 h and stopped growing; RSS went flat with them (+3 MB over the last two hours). Over the run RSS grew about 2.3 MB per MB of counted payload: the counters count keys and values, not hash-table slots, spare capacity or allocator rounding, so the uncounted part grows with the caches rather than on its own.
 - **Where it is:** 305 of 339 MB was mimalloc's heap (skim's own allocations), 22 MB the binary, nothing else of note.
-- **The largest growing group was the transaction index** (index, per-block hash lists and BAL addresses: ~36 MB of payload). Since `9ed1f49`, transactions are indexed only if they change a pinned address (`--tx-index pinned`, the default), the index stores 8-byte hash prefixes, and the per-block lists hold those 8-byte keys instead of full hashes. Headers still fill until ~27 h (a few MB).
+- **The largest growing group was the transaction index** (index, per-block hash lists and BAL addresses: ~36 MB of payload). Since `9ed1f49`, transactions are indexed only if they change a subscribed address (`--tx-index subscribed`, the default), the index stores 8-byte hash prefixes, and the per-block lists hold those 8-byte keys instead of full hashes. Headers still fill until ~27 h (a few MB).
 
-**27 hours on the pinned-index build** (`9ed1f49`, mimalloc, the same deployment): RSS rose to ~370-400 MB by ~9 h and stayed there through 27.7 h (379 MB, peak 412). The production indexer's load is what puts it above the zero-config run below.
+**27 hours on the `--tx-index subscribed` build** (`9ed1f49`, mimalloc, the same deployment): RSS rose to ~370-400 MB by ~9 h and stayed there through 27.7 h (379 MB, peak 412). The production indexer's load is what puts it above the zero-config run below.
 
 **43 hours, zero config** (Linux aarch64, no subscriptions, head-only, mimalloc build `57478b6`; sampled every minute):
 
@@ -92,7 +92,7 @@ Both runs below are the production deployment: Linux aarch64, `--history local` 
 | Envelopes and raw BALs kept to serve peers (`cl.envelopes_served`, `chain.bals_raw`) | 64 blocks each | ~13 min |
 | Bodies, receipts, withdrawals (`chain.bodies`, `chain.receipts`, `chain.withdrawals`) | 128 blocks each | ~26 min |
 | Recent-BAL writes (`state.recent_bal_writes`) | `--window` blocks (256) | ~51 min; ~19.5 MB when full |
-| Transaction index (`chain.tx_index`, `chain.tx_blocks`): pinned transactions only by default | `--tx-index-blocks` (2,048) | ~7 h; small unless `--tx-index all` |
+| Transaction index (`chain.tx_index`, `chain.tx_blocks`): transactions of subscribed addresses only by default | `--tx-index-blocks` (2,048) | ~7 h; small unless `--tx-index all` |
 | Transactions sent through skim (`chain.sent_txs`, `chain.sent_included`) | pending: re-broadcast for up to 30 min; included: 24 h, at most 4,096 | as sent |
 | BAL addresses per block, an `eth_getLogs` pre-filter (`chain.touched`) | 2,048 blocks | ~7 h |
 | Headers (`chain.headers`) | 8,192 blocks | ~27 h |

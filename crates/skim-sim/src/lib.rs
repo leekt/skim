@@ -1,6 +1,6 @@
 //! Simulation over skim's MVCC snapshots (PROJECT.md §7).
 //!
-//! [`Simulator::call`] runs one input at a pinned block:
+//! [`Simulator::call`] runs one input at a fixed block:
 //! 1. **predict** the state it reads ([`predictor`]: learned sets + protocol-aware sources)
 //! 2. **fetch** the unknown part in one wave (parent root + BAL replay, [`prefetch::resolve`])
 //! 3. **execute** on the snapshot (revm, [`db::SnapDb`])

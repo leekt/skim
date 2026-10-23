@@ -9,7 +9,7 @@ This document describes the implemented architecture as of 2026-10-19. Operator 
 | Status | Experimental; BAL follower, verified state, local simulation, selective archive and block streams implemented |
 | Networks | Sepolia and Hoodi built in; other Glamsterdam networks through `skim run --network <dir>` (Cancun must be active by `amsterdamTime`); other subcommands are Sepolia diagnostics |
 | Consensus presets | `mainnet` and `minimal`; preset-sized light-client verification and committee rotation |
-| Language/toolchain | Rust 2024; Rust 1.97.0 pinned in `rust-toolchain.toml` |
+| Language/toolchain | Rust 2024; Rust 1.97.0, set in `rust-toolchain.toml` |
 | Core dependencies | reth v2.7.0 networking, libp2p/discv5, revm 43, alloy, redb, axum |
 
 ## 1. Thesis
@@ -94,7 +94,7 @@ This is separate from `skim-chain`'s 32-block decoded-BAL cache and 64-block raw
 
 ### 5.3 Snapshot identity and views
 
-A `Snapshot` holds an `Arc<Store>` and a `BlockRef` (number, hash, parent, state root). Reads check that the block is still canonical. A reorg or expiration can invalidate the view; holding a snapshot does not pin an independent MVCC generation beyond GC. Unknown keys can become known through verified fills at the same block.
+A `Snapshot` holds an `Arc<Store>` and a `BlockRef` (number, hash, parent, state root). Reads check that the block is still canonical. A reorg or expiration can invalidate the view; holding a snapshot does not hold an independent MVCC generation beyond GC. Unknown keys can become known through verified fills at the same block.
 
 Execution writes belong to revm's local state/overrides, not to the followed chain. Archived snapshots read only explicitly covered historical state and do not fetch missing old keys from SNAP.
 
@@ -118,9 +118,9 @@ A verified envelope is decoded into writes and recent chain data. The chain plac
 
 A read first uses held versions, verified complete storage or a contiguous recent BAL write. Otherwise, the resolver fetches at a usable recent ancestor root, verifies the answer, and replays BALs to the target. Unavailable data is retried within request/round limits, then refused with `-32002`.
 
-### 6.3.1 State provider pool (pinned SNAP peers)
+### 6.3.1 State provider pool (trusted SNAP peers)
 
-The scheduler uses connected SNAP-capable peers, scoring placement by latency and load with adaptive per-peer limits. It deduplicates jobs, batches code requests, hedges slow work (after the asked peer's own latency: mean plus four deviations, clamped to 150 ms..1.2 s, within a 10% hedge budget) and separates interactive/background priorities. `--trusted-peer` keeps selected EL peers connected; public discovery remains enabled in `skim run`. Pinning does not exempt proofs or guarantee availability. Saved-peer ranking favors useful stable peers at restart.
+The scheduler uses connected SNAP-capable peers, scoring placement by latency and load with adaptive per-peer limits. It deduplicates jobs, batches code requests, hedges slow work (after the asked peer's own latency: mean plus four deviations, clamped to 150 ms..1.2 s, within a 10% hedge budget) and separates interactive/background priorities. `--trusted-peer` keeps selected EL peers connected; public discovery remains enabled in `skim run`. A trusted peer is not exempt from proofs, and keeping it connected does not guarantee availability. Saved-peer ranking favors useful stable peers at restart.
 
 EL session defaults are 40 outbound and 15 inbound; CL peer target and mesh default to 50 and 8. These are separate from the scheduler's adaptive request concurrency.
 
@@ -160,7 +160,7 @@ Calls use revm's Amsterdam rules and the selected execution chain id. A call at 
 
 ### 7.4 JSON-RPC adapter
 
-The adapter is in `skim-cli/src/rpc.rs`, served by axum over HTTP and WebSocket. Batch requests execute with up to eight concurrent handlers, pinning `latest` to one block. [The RPC reference](docs/guide/json-rpc.md) lists all implemented methods and compatibility limits.
+The adapter is in `skim-cli/src/rpc.rs`, served by axum over HTTP and WebSocket. Batch requests execute with up to eight concurrent handlers, fixing `latest` to one block. [The RPC reference](docs/guide/json-rpc.md) lists all implemented methods and compatibility limits.
 
 Supported families include state reads, `eth_call`, gas estimation, `eth_simulateV1`, access lists/proofs, geth tracers, transactions, blocks, fee history and logs. Skim-specific methods are `skim_status`, `skim_dashboard`, `skim_subscriptionStatus`, `skim_archiveCoverage` and `skim_streamNext`.
 
@@ -186,7 +186,7 @@ After a restart, a reloaded archived key that an on-demand read warms first stil
 
 ### 7.7 Transactions
 
-`eth_getTransactionByHash`, `eth_getTransactionReceipt` and `debug_traceTransaction` find transactions through an in-memory index in `skim-chain`. `--tx-index pinned` (the default) indexes only transactions whose BAL changes touch a pinned address (one with any subscribed key); that includes the sender, through its nonce change. Transactions that only read a pinned address can't be identified without re-execution and aren't indexed. `--tx-index all` indexes every transaction. `--tx-index-blocks N` sets the covered recent blocks (2,048 by default; 0 = none). Keys are 8-byte hash prefixes, confirmed against the transaction on lookup. Unindexed transactions return null.
+`eth_getTransactionByHash`, `eth_getTransactionReceipt` and `debug_traceTransaction` find transactions through an in-memory index in `skim-chain`. `--tx-index subscribed` (the default) indexes only transactions whose BAL changes touch a subscribed address (one with any subscribed key); that includes the sender, through its nonce change. Transactions that only read a subscribed address can't be identified without re-execution and aren't indexed. `--tx-index all` indexes every transaction. `--tx-index-blocks N` sets the covered recent blocks (2,048 by default; 0 = none). Keys are 8-byte hash prefixes, confirmed against the transaction on lookup. Unindexed transactions return null.
 
 `eth_sendRawTransaction` checks and gossips a signed transaction to EL peers. Sent transactions are always found, whatever `--tx-index` is: while pending they are re-broadcast every 12 s, and dropped after 30 minutes if never included; once included they are remembered for 24 h (at most 4,096). A reorg makes an included one pending again.
 

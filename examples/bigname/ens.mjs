@@ -2,7 +2,7 @@
 //
 //   SKIM_RPC=http://localhost:8545 REF_RPC=<sepolia rpc> node bigname/ens.mjs [name ...]
 //
-// Two reads per name, both pinned to one block hash (what bigname's verified lookups do):
+// Two reads per name, both fixed to one block hash (what bigname's verified lookups do):
 //   - viem getEnsAddress (Universal Resolver, ENSv2 with the ENSv1 fallback)
 //   - the raw UniversalResolver.resolve(dnsEncode(name), addr(node)) eth_call, so reverts
 //     are compared byte for byte too
@@ -58,7 +58,7 @@ const row = async (label, run) => {
   console.log(`${ok ? 'MATCH' : 'DIFF '} ${label.padEnd(40)} ${show(a)}${ok ? '' : `  ref=${show(b)}`}  (skim ${ms.toFixed(1)} ms)`);
 };
 
-// eth_call with a blockHash (EIP-1898), as bigname pins its lookups.
+// eth_call with a blockHash (EIP-1898), as bigname fixes its lookups to a block.
 const call = (c, data) => c.request({ method: 'eth_call', params: [{ to: UR, data }, at] });
 
 for (const name of names) {

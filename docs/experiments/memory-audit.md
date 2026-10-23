@@ -6,7 +6,7 @@ A source audit of skim's memory use at `47ceff4`, with the A/B measurements it w
 
 Since the audit, current code has platform-specific allocators (mimalloc on Linux, system allocator on macOS), transparent huge pages disabled by default on Linux, 40 outbound / 15 inbound EL peer targets, per-structure memory estimates in `skim_status.memory.parts` and Grafana, and call-cache clear triggers at 20,000 entries or an estimated 32 MiB. A large result can exceed the byte trigger until the next insertion. Cached read lists contain addresses, not individual storage keys. Chain-data caches and the history database now live in `skim-chain`. The four cleanup findings below were applied (see "Review of the audit").
 
-**Current measurements:** [hardware requirements](../guide/hardware.md#memory) and [memory and latency](../guide/memory-and-latency.md). In short: production, Linux aarch64, `--history local` plus an indexer, on the build that indexed every transaction, RSS was 147 MB at start, 281 MB at 3 h, 335 MB at 6 h and 346 MB at 9 h, flat after about 7 h (+3 MB over the last 2 h). The counted structures reached ~91 MB; RSS grew about 2.3x the counted payload (hash-table and allocator overhead), and 305 of 339 MB was mimalloc's heap. Whether RSS stays flat once headers fill (~27 h) is [TODO 6](../TODO.md#memory), now measured on the `--tx-index pinned` build.
+**Current measurements:** [hardware requirements](../guide/hardware.md#memory) and [memory and latency](../guide/memory-and-latency.md). In short: production, Linux aarch64, `--history local` plus an indexer, on the build that indexed every transaction, RSS was 147 MB at start, 281 MB at 3 h, 335 MB at 6 h and 346 MB at 9 h, flat after about 7 h (+3 MB over the last 2 h). The counted structures reached ~91 MB; RSS grew about 2.3x the counted payload (hash-table and allocator overhead), and 305 of 339 MB was mimalloc's heap. Whether RSS stays flat once headers fill (~27 h) is [TODO 6](../TODO.md#memory), now measured on the `--tx-index subscribed` build.
 
 Short macOS soaks restart every 6–12 minutes and use `--window 32`: their ~100 MB medians cannot be attributed to full seven-hour transaction indexes. All in-process caches reset at restart. Payload estimates exclude allocation slack, code pages and several uninstrumented structures, so they are not a complete live-heap breakdown.
 
@@ -145,7 +145,7 @@ This excludes spare hash-table capacity, control bytes, containers, and allocato
 actual allocated memory is larger. At the same sample mix, the three caches of raw payload
 data alone would retain roughly 7.8 MiB of full SSZ envelopes, 2.8 MiB of raw BALs, and 9.6 MiB
 of transaction bytes, before decoded objects and indexes. These are overlapping representations
-of the same blocks, explicitly copied in `run.rs`, rather than accidental backing-buffer pins.
+of the same blocks, explicitly copied in `run.rs`, rather than accidental backing-buffer retention.
 
 | Consumer | Reduction | Tradeoff or limitation |
 |---|---|---|

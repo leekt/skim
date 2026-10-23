@@ -45,7 +45,7 @@
 | Peer acquisition | time to the first SNAP peer, SNAP peers seen and held (≥ 60 s), sessions by client, session ends by reason |
 | EL networking (reth) | connections, known peers, disconnect reasons (e.g. remote `too_many_peers`) |
 | JSON-RPC | request rate, P95 latency and outcomes per method, plus a method table |
-| State and addresses | the addresses your calls read (pinned / partly pinned / on demand, keys fetched), call and fetch rates per address, store size, subscription readiness, subscription maintenance time (P50/P99) and archive base writes |
+| State and addresses | the addresses your calls read (subscribed / partly subscribed / on demand, keys fetched), call and fetch rates per address, store size, subscription readiness, subscription maintenance time (P50/P99) and archive base writes |
 | Serving the network | requests skim answered for other peers, and items sent |
 | Process | CPU, RSS, file descriptors, threads, estimated retained data and entries by structure |
 
@@ -61,7 +61,7 @@ The process row's "Retained data by structure (stacked) vs RSS" compares payload
 | Subscription not ready | a subscription isn't ready for 5 min |
 | Requests refused | over 10% of requests answered `-32002` for 10 min |
 
-For a ready-to-paste `skim.yaml` block covering the hot addresses that aren't pinned, call `skim_dashboard` (JSON-RPC) and read `.result.suggestion`.
+For a ready-to-paste `skim.yaml` block covering the hot addresses that aren't subscribed, call `skim_dashboard` (JSON-RPC) and read `.result.suggestion`.
 
 The bundled head-age threshold is fixed at 36 s. Adjust it for a custom network's slot duration; choosing `--network` does not rewrite Grafana's provisioned rules.
 
@@ -93,8 +93,8 @@ The bundled head-age threshold is fixed at 36 s. Adjust it for a custom network'
 | `skim_subscription_ready`, `skim_subscription_missing_keys` | gauge | `name` |
 | `skim_served_requests_total`, `skim_served_items_total` | counter | `layer`, `kind` |
 | `skim_address_calls_total`, `skim_address_fetched_keys_total` | counter | `address` |
-| `skim_address_pinning` | gauge | `address` (2 = pinned, 1 = partly pinned, 0 = on demand) |
+| `skim_address_subscription` | gauge | `address` (2 = subscribed, 1 = partly subscribed, 0 = on demand) |
 | `skim_address_info` | gauge (always 1) | `address`, `subscription` |
-| `skim_address_slots` | gauge | `address`, `pinned` |
+| `skim_address_slots` | gauge | `address`, `subscribed` |
 | `process_*` | | CPU, memory, file descriptors, threads |
 | `network_*`, `discv4_*`, … | | reth's own network metrics |

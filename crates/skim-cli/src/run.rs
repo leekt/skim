@@ -98,11 +98,11 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = HistoryMode::Off)]
     history: HistoryMode,
     /// Which transactions `eth_getTransactionByHash`, `eth_getTransactionReceipt` and
-    /// `debug_traceTransaction` can find by hash. `pinned`: only those whose BAL changes touch
-    /// a pinned address (which covers the sender, through its nonce change; a call that only
-    /// reads a pinned contract isn't indexed), so nothing is kept about unrelated transactions. `all`: every transaction (a wallet backend or
+    /// `debug_traceTransaction` can find by hash. `subscribed`: only those whose BAL changes touch
+    /// a subscribed address (which covers the sender, through its nonce change; a call that only
+    /// reads a subscribed contract isn't indexed), so nothing is kept about unrelated transactions. `all`: every transaction (a wallet backend or
     /// explorer looking up arbitrary hashes). Transactions sent through skim are always found.
-    #[arg(long, value_enum, default_value_t = TxIndexArg::Pinned)]
+    #[arg(long, value_enum, default_value_t = TxIndexArg::Subscribed)]
     tx_index: TxIndexArg,
     /// Recent blocks the transaction index covers (2048 is about 7 h of 12 s blocks; 0 = none).
     #[arg(long, default_value_t = 2048)]
@@ -165,7 +165,7 @@ pub struct Args {
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum TxIndexArg {
-    Pinned,
+    Subscribed,
     All,
 }
 
@@ -440,7 +440,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     store.set_max_on_demand(cfg.state.limits.max_on_demand_keys.0);
     tracing::info!(subscriptions = subs.status().len(), declared_keys = subs.total_keys(), "state subscriptions loaded");
     if subs.status().is_empty() {
-        tracing::info!("no subscriptions: every state read is fetched on demand (verified) and kept current while it's used; pin hot addresses in a --config file for the lowest latency");
+        tracing::info!("no subscriptions: every state read is fetched on demand (verified) and kept current while it's used; subscribe hot addresses in a --config file for the lowest latency");
     }
     let mut ncfg = NodeConfig::from_network(&cl_net, args.cl_port);
     ncfg.explicit_peers.extend(args.cl_peer.iter().cloned());
@@ -469,12 +469,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     {
         use crate::chaindata::{TxIndexConfig, TxIndexMode};
         let mode = match args.tx_index {
-            TxIndexArg::Pinned => TxIndexMode::Pinned,
+            TxIndexArg::Subscribed => TxIndexMode::Subscribed,
             TxIndexArg::All => TxIndexMode::All,
         };
-        let pinned_store = store.clone();
-        let pinned: crate::chaindata::PinnedFn = Arc::new(move || pinned_store.pinned_addresses().into_iter().collect());
-        chaindata.set_tx_index(TxIndexConfig { mode, blocks: args.tx_index_blocks }, Some(pinned));
+        let subscribed_store = store.clone();
+        let subscribed: crate::chaindata::SubscribedFn = Arc::new(move || subscribed_store.subscribed_addresses().into_iter().collect());
+        chaindata.set_tx_index(TxIndexConfig { mode, blocks: args.tx_index_blocks }, Some(subscribed));
     }
     if args.history == HistoryMode::Local {
         anyhow::ensure!(!args.ephemeral, "--history local needs a data dir (not --ephemeral)");

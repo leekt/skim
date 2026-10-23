@@ -26,7 +26,7 @@ Subscribed state shows `ready: false` with `missing_keys > 0` in `skim_subscript
 To get peers faster:
 - **Open `--el-port`** (TCP + UDP).
 - **Keep `--data-dir`** (the default; not `--ephemeral`). skim saves the peers it dialed and re-dials them on start, SNAP-capable ones first. Those peers are often full, though, so this sometimes saves minutes and sometimes doesn't.
-- **Pin a peer you run** with `--trusted-peer`.
+- **Keep a peer you run connected** with `--trusted-peer`.
 
 **What's happening with peers:** `skim_status.peer_acquisition` (or the Grafana "Peer acquisition" row) shows:
 - time to the first SNAP peer
@@ -73,7 +73,7 @@ Fetches go through whichever peers are connected. With 1–2 peers, a wide fetch
 - **No EL peers:** check `skim_el: session` lines in the log.
 
 ### `eth_getTransactionByHash` returns `null` for a mined transaction
-skim indexes transactions by hash only for the last `--tx-index-blocks` blocks (2,048 by default), and with the default `--tx-index pinned` only those whose block access list shows a change to a pinned address (an address with any subscribed key, including the sender's nonce). A transaction that only reads a pinned contract, or touches nothing you subscribe, isn't indexed, so `eth_getTransactionByHash` and `eth_getTransactionReceipt` return `null` and `debug_traceTransaction` returns `-32002`. Remedies:
+skim indexes transactions by hash only for the last `--tx-index-blocks` blocks (2,048 by default), and with the default `--tx-index subscribed` only those whose block access list shows a change to a subscribed address (an address with any subscribed key, including the sender's nonce). A transaction that only reads a subscribed contract, or touches nothing you subscribe, isn't indexed, so `eth_getTransactionByHash` and `eth_getTransactionReceipt` return `null` and `debug_traceTransaction` returns `-32002`. Remedies:
 - **Look it up by block** if you know where it is: `eth_getBlockByNumber(n, true)`, `eth_getBlockReceipts`, `eth_getTransactionByBlockNumberAndIndex` and `debug_traceBlockByNumber` don't use the index.
 - **Index everything** with `--tx-index all` (a wallet backend or explorer). Its memory grows with chain activity over the index window, not with your subscriptions. Blocks are indexed as they arrive, so only blocks after the restart are covered.
 - **Subscribe the address** you care about, so its transactions are indexed from then on.

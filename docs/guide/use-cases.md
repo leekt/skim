@@ -8,7 +8,7 @@ Find the row closest to what your app does, then read its section: what to confi
 |---|---|---|
 | [Latest state of a few contracts](#1-latest-state-of-a-few-contracts) | `account` / `storage` subscriptions | reads in ms, current ~0.9 s after each slot |
 | [The same view calls every block](#2-the-same-view-calls-every-block) | `calls` subscriptions with `on_block` | results pushed per block, no requests |
-| [Many pinned contracts, plus reads beyond them](#3-many-pinned-contracts-plus-reads-beyond-them) | subscriptions + `storage: all` + predictors + on-demand cache | pinned reads in ms; the first unpinned read waits on peers |
+| [Many subscribed contracts, plus reads beyond them](#3-many-subscribed-contracts-plus-reads-beyond-them) | subscriptions + `storage: all` + predictors + on-demand cache | subscribed reads in ms; the first unsubscribed read waits on peers |
 | [Arbitrary calls on any contract](#4-arbitrary-calls-on-any-contract) | on-demand only (plus subscriptions for the popular ones) | warm in ms; cold reads take seconds, more on a fresh node |
 | [Event history, indexed](#5-event-history-indexed) | `--history local` + `skim_streamNext` | logs from Glamsterdam on, reorg-safe, catch-up then the head |
 | [State at past blocks](#6-state-at-past-blocks) | `retention: { mode: archive }` + `--archive` | any block since you subscribed (or ~2 weeks back with backfill) |
@@ -61,24 +61,24 @@ Read results from `skim_subscriptionStatus`, or get them pushed over WebSocket w
 
 **Limits:** a call that reads different slots each block (e.g. crossing ticks) changes its set. Keys it stops reading are released (for archived subscriptions, after 64 blocks).
 
-## 3. Many pinned contracts, plus reads beyond them
+## 3. Many subscribed contracts, plus reads beyond them
 **Need:** a set of hot contracts known in advance (pools, routers, tokens) answered instantly, plus whatever else a request happens to touch.
 
 **Set up:**
 - **Core contracts:** subscribe them. For a contract whose every slot may be read (a pool's ticks), use `storage: all` (downloaded once, verified against the storage root, then kept current; up to `max_slots`, default 50,000).
 - **Ticks near the price:** the Uniswap V3 predictor (`predictors.uniswap_v3`) prefetches the tick range a quote can reach and keeps a window around the current tick warm.
 - **Everything else:** the on-demand cache keeps it current for `cache_ttl_blocks` after use.
-- **Finding what to pin:** the dashboard's "Addresses your calls read" (or `skim_dashboard.suggestion`) lists hot addresses not pinned yet, with a ready-made `skim.yaml` block.
+- **Finding what to subscribe:** the dashboard's "Addresses your calls read" (or `skim_dashboard.suggestion`) lists hot addresses not subscribed yet, with a ready-made `skim.yaml` block.
 
 **Expect:**
-- Pinned reads in milliseconds.
-- The first read of an unpinned account or slot waits for a SNAP peer: seconds when warm peers are connected. In the worst case measured, 40 cold calls on a fresh node took 6-53 s.
+- Subscribed reads in milliseconds.
+- The first read of an unsubscribed account or slot waits for a SNAP peer: seconds when warm peers are connected. In the worst case measured, 40 cold calls on a fresh node took 6-53 s.
 - After the first read, it's cached for `cache_ttl_blocks` (default 4) and repeats are milliseconds.
 - `storage: all` costs ~100 bytes per slot.
 
-**Examples:** DEX quoting and routing over a known set of pools ([Uniswap V3](../../examples/uniswap-v3), [Uniswap V4](../../examples/uniswap-v4)), an aggregator, a lending protocol's risk engine (markets pinned, user positions on demand).
+**Examples:** DEX quoting and routing over a known set of pools ([Uniswap V3](../../examples/uniswap-v3), [Uniswap V4](../../examples/uniswap-v4)), an aggregator, a lending protocol's risk engine (markets subscribed, user positions on demand).
 
-**Limits:** cold reads depend on peers. On Sepolia, SNAP peers that serve the latest state are the scarce kind, so pin whatever must never wait.
+**Limits:** cold reads depend on peers. On Sepolia, SNAP peers that serve the latest state are the scarce kind, so subscribe whatever must never wait.
 
 ## 4. Arbitrary calls on any contract
 **Need:** reads you can't predict: whatever contract a user points at.
@@ -163,7 +163,7 @@ skim run --config skim.yaml --archive data/my-app.redb --archive-backfill 1000
 - The transaction is gossiped to connected peers and re-broadcast every 12 s for up to 30 minutes.
 - `eth_getTransactionReceipt` returns `null` until inclusion, then a receipt verified against the block.
 - Transactions sent through skim are always found by hash: pending, then included (kept 24 h, at most 4,096), then expired. A reorg that drops the block makes them pending again, and they are re-broadcast.
-- Other transactions are found by hash (`eth_getTransactionByHash`, `eth_getTransactionReceipt`, `debug_traceTransaction`) only if indexed: by default (`--tx-index pinned`) those whose state changes touch a subscribed address, which covers ones it sent (its nonce changes) and ETH it received; a transaction that only reads a subscribed contract isn't indexed. `--tx-index all` indexes every transaction. Either way the index covers the last `--tx-index-blocks` blocks (2,048, ~7 h); anything else returns `null`.
+- Other transactions are found by hash (`eth_getTransactionByHash`, `eth_getTransactionReceipt`, `debug_traceTransaction`) only if indexed: by default (`--tx-index subscribed`) those whose state changes touch a subscribed address, which covers ones it sent (its nonce changes) and ETH it received; a transaction that only reads a subscribed contract isn't indexed. `--tx-index all` indexes every transaction. Either way the index covers the last `--tx-index-blocks` blocks (2,048, ~7 h); anything else returns `null`.
 
 **Examples:** a wallet's send flow, a relayer, a bot submitting transactions.
 
@@ -176,7 +176,7 @@ skim run --config skim.yaml --archive data/my-app.redb --archive-backfill 1000
 
 **Expect:**
 - Milliseconds on warm state: ~21,000 `eth_call`/s at 100 in flight on the development machine.
-- Unpinned state is fetched as in [3](#3-many-pinned-contracts-plus-reads-beyond-them).
+- Unsubscribed state is fetched as in [3](#3-many-subscribed-contracts-plus-reads-beyond-them).
 - Results were checked against reference nodes for every tracer, state overrides and `eth_simulateV1`.
 
 **Examples:** a wallet's transaction preview and gas estimate, an intent solver evaluating routes, a searcher simulating bundles against the latest block.
@@ -202,4 +202,4 @@ skim run --config skim.yaml --archive data/my-app.redb --archive-backfill 1000
 - **Pre-Glamsterdam networks:** skim needs BALs and Gloas payload envelopes. Sepolia is built in; other compatible networks use `--network <dir>`. There is no built-in `--network mainnet` shortcut.
 - **Whole-chain analytics:** skim keeps what you use, not the chain. Queries across every contract and every block need a full or archive node and a data warehouse.
 - **The mempool:** pending transactions aren't followed.
-- **Old transactions by hash:** the index covers the last 2,048 blocks (~7 h) by default, in memory; with the default `--tx-index pinned`, only transactions touching subscribed addresses.
+- **Old transactions by hash:** the index covers the last 2,048 blocks (~7 h) by default, in memory; with the default `--tx-index subscribed`, only transactions touching subscribed addresses.

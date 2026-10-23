@@ -1,4 +1,4 @@
-"""Differential JSON-RPC harness: the same requests, pinned to one block hash, against skim and a
+"""Differential JSON-RPC harness: the same requests, fixed to one block hash, against skim and a
 reference node. Prints per-request match, skim cold (first) and warm (second) latency.
 
 usage: python3 -I rpc_diff.py http://127.0.0.1:8545 <reference-url> [rounds]

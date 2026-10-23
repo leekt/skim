@@ -6,7 +6,7 @@
 |---|---|---|
 | **Historical intake** from block 0: every ENS event since deployment | `eth_getLogs` over millions of blocks, `eth_getBlockByNumber` | **No full-history intake.** `--history local` can serve post-Glamsterdam history while peers or stored coverage supply it; pre-fork history still needs another source |
 | **Live follow** at the head | `eth_getLogs` per block range, `eth_getBlockByHash`, receipts | Yes, for the blocks skim holds |
-| **Verified lookups** (API `?verify`): Universal Resolver `eth_call` pinned to a block hash | `eth_call` with `{ blockHash }` | Yes. This is what `skim.yaml` keeps warm |
+| **Verified lookups** (API `?verify`): Universal Resolver `eth_call` at a fixed block hash | `eth_call` with `{ blockHash }` | Yes. This is what `skim.yaml` keeps warm |
 | **Hydration** (phase runner): resolver reads for names the indexer saw change | `eth_call` | Yes |
 
 So skim takes the read load (verified lookups and hydration, the calls that scale with traffic) and the reference provider handles the one-time backfill.

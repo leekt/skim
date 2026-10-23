@@ -78,11 +78,11 @@ pub enum DataError {
 /// `debug_traceTransaction`). Transactions skim sent are always tracked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxIndexMode {
-    /// Only transactions that change a pinned address: a change to it in the BAL at the
+    /// Only transactions that change a subscribed address: a change to it in the BAL at the
     /// transaction's position (which covers the sender: its nonce changes). A transaction that
-    /// only reads a pinned address isn't distinguishable without re-execution (BAL reads carry
+    /// only reads a subscribed address isn't distinguishable without re-execution (BAL reads carry
     /// no position) and isn't indexed.
-    Pinned,
+    Subscribed,
     /// Every transaction.
     All,
 }
@@ -95,15 +95,15 @@ pub struct TxIndexConfig {
 }
 
 /// The library default indexes every transaction (tests and embedders); `skim run` defaults to
-/// `--tx-index pinned` and always sets it.
+/// `--tx-index subscribed` and always sets it.
 impl Default for TxIndexConfig {
     fn default() -> Self {
         Self { mode: TxIndexMode::All, blocks: 2048 }
     }
 }
 
-/// The current pinned addresses (a subscription's addresses), asked for per indexed block.
-pub type PinnedFn = Arc<dyn Fn() -> HashSet<Address> + Send + Sync>;
+/// The current subscribed addresses (a subscription's addresses), asked for per indexed block.
+pub type SubscribedFn = Arc<dyn Fn() -> HashSet<Address> + Send + Sync>;
 
 /// A transaction hash's first 8 bytes: the index key. A hit is confirmed against the
 /// transaction itself before it's answered, so a prefix collision can't give a wrong answer.
@@ -272,7 +272,7 @@ pub struct ChainData {
     pub chain_id: u64,
     rr: AtomicUsize,
     tx_cfg: RwLock<TxIndexConfig>,
-    pinned: RwLock<Option<PinnedFn>>,
+    subscribed: RwLock<Option<SubscribedFn>>,
     /// Post-Amsterdam headers on disk (`history.redb` in the data dir), so logs and receipts
     /// cover the whole post-fork history. `None` with `--ephemeral`: memory only.
     history: std::sync::OnceLock<crate::history::HeaderStore>,
@@ -452,7 +452,7 @@ impl ChainData {
             chain_id,
             rr: AtomicUsize::new(0),
             tx_cfg: Default::default(),
-            pinned: Default::default(),
+            subscribed: Default::default(),
             history: Default::default(),
             inflight: Default::default(),
             #[cfg(any(test, feature = "testkit"))]
@@ -549,11 +549,11 @@ impl ChainData {
         let _ = self.history.set(store);
     }
 
-    /// Which transactions are indexed, and `pinned`: the pinned addresses (for
-    /// [`TxIndexMode::Pinned`]). Applies to blocks indexed from now on.
-    pub fn set_tx_index(&self, cfg: TxIndexConfig, pinned: Option<PinnedFn>) {
+    /// Which transactions are indexed, and `subscribed`: the subscribed addresses (for
+    /// [`TxIndexMode::Subscribed`]). Applies to blocks indexed from now on.
+    pub fn set_tx_index(&self, cfg: TxIndexConfig, subscribed: Option<SubscribedFn>) {
         *self.tx_cfg.write() = cfg;
-        *self.pinned.write() = pinned;
+        *self.subscribed.write() = subscribed;
         let mut g = self.inner.write();
         while g.txs.len() > cfg.blocks {
             let Some((&n, _)) = g.txs.first_key_value() else { break };
@@ -561,9 +561,9 @@ impl ChainData {
         }
     }
 
-    /// Which of a block's `n` transactions to index: all, or those changing a pinned address
+    /// Which of a block's `n` transactions to index: all, or those changing a subscribed address
     /// (by the BAL's changes per transaction). `None`: don't index the block now (index off, or
-    /// pinned mode without the block's BAL: that can't tell which transactions qualify, and
+    /// subscribed mode without the block's BAL: that can't tell which transactions qualify, and
     /// mustn't be read as "none do").
     fn select_txs(&self, bal: Option<&skim_bal::BlockAccessList>, n: usize) -> Option<Vec<bool>> {
         let cfg = *self.tx_cfg.read();
@@ -575,8 +575,8 @@ impl ChainData {
         }
         let bal = bal?;
         let mut keep = vec![false; n];
-        let Some(pinned) = self.pinned.read().clone().map(|f| f()) else { return Some(keep) };
-        if pinned.is_empty() {
+        let Some(subscribed) = self.subscribed.read().clone().map(|f| f()) else { return Some(keep) };
+        if subscribed.is_empty() {
             return Some(keep);
         }
         // BAL index 0 is the pre-execution system calls; transaction i is index i + 1.
@@ -586,7 +586,7 @@ impl ChainData {
             }
         };
         for acc in bal.iter() {
-            if !pinned.contains(&acc.address) {
+            if !subscribed.contains(&acc.address) {
                 continue;
             }
             acc.balance_changes().iter().for_each(|c| mark(c.block_access_index.0));
@@ -652,7 +652,7 @@ impl ChainData {
         };
         let Some(raw) = self.bodies.lock().get(&hash) else { return };
         let hashes = tx_hashes(&raw);
-        // Outside the lock: the pinned set comes from the store.
+        // Outside the lock: the subscribed set comes from the store.
         let keep = if indexed { None } else { self.select_txs(self.bals.lock().get(&hash).as_deref(), raw.len()) };
         let mut g = self.inner.write();
         let Some(header) = canonical(&g) else { return };
@@ -1087,7 +1087,7 @@ impl ChainData {
 
     /// A verified body fetched (and cached) for a block: indexed if the block is canonical,
     /// unless it already is under the same hash. A refetch must never shrink the index: without
-    /// the block's BAL, pinned mode leaves it as it was.
+    /// the block's BAL, subscribed mode leaves it as it was.
     fn accept_body(&self, hash: B256, header: &Header, _raw: &[Bytes]) {
         self.index_if_canonical(header.number, hash);
     }
@@ -1946,24 +1946,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn by_default_only_transactions_touching_a_pinned_address_are_indexed() {
+    async fn by_default_only_transactions_touching_a_subscribed_address_are_indexed() {
         use skim_bal::alloy_eip7928::{AccountChanges, BalanceChange, BlockAccessIndex, NonceChange};
-        let (pinned, sender, other) = (Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(3));
+        let (subscribed, sender, other) = (Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(3));
         let cd = ChainData::offline(100);
-        let set: HashSet<Address> = [pinned, sender].into();
-        cd.set_tx_index(TxIndexConfig { mode: TxIndexMode::Pinned, blocks: 16 }, Some(Arc::new(move || set.clone())));
-        // tx 0: pays the pinned address (its balance changes at BAL index 1). tx 1: sent by a
-        // pinned address (its nonce changes at index 2). tx 2: unrelated. tx 3: calls the pinned
+        let set: HashSet<Address> = [subscribed, sender].into();
+        cd.set_tx_index(TxIndexConfig { mode: TxIndexMode::Subscribed, blocks: 16 }, Some(Arc::new(move || set.clone())));
+        // tx 0: pays the subscribed address (its balance changes at BAL index 1). tx 1: sent by a
+        // subscribed address (its nonce changes at index 2). tx 2: unrelated. tx 3: calls the subscribed
         // address without changing it (a read): not indexed, by design.
         let bal = vec![
-            AccountChanges::new(pinned).with_balance_change(BalanceChange::new(BlockAccessIndex(1), alloy_primitives::U256::from(5))),
+            AccountChanges::new(subscribed).with_balance_change(BalanceChange::new(BlockAccessIndex(1), alloy_primitives::U256::from(5))),
             AccountChanges::new(sender).with_nonce_change(NonceChange::new(BlockAccessIndex(2), 1)),
         ];
-        let (_, h) = note_block(&cd, 10, &[pinned, other, other, pinned], bal);
-        assert_eq!(found(&cd, &h[0]), Some((10, 0)), "changes a pinned address");
-        assert_eq!(found(&cd, &h[1]), Some((10, 1)), "sent by a pinned address");
+        let (_, h) = note_block(&cd, 10, &[subscribed, other, other, subscribed], bal);
+        assert_eq!(found(&cd, &h[0]), Some((10, 0)), "changes a subscribed address");
+        assert_eq!(found(&cd, &h[1]), Some((10, 1)), "sent by a subscribed address");
         assert_eq!(found(&cd, &h[2]), None, "unrelated: nothing kept");
-        assert_eq!(found(&cd, &h[3]), None, "only reads a pinned address");
+        assert_eq!(found(&cd, &h[3]), None, "only reads a subscribed address");
         assert_eq!(cd.inner.read().tx_index.len(), 2);
 
         // A hash sharing a stored prefix is confirmed against the transaction, never answered.
@@ -1978,17 +1978,17 @@ mod tests {
     }
 
     /// Review: refetching an evicted body, with the BAL gone from its cache too, re-indexed the
-    /// block from "no BAL" and erased its pinned entries: the first lookup worked, the next ones
+    /// block from "no BAL" and erased its subscribed entries: the first lookup worked, the next ones
     /// returned null.
     #[tokio::test]
-    async fn refetching_an_evicted_body_keeps_the_blocks_pinned_entries() {
+    async fn refetching_an_evicted_body_keeps_the_blocks_subscribed_entries() {
         use skim_bal::alloy_eip7928::{AccountChanges, BlockAccessIndex, NonceChange};
-        let pinned = Address::repeat_byte(1);
+        let subscribed = Address::repeat_byte(1);
         let cd = ChainData::offline(100);
-        let set: HashSet<Address> = [pinned].into();
-        cd.set_tx_index(TxIndexConfig { mode: TxIndexMode::Pinned, blocks: 16 }, Some(Arc::new(move || set.clone())));
+        let set: HashSet<Address> = [subscribed].into();
+        cd.set_tx_index(TxIndexConfig { mode: TxIndexMode::Subscribed, blocks: 16 }, Some(Arc::new(move || set.clone())));
         let txs = [legacy_tx(1, Address::repeat_byte(9)), legacy_tx(2, Address::repeat_byte(9))];
-        let bal = vec![AccountChanges::new(pinned)
+        let bal = vec![AccountChanges::new(subscribed)
             .with_nonce_change(NonceChange::new(BlockAccessIndex(1), 1))
             .with_nonce_change(NonceChange::new(BlockAccessIndex(2), 2))];
         let (h, hash, raw, hashes) = block(100, &txs);
@@ -2001,7 +2001,7 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(found(&cd, &hashes[0]), Some((100, 0)));
         }
-        assert_eq!(found(&cd, &hashes[1]), Some((100, 1)), "the block's other pinned transaction");
+        assert_eq!(found(&cd, &hashes[1]), Some((100, 1)), "the block's other subscribed transaction");
     }
 
     /// Review: included sent transactions were kept forever (they kept each other alive), and once

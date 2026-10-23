@@ -1,4 +1,4 @@
-# skim: build with the pinned toolchain, run on a slim base.
+# skim: build with the toolchain from rust-toolchain.toml, run on a slim base.
 #   docker build -t skim .
 #   docker run --rm -p 8545:8545 -p 9130:9130 -p 9130:9130/udp -p 9131:9131/udp \
 #     -p 30388:30388 -p 30388:30388/udp -v skim-data:/data \

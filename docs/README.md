@@ -77,6 +77,6 @@ Scripts used by these runs, in [`experiments/tools`](experiments/tools) (run wit
 | [`mem_ab.py`](experiments/tools/mem_ab.py) | memory A/B: several builds side by side under the same load |
 | [`p0_analyze.py`](experiments/tools/p0_analyze.py) | summarizes a `skim follow` JSONL: misses, rounds per call, tails |
 | [`replay_check.py`](experiments/tools/replay_check.py) | `debug_traceTransaction` / `debug_traceBlockByNumber` vs a reference node |
-| [`rpc_diff.py`](experiments/tools/rpc_diff.py) | differential JSON-RPC harness pinned to one block hash, with cold/warm latency |
+| [`rpc_diff.py`](experiments/tools/rpc_diff.py) | differential JSON-RPC harness fixed to one block hash, with cold/warm latency |
 | [`rpc_gaps_check.py`](experiments/tools/rpc_gaps_check.py) | block data, fees, access lists, proofs, tracers and `eth_simulateV1` vs a reference node |
 | [`sim_trace_check.py`](experiments/tools/sim_trace_check.py) | state overrides, `eth_simulateV1` and `debug_traceCall` vs a reference node |

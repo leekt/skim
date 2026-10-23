@@ -303,7 +303,7 @@ pub struct ElNet {
 
 impl ElNet {
     /// Starts a Sepolia network with snap/2 advertised and the session tracker running.
-    /// `trusted` peers are kept connected (the pinned state-provider pool, PROJECT.md §6.3.1);
+    /// `trusted` peers are kept connected (the trusted state-provider pool, PROJECT.md §6.3.1);
     /// with `trusted_only`, no other peers are dialed or accepted.
     /// Must be called inside a Tokio runtime.
     pub async fn start_sepolia(

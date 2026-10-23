@@ -7,7 +7,7 @@ Measured on Sepolia, Linux aarch64, `--history local`, with an indexer:
 
 | | Memory |
 |---|---|
-| skim, following the head | 147 MB at start, 281 MB at 3 h, 346 MB at 9 h, flat after ~7 h (a build that indexed every transaction; a 27 h run on the current `--tx-index pinned` default is pending) |
+| skim, following the head | 147 MB at start, 281 MB at 3 h, 346 MB at 9 h, flat after ~7 h (a build that indexed every transaction; a 27 h run on the current `--tx-index subscribed` default is pending) |
 | skim, catching up the whole post-fork history | earlier builds reached ~500 MB transiently; the current peak has not been re-measured |
 | smallname (node) | ~90-160 MB |
 

@@ -52,7 +52,7 @@ pub struct Args {
     /// Scheduler: hedge a request to another peer after this many ms.
     #[arg(long, default_value_t = 1200)]
     hedge_ms: u64,
-    /// Pinned peers (enode URLs), e.g. a local node as the control case. Repeatable.
+    /// Trusted peers (enode URLs), e.g. a local node as the control case. Repeatable.
     #[arg(long = "trusted")]
     trusted: Vec<String>,
     /// Use trusted peers only.

@@ -2,7 +2,7 @@
 
 For an agent picking up work on **skim** (this repo). The sibling project **skim-hub** (a separate, private repo) has its own handoff. skim must stay standalone and trust-minimized; see [The skim-hub boundary](#the-skim-hub-boundary) for what is shared and what is being built where.
 
-Status as of 2026-10-19, `main` at `3e2c75d`: through the pinned transaction index (`9ed1f49`, `c774387`), `probe-retention` (`eac7020`), the EL fork-id fix (`a1ac222`), the archive base fix (`e13b916`) and the devnet state edge cases (`f87bca2`).
+Status as of 2026-10-19, `main` at `3e2c75d`: through the subscribed-address transaction index (`9ed1f49`, `c774387`), `probe-retention` (`eac7020`), the EL fork-id fix (`a1ac222`), the archive base fix (`e13b916`) and the devnet state edge cases (`f87bca2`).
 
 ## What skim is
 A minimal Ethereum node for apps: it follows payloads over CL gossip, checks BAL/header commitments, keeps subscribed and TTL-bound on-demand state (multi-version for `--window` blocks), fetches unknown state from peers over SNAP with proofs, and serves JSON-RPC, WebSocket subscriptions, `skim_streamNext` block streams and a selective archive. Default `latest` is optimistic; `safe`, `finalized` and `--require-verified` require light-client-authenticated execution hashes on the selected chain.
@@ -58,7 +58,7 @@ Read first:
 
 **On the devnet** ([devnet/](../devnet), `devnet/run.sh`): verified end to end on the minimal preset, with peers from discovery alone. The light client verifies and rotates, blocks apply ~0.53 s after their slot, and answers match the devnet's EL node (`devnet/check.py`). A live blob-parameter fork was crossed without losing peers (TODO 24 closed, M7). State edge cases (`examples/devnet-edgecases.mjs`: creation, selfdestruct, slot clearing, EIP-7702, a reverted call with value) match Nethermind at each block hash, all 11 steps (`f87bca2`).
 
-**Transaction index** (`9ed1f49`, `c774387`): `--tx-index pinned|all` (default `pinned`: only transactions whose BAL changes touch a pinned address, i.e. one with any subscribed key; that covers the sender through its nonce change; read-only interactions aren't indexed) and `--tx-index-blocks N` (2,048 by default, 0 = none). Keys are hash prefixes, confirmed against the transaction. Transactions sent through skim are always found: pending, then included (kept 24 h, at most 4,096), then expired; a reorg makes them pending again. `eth_getTransactionByHash`, `eth_getTransactionReceipt` and `debug_traceTransaction` return null for unindexed transactions.
+**Transaction index** (`9ed1f49`, `c774387`): `--tx-index subscribed|all` (default `subscribed`: only transactions whose BAL changes touch a subscribed address, i.e. one with any subscribed key; that covers the sender through its nonce change; read-only interactions aren't indexed) and `--tx-index-blocks N` (2,048 by default, 0 = none). Keys are hash prefixes, confirmed against the transaction. Transactions sent through skim are always found: pending, then included (kept 24 h, at most 4,096), then expired; a reorg makes them pending again. `eth_getTransactionByHash`, `eth_getTransactionReceipt` and `debug_traceTransaction` return null for unindexed transactions.
 
 **BAL retention on Sepolia** (`probe-retention`, 2026-10-19): all 7 eth/71 peers served BAL, body and receipts for every sampled block back to the fork block 11,856,337 (~12.7 days). EIP-7928 only requires BALs for the weak subjectivity period (3,533 epochs, ~15.7 days). One Geth peer had expired pre-merge history (M7).
 
@@ -70,12 +70,12 @@ Read first:
 
 **`skim-chain` extracted** from `skim-cli` (`c225129`): chain data and the history store as a library (no behaviour change; `ChainData::new` takes the chain id). skim-hub can depend on it.
 
-**Memory:** nine production hours (Linux aarch64, `--history local` plus an indexer, on the build that indexed every transaction) are in [hardware](guide/hardware.md#memory): RSS 147 MB at start, 346 MB at 9 h, flat after ~7 h; 305 of 339 MB was mimalloc's heap. A run on the `--tx-index pinned` build started 2026-10-19 11:31 UTC; the 27 h result decides TODO 6 and the README's footprint row, which is deliberately left until then. The [memory audit](experiments/memory-audit.md) (2026-10-18) preserves the earlier investigation; its proposals have been implemented.
+**Memory:** nine production hours (Linux aarch64, `--history local` plus an indexer, on the build that indexed every transaction) are in [hardware](guide/hardware.md#memory): RSS 147 MB at start, 346 MB at 9 h, flat after ~7 h; 305 of 339 MB was mimalloc's heap. A run on the `--tx-index subscribed` build started 2026-10-19 11:31 UTC; the 27 h result decides TODO 6 and the README's footprint row, which is deliberately left until then. The [memory audit](experiments/memory-audit.md) (2026-10-18) preserves the earlier investigation; its proposals have been implemented.
 
 ## Next tasks (in order)
 0. **Hoodi, from its Glamsterdam fork (2026-10-26 17:42:48 UTC).** `--network hoodi` is built in (`d92354c`). A zero-config run is scheduled on the production machine (ask the owner): it starts 12 minutes before the fork (a live crossing into Glamsterdam), samples memory every minute, runs `docs/experiments/tools/cold_read_bench.py` two hours after the fork, and stops after 24 hours. Then record startup, the crossing, memory, CPU and read latency in the hardware guide and M7.
 1. **Open items in [`docs/TODO.md`](TODO.md):**
-   - 6: memory past 27 h: read the pinned-index run when it reaches 27 h, update [hardware](guide/hardware.md#memory), [memory and latency](guide/memory-and-latency.md) and the README footprint row, then close or narrow the item;
+   - 6: memory past 27 h: read the subscribed-index run when it reaches 27 h, update [hardware](guide/hardware.md#memory), [memory and latency](guide/memory-and-latency.md) and the README footprint row, then close or narrow the item;
    - 25: TCP peers without yamux.
 2. **Pending measurements:**
    - **Huge pages on/off for speed:** a `skim bench-node` A/B on Linux.
@@ -90,4 +90,4 @@ The owner's decision, 2026-10:
 - **skim-hub** stays a separate, private repo: a shared chain-data hub for several skim instances, and a **trusted** setup. It keeps the pre-Glamsterdam reconstruction, which skim can't verify.
 - **The verifiable part becomes a skim mode:** post-fork headers, BALs and receipts, served with their provenance. It is being built on the `hub-mode` branch, **not on `main`**. Docs on `main` must not describe hub mode as available until it is merged.
 - **The leaf side** (`--hub <url>`) stays refused on `main` until the owner asks for it. When implemented, it must be opt-in, record the provenance of every hub answer, keep the free checks (header commitments) on, and fall back to public peers.
-- **What skim provides skim-hub:** crates (`skim-el`, `skim-cl`, `skim-bal`, `skim-state`, `skim-chain`), consumed as git dependencies pinned to a commit. Keep their public APIs stable, or coordinate changes.
+- **What skim provides skim-hub:** crates (`skim-el`, `skim-cl`, `skim-bal`, `skim-state`, `skim-chain`), consumed as git dependencies locked to a commit. Keep their public APIs stable, or coordinate changes.

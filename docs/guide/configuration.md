@@ -6,7 +6,7 @@ skim reads one YAML file (`skim run --config skim.yaml`) plus command-line flags
 ```yaml
 state:
   subscriptions:                      # your app's state: always kept ready
-    - name: <unique name>
+    - name: <unique name>             # kept current at the head; history only for --window blocks
       address: "0x…"                  # needed for account/storage
       account: true                   # balance, nonce, code hash (and the code)
       storage: ["0x0", "0x4"]         # explicit slots (hex strings), or "all" (whole storage, see below)
@@ -36,6 +36,8 @@ predictors:
 ```
 
 ### Subscriptions in detail
+A subscription keeps its keys **current**: every block's access list updates them, so reads at the head never wait on a peer, and they never expire the way on-demand keys do. It doesn't keep their **history**: like every key, a subscribed key holds versions only for the last `--window` blocks (256 by default), and older versions fold into one. Removing a subscription stops the updates. Values at older blocks need `retention: { mode: archive }` (below, and [archive](archive.md)).
+
 | Field | Effect |
 |---|---|
 | `account: true` | Subscribes balance, nonce and code hash. Code is cached for tracked accounts. |
@@ -113,7 +115,7 @@ Only `skim run` follows networks other than Sepolia (`--network`). The other sub
 | `--archive-backfill <blocks>` | `0` | extend archived history backwards from retained BALs (~2 weeks) |
 | `--history <off\|local>` | `off` | `off`: in-memory chain-data history; `local`: post-fork headers and fetched matching logs in `history.redb`; requires a data dir and cannot be combined with `--ephemeral` |
 | `--max-logs-range <blocks>` | `2048` | largest range one `eth_getLogs` may scan |
-| `--tx-index <pinned\|all>` | `pinned` | which transactions `eth_getTransactionByHash`, `eth_getTransactionReceipt` and `debug_traceTransaction` can find by hash. `pinned`: only transactions whose BAL changes touch a pinned address (an address with any subscribed key), which includes everything sent from one (its nonce changes). Nothing is kept about other transactions; lookups for them return `null`. A transaction that only *reads* a pinned contract isn't indexed (BAL reads carry no transaction position). `all`: every transaction, e.g. for a wallet backend or explorer. Transactions sent through skim are always found (see [JSON-RPC](json-rpc.md)) |
+| `--tx-index <subscribed\|all>` | `subscribed` | which transactions `eth_getTransactionByHash`, `eth_getTransactionReceipt` and `debug_traceTransaction` can find by hash. `subscribed`: only transactions whose BAL changes touch a subscribed address (an address with any subscribed key), which includes everything sent from one (its nonce changes). Nothing is kept about other transactions; lookups for them return `null`. A transaction that only *reads* a subscribed contract isn't indexed (BAL reads carry no transaction position). `all`: every transaction, e.g. for a wallet backend or explorer. Transactions sent through skim are always found (see [JSON-RPC](json-rpc.md)) |
 | `--tx-index-blocks <blocks>` | `2048` | recent blocks the transaction index covers (2,048 is ~7 h of 12 s blocks); `0` = none (sent transactions are still tracked) |
 | `--exclude-snap-peer <node-id>` | none | never use this peer for state (e.g. a node you benchmark against); repeatable |
 | `--data-dir <path>` | `~/.skim/<network>` | restart data: snapshot of subscribed state, EL node key, known peers and verified finalized root; built-in Sepolia uses `~/.skim/sepolia`, custom networks use the directory's basename |
@@ -151,6 +153,6 @@ Anything that doesn't check out (a reorg while skim was down, a gap over 8,192 b
   - **Block data and results:** block-count limits on headers, transaction indexes, bodies, receipts and BALs; the call cache clears before a new insert when it already holds 20,000 entries or an estimated 32 MiB. A single result can take it over the byte threshold until the next insertion.
   - **Database caches and peers:** bounded page caches and EL session targets also consume memory; network buffers and allocator overhead are not fully counted by `skim_status.memory`.
 
-  There is no single total RSS cap. Measurements (Linux aarch64, `--history local` plus an indexer, default window): 179 MB after 26 minutes; on a build that indexed every transaction, 281 MB at 3 h and 346 MB at 9 h, flat after ~7 h once the caches were full. Short macOS soaks with `--window 32` had 99–105 MB medians. These are different workloads and durations, not upper bounds; a run on the default `--tx-index pinned` build is still being measured. See [hardware requirements](hardware.md) and [memory and latency](memory-and-latency.md).
+  There is no single total RSS cap. Measurements (Linux aarch64, `--history local` plus an indexer, default window): 179 MB after 26 minutes; on a build that indexed every transaction, 281 MB at 3 h and 346 MB at 9 h, flat after ~7 h once the caches were full. Short macOS soaks with `--window 32` had 99–105 MB medians. These are different workloads and durations, not upper bounds; a run on the default `--tx-index subscribed` build is still being measured. See [hardware requirements](hardware.md) and [memory and latency](memory-and-latency.md).
 - **Network and CPU:** skim receives and checks every block's full payload and BAL, so this part follows the whole chain's activity, not just your keys. What scales with your app is the state it keeps and the fetches it makes.
 - **Disk:** restart data in `--data-dir` by default; `--history local` adds `history.redb`, and `--archive` writes its separately selected file. `--ephemeral` without `--archive` keeps no persistent state. Use a separate data directory and archive for each chain/genesis.

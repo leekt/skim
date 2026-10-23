@@ -57,7 +57,7 @@ The check must print `OK`. Binaries are not code-signed beyond the linker's ad-h
 
 ## Build from source
 
-The toolchain is pinned in [`rust-toolchain.toml`](../../rust-toolchain.toml) (Rust 1.97.0); `rustup` installs it on first build. A C compiler is needed for native dependencies.
+The toolchain is set in [`rust-toolchain.toml`](../../rust-toolchain.toml) (Rust 1.97.0); `rustup` installs it on first build. A C compiler is needed for native dependencies.
 
 ```sh
 cargo install --git https://github.com/leekt/skim skim-cli --locked
@@ -79,7 +79,7 @@ On Linux the binary uses mimalloc as its allocator; on macOS it uses the system 
 skim        # a Sepolia node with no config: JSON-RPC on 127.0.0.1:8545, state fetched on demand
 ```
 
-Point a wallet or any Ethereum tool at `http://127.0.0.1:8545`. Nothing needs pinning to start; subscriptions in a `--config` file are a latency optimization for state you read every block.
+Point a wallet or any Ethereum tool at `http://127.0.0.1:8545`. Nothing needs a subscription to start; subscriptions in a `--config` file are a latency optimization for state you read every block.
 
 Continue with [getting started](getting-started.md) for subscriptions and a first call, and [configuration](configuration.md) for flags and `skim.yaml`.
 

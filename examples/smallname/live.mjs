@@ -28,7 +28,7 @@ export function dnsEncode(name) {
   return bytesToHex(new Uint8Array(bytes));
 }
 
-/** A batch of eth_calls pinned to `blockHash`, as one JSON-RPC batch to skim. */
+/** A batch of eth_calls at `blockHash`, as one JSON-RPC batch to skim. */
 export class Reader {
   constructor(url, blockHash) {
     this.url = url;

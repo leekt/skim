@@ -41,7 +41,7 @@ From `probe-call-3` and `probe-call-4`. All values in ms unless marked. P50/P95.
 2. **A learned access set collapses k to 1** for every call that completed: WETH 2→1, USDC proxy 5→1, V3 quote 8→1. This is the strongest result: a repeated call shape becomes a single round. The remaining cost is the round's width (65 keys for the V3 quote, limited by per-peer concurrency), not its depth.
 3. **Naive cold k is large.** Proxies (5) and AMM quotes (8–9) are dominated by data-dependent chains. Without prediction, cold calls take 1–5 s.
 4. **Fan-out has to be spread across peers.** Firing dozens of concurrent requests at one peer gets them dropped. Width needs more peers, not more concurrency per peer.
-5. **Public snap/2 peers evict us.** Nethermind peers accept the session, then disconnect us with `TooManyPeers` after 22–51 s (7 sessions in 8 minutes), and in-flight requests are lost (1,048 dropped). A pinned pool of *public* peers isn't stable as-is. Options:
+5. **Public snap/2 peers evict us.** Nethermind peers accept the session, then disconnect us with `TooManyPeers` after 22–51 s (7 sessions in 8 minutes), and in-flight requests are lost (1,048 dropped). A trusted pool of *public* peers isn't stable as-is. Options:
    - look like a useful peer: advertise the real head and send `BlockRangeUpdate`
    - add snap/1 to reach Geth peers
    - run a dedicated snap peer
@@ -52,7 +52,7 @@ From `probe-call-3` and `probe-call-4`. All values in ms unless marked. P50/P95.
 ## Implications for the design
 - §7.2 prediction is mandatory, not an optimization. The "previous access set for the same call shape" source alone takes partially cold calls to Infura-class latency.
 - Discovery passes need divergence control. Cap keys per round, or fetch in waves that stop early, so placeholder walks don't over-fetch (the multihop case).
-- The resolver must spread a round's keys across several pinned peers, with per-peer in-flight limits (§6.3.1).
+- The resolver must spread a round's keys across several trusted peers, with per-peer in-flight limits (§6.3.1).
 - Peer retention is the gating risk for M0's go/no-go. Next experiments, in order:
   1. advertise the real head and see whether eviction stops
   2. snap/1 client support (the Geth majority)

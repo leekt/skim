@@ -6,7 +6,7 @@ These configs and scripts use Sepolia addresses and viem's Sepolia chain definit
 
 ```bash
 cargo build --release                                   # once, from the repo root
-cd examples && npm install                              # viem 2.57.1, pinned
+cd examples && npm install                              # viem 2.57.1, exact version
 ```
 
 Run the commands below from `examples/`. Wait for the relevant `skim_subscriptionStatus` entries to be ready, not just the first `state ready` line: the latter means a block was applied, and subscribed state may still be fetching. Recorded output and timings below are observations from Sepolia runs.

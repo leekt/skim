@@ -9,7 +9,7 @@
 //! and EIP-1898 `{blockHash}` / `{blockNumber}` are accepted. `pending` reads the latest state,
 //! except that `eth_getTransactionCount` counts transactions sent through skim and not yet
 //! included. `safe` and `finalized` are the light client's verified and finalized blocks;
-//! `earliest` is not tracked and answers `-32002`. Within one batch, `latest` is pinned to one
+//! `earliest` is not tracked and answers `-32002`. Within one batch, `latest` is fixed to one
 //! block.
 //!
 //! Transactions, receipts and logs come from [`crate::chaindata`].
@@ -1050,22 +1050,22 @@ impl Rpc {
         if top_addresses > 0 {
             let labels = self.subs.as_ref().map(|s| s.labels()).unwrap_or_default();
             for a in self.dash.addresses_json(&sim.store, &labels).into_iter().take(top_addresses) {
-                // Only `address` labels the counters, so a change of pinning or subscription
+                // Only `address` labels the counters, so a change of subscription
                 // never splits an address into two series.
                 let addr = a["address"].as_str().unwrap_or("").to_string();
                 counter!("skim_address_calls_total", "address" => addr.clone()).absolute(a["calls"].as_u64().unwrap_or(0));
                 counter!("skim_address_fetched_keys_total", "address" => addr.clone()).absolute(a["fetched"].as_u64().unwrap_or(0));
-                let pinning = match a["status"].as_str() {
-                    Some("pinned") => 2.0,
-                    Some("partly pinned") => 1.0,
+                let subscription = match a["status"].as_str() {
+                    Some("subscribed") => 2.0,
+                    Some("partly subscribed") => 1.0,
                     _ => 0.0,
                 };
-                gauge!("skim_address_pinning", "address" => addr.clone()).set(pinning);
+                gauge!("skim_address_subscription", "address" => addr.clone()).set(subscription);
                 gauge!("skim_address_info", "address" => addr.clone(), "subscription" => a["label"].as_str().unwrap_or("").to_string()).set(1.0);
                 let slots = a["slots"].as_u64().unwrap_or(0);
-                let unpinned = a["unpinned_slots"].as_u64().unwrap_or(0);
-                gauge!("skim_address_slots", "address" => addr.clone(), "pinned" => "true").set((slots - unpinned) as f64);
-                gauge!("skim_address_slots", "address" => addr, "pinned" => "false").set(unpinned as f64);
+                let unsubscribed = a["unsubscribed_slots"].as_u64().unwrap_or(0);
+                gauge!("skim_address_slots", "address" => addr.clone(), "subscribed" => "true").set((slots - unsubscribed) as f64);
+                gauge!("skim_address_slots", "address" => addr, "subscribed" => "false").set(unsubscribed as f64);
             }
         }
     }
@@ -1158,7 +1158,7 @@ impl Rpc {
         let q = |p: f64| arrivals.get(((arrivals.len() as f64 - 1.0) * p).round() as usize).copied().map(round2);
         let labels = self.subs.as_ref().map(|s| s.labels()).unwrap_or_default();
         let addresses = self.dash.addresses_json(&sim.store, &labels);
-        let unpinned = addresses.iter().filter(|a| a["status"] != "pinned").count();
+        let unsubscribed = addresses.iter().filter(|a| a["status"] != "subscribed").count();
         let z = sim.store.sizes();
         let el_kinds: Vec<&str> = peers.iter().map(|(_, p)| p.client.as_str()).collect();
         json!({
@@ -1173,7 +1173,7 @@ impl Rpc {
                 "subscribed_keys": z.watched_keys,
                 "on_demand_keys": z.temp_keys,
                 "addresses_used": addresses.len(),
-                "addresses_not_pinned": unpinned,
+                "addresses_not_subscribed": unsubscribed,
                 "arrival_p50_ms": q(0.5),
                 "arrival_p90_ms": q(0.9),
             },

@@ -48,7 +48,7 @@ The [review](REVIEW.md) lists every finding; these are the open ones that need d
     request's total fetches are bounded and measured under a cold-burst load.
 
 ## Memory
-6. **Whether RSS levels off.** Mostly, with a slow tail. Production (pinned-index build, mimalloc)
+6. **Whether RSS levels off.** Mostly, with a slow tail. Production (`--tx-index subscribed` build, mimalloc)
    stayed ~370-400 MB from ~9 h through 27.7 h. A 43 h zero-config soak plateaued by ~6 h
    (~268 MB) and then crept ~1 MB/h to 307 MB, with what still fills (headers until ~27 h)
    accounting for a fraction of it ([hardware](guide/hardware.md#long-runs)). Production on

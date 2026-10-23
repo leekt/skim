@@ -153,13 +153,13 @@ skim                                      # a Sepolia node, no config: JSON-RPC 
 skim status                               # how it's doing, with hints
 ```
 
-No addresses need pinning to start: every state read is fetched on demand, verified, and kept current while it's used. A config that subscribes your app's hot state is a latency optimization:
+No addresses need a subscription to start: every state read is fetched on demand, verified, and kept current while it's used. A config that subscribes your app's hot state is a latency optimization:
 
 ```bash
 skim --config examples/uniswap-v3/skim.yaml
 ```
 
-From source: `git clone https://github.com/leekt/skim && cd skim && cargo build --release` (Rust 1.97, pinned in `rust-toolchain.toml`); see [installation](docs/guide/install.md). Or with Docker (`docker build -t skim .`; the image's default command is `run --rpc 0.0.0.0:8545 --data-dir /data`). Tagged releases publish Linux and macOS binaries and an image at `ghcr.io/leekt/skim`.
+From source: `git clone https://github.com/leekt/skim && cd skim && cargo build --release` (Rust 1.97, set in `rust-toolchain.toml`); see [installation](docs/guide/install.md). Or with Docker (`docker build -t skim .`; the image's default command is `run --rpc 0.0.0.0:8545 --data-dir /data`). Tagged releases publish Linux and macOS binaries and an image at `ghcr.io/leekt/skim`.
 
 Wait for `state ready` in the log (logged for each applied block; `skim_subscriptionStatus` says when your subscriptions are ready). Then point any Ethereum tooling at `http://127.0.0.1:8545`:
 
@@ -186,7 +186,7 @@ docker compose -f metrics/docker-compose.yaml up -d     # Grafana on port 3001, 
 The dashboard shows:
 - peers by client, with SNAP latency per peer
 - block arrival and RPC latency per method
-- which addresses your calls read, and which of them aren't pinned by a subscription
+- which addresses your calls read, and which of them aren't covered by a subscription
 - what skim serves to other peers, and process CPU and memory
 - estimated retained payloads, entries and capacities by structure, compared with RSS
 
@@ -218,7 +218,7 @@ For network development, see the [local devnet walkthrough](devnet/README.md). [
 
 **Supported methods:**
 - State and simulation: `eth_call` (with state overrides), `eth_simulateV1`, `debug_traceCall` / `debug_traceTransaction` / `debug_traceBlockBy*` (default, `callTracer`, `prestateTracer`, `4byteTracer`, `muxTracer`), `eth_createAccessList`, `eth_getProof`, `eth_estimateGas`, `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`, `eth_getTransactionCount` (including `pending`)
-- Transactions: `eth_sendRawTransaction` (gossiped straight to EL peers), `eth_getTransactionByHash`, `eth_getTransactionReceipt`, `eth_getTransactionByBlock*AndIndex`. Lookups by hash cover recent transactions that change a subscribed address (`--tx-index pinned`, the default) or every transaction (`--tx-index all`), plus every transaction sent through skim; others return null.
+- Transactions: `eth_sendRawTransaction` (gossiped straight to EL peers), `eth_getTransactionByHash`, `eth_getTransactionReceipt`, `eth_getTransactionByBlock*AndIndex`. Lookups by hash cover recent transactions that change a subscribed address (`--tx-index subscribed`, the default) or every transaction (`--tx-index all`), plus every transaction sent through skim; others return null.
 - Logs: `eth_getLogs`. Receipts are fetched only for blocks whose bloom and BAL match, and checked against `receiptsRoot`.
 - Blocks and chain: `eth_getBlockByNumber` / `eth_getBlockByHash` (full transactions), `eth_getBlockReceipts`, `eth_feeHistory`, `eth_getBlockTransactionCountBy*`, `eth_blockNumber`, `eth_chainId`, `net_version`, `net_listening`, `eth_syncing`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `web3_clientVersion`
 - `skim_subscriptionStatus`, `skim_status` (including per-structure memory estimates), `skim_dashboard`, `skim_archiveCoverage`, `skim_streamNext` (stateless block streams with log/BAL changes, reorg rewinds and gaps)

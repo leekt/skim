@@ -38,7 +38,7 @@ Combined results from run 1 (10 min) and run 3 (15 min):
 
 ## Findings
 1. **The protocol path works.** BALs by hash, verified against the header commitment, plus SNAP point lookups at a fresh root, reproduce correct state with zero mismatches (147 BALs, 40 slot reads). This is the core feasibility assumption.
-2. **A storage point lookup costs about 290 ms P50 / 550 ms P95** from this location, over whichever peer was connected. Pinned, low-RTT peers (Spike B2) should improve this. `peer_rtt_ms` isn't measured yet.
+2. **A storage point lookup costs about 290 ms P50 / 550 ms P95** from this location, over whichever peer was connected. Trusted, low-RTT peers (Spike B2) should improve this. `peer_rtt_ms` isn't measured yet.
 3. **Account lookups are about 2× slower than storage lookups.** It's unclear whether this comes from message type or from being the first request at a fresh root. Next step: repeat the account request at the same root.
 4. **Peer availability is the real constraint:**
    - Public nodes are full (`TooManyPeers`), and it takes minutes to collect even 5–7 real peers.
@@ -47,7 +47,7 @@ Combined results from run 1 (10 min) and run 3 (15 min):
 
 ## Next steps
 - **snap/1 client support.** `GetAccountRange`, `GetStorageRanges` and `GetByteCodes` (0x00–0x05) are the same in snap/1 and snap/2, except for the slim-account encoding. A snap/1 RLPx subprotocol client, alongside reth's snap/2, would make Geth peers usable as state sources. This is the biggest lever on availability.
-- **Spike B2: pinned pool.** Pick 3–5 peers from the per-peer scorecard (`per_peer` in the probe summary, now with enodes), pin them with `--trusted`, and measure storage P50/P95 and retention over hours.
+- **Spike B2: trusted pool.** Pick 3–5 peers from the per-peer scorecard (`per_peer` in the probe summary, now with enodes), keep them connected with `--trusted`, and measure storage P50/P95 and retention over hours.
 - **Separate RTT from serving time.** Measure `peer_rtt_ms`, and repeat account requests at the same root (finding 3).
 - **Spike C.** Compare against Infura `eth_call` at the same block. This needs an Infura Sepolia URL in an environment variable, used only by the harness.
 - **Spike A: CL payload gossip.** Use Lighthouse v8.3.0-rc.0 networking (progressive SSZ). Baseline to beat: 1.0–1.3 s EL header lag, plus about 360 ms BAL fetch.

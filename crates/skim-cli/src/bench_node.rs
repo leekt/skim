@@ -1,6 +1,6 @@
 //! P3 benchmark driver: the same per-block workload `skim follow` runs (7 fixed calls + the same
 //! seeded random V3 quotes), sent over JSON-RPC to one or more endpoints (skim and/or a full
-//! node), pinned to the **same block hash**.
+//! node), fixed to the **same block hash**.
 //!
 //! Per block, per endpoint:
 //! - **readiness:** time from the block's slot start until the endpoint first answers `eth_call` at

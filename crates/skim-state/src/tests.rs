@@ -472,10 +472,10 @@ fn a_reorged_out_download_also_stops_its_address_being_watched() {
     s.apply_block(blk(2, 0), writes(&[])).unwrap();
     let h = |i: u64| keccak256(U256::from(i).to_be_bytes::<32>());
     s.install_complete_storage(&blk(2, 0), A, vec![(h(1), U256::from(10))]).unwrap();
-    assert!(s.pinned_addresses().contains(&A));
+    assert!(s.subscribed_addresses().contains(&A));
     assert_eq!(s.sizes().watched_addresses, 1);
     s.rollback_to(1);
-    assert!(!s.pinned_addresses().contains(&A));
+    assert!(!s.subscribed_addresses().contains(&A));
     assert!(!s.is_subscribed(&slot(7)));
     assert_eq!(s.sizes().watched_addresses, 0);
 }

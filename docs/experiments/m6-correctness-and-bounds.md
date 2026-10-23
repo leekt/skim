@@ -25,7 +25,7 @@ Every 6–12 minutes the soak either killed skim (SIGKILL), restarted it gracefu
 
 **Setup:**
 - `max_subscribed_keys: 60`, `--window 32` (so archived reads come from disk)
-- a local full node pinned as the state peer (`--trusted-peer`; its answers are still Merkle-checked)
+- a local full node kept as the trusted state peer (`--trusted-peer`; its answers are still Merkle-checked)
 - a separate reference node
 
 Partway through, the binary under test was rebuilt with restart persistence, so later restarts also exercised the snapshot path.

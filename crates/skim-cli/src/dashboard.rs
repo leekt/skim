@@ -1,5 +1,5 @@
 //! Usage and latency history behind `skim_dashboard` and the Prometheus metrics: which contract
-//! addresses requests read (pinned by a subscription or not), RPC latency per method, and
+//! addresses requests read (covered by a subscription or not), RPC latency per method, and
 //! block arrival.
 
 use std::{
@@ -126,7 +126,7 @@ impl Dashboard {
         self.started.elapsed().as_secs()
     }
 
-    /// Addresses by calls, with how much of what was read is pinned by a subscription.
+    /// Addresses by calls, with how much of what was read is covered by a subscription.
     /// `labels`: subscription names by address.
     pub fn addresses_json(&self, store: &Store, labels: &HashMap<Address, String>) -> Vec<Value> {
         let u = self.usage.lock();
@@ -135,12 +135,12 @@ impl Dashboard {
         rows.into_iter()
             .take(200)
             .map(|(a, e)| {
-                let account_pinned = store.is_subscribed(&StateKey::Balance(*a));
-                let pinned_slots = e.slots.iter().filter(|s| store.is_subscribed(&StateKey::Storage(*a, **s))).count();
-                let unpinned = e.slots.len() - pinned_slots;
-                let status = match (account_pinned || pinned_slots > 0, unpinned) {
-                    (true, 0) => "pinned",
-                    (true, _) => "partly pinned",
+                let account_subscribed = store.is_subscribed(&StateKey::Balance(*a));
+                let subscribed_slots = e.slots.iter().filter(|s| store.is_subscribed(&StateKey::Storage(*a, **s))).count();
+                let unsubscribed = e.slots.len() - subscribed_slots;
+                let status = match (account_subscribed || subscribed_slots > 0, unsubscribed) {
+                    (true, 0) => "subscribed",
+                    (true, _) => "partly subscribed",
                     (false, _) => "on demand",
                 };
                 json!({
@@ -149,7 +149,7 @@ impl Dashboard {
                     "status": status,
                     "calls": e.calls,
                     "slots": e.slots.len(),
-                    "unpinned_slots": unpinned,
+                    "unsubscribed_slots": unsubscribed,
                     "slot_reads": e.slot_reads,
                     "fetched": e.fetched,
                     "last_block": e.last_block,
@@ -158,7 +158,7 @@ impl Dashboard {
             .collect()
     }
 
-    /// A `skim.yaml` subscription block for the most-used addresses that aren't fully pinned.
+    /// A `skim.yaml` subscription block for the most-used addresses that aren't fully subscribed.
     pub fn suggestion(&self, store: &Store) -> String {
         let u = self.usage.lock();
         let mut rows: Vec<(&Address, &AddrUsage)> = u

@@ -68,9 +68,9 @@ fn describe() {
     describe_counter!("skim_served_items_total", "Items skim sent to other peers");
     describe_counter!("skim_address_calls_total", "eth_call executions that read this address (top N)");
     describe_counter!("skim_address_fetched_keys_total", "Keys fetched from the network for this address (top N)");
-    describe_gauge!("skim_address_slots", "Distinct slots read at this address, by pinning (top N)");
-    describe_gauge!("skim_address_pinning", "2 = pinned by a subscription, 1 = partly pinned, 0 = on demand (top N)");
-    describe_gauge!("skim_address_info", "Always 1; `subscription` names the subscription that pins the address, if any (top N)");
+    describe_gauge!("skim_address_slots", "Distinct slots read at this address, by subscription status (top N)");
+    describe_gauge!("skim_address_subscription", "2 = covered by a subscription, 1 = partly subscribed, 0 = on demand (top N)");
+    describe_gauge!("skim_address_info", "Always 1; `subscription` names the subscription that covers the address, if any (top N)");
 }
 
 /// Serves `/metrics` until the process exits.

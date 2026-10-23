@@ -42,7 +42,7 @@ pub struct Args {
     /// Peers to query in parallel for each BAL / SNAP measurement.
     #[arg(long, default_value_t = 3)]
     fanout: usize,
-    /// Pinned peers (enode URLs), kept connected as the state-provider pool. Repeatable.
+    /// Trusted peers (enode URLs), kept connected as the state-provider pool. Repeatable.
     #[arg(long = "trusted")]
     trusted: Vec<String>,
     /// Connect to trusted peers only (Spike B2).

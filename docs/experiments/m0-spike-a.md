@@ -129,7 +129,7 @@ Remaining risks:
 | Not needed | `lighthouse_network`. The crates.io libp2p 0.57 stack worked without the sigp fork or `[patch]`es. |
 
 ## Next
-- Hold a larger, more stable `execution_payload` mesh. Options: explicit or pinned infra peers, a higher `mesh_n` for that topic, and/or real column custody so peers value us.
+- Hold a larger, more stable `execution_payload` mesh. Options: explicit or trusted infra peers, a higher `mesh_n` for that topic, and/or real column custody so peers value us.
 - Then re-measure the envelope P50 gap.
 - Feed `verify_payload` output straight into the state follower (`skim-bal::BlockWrites`), with the "candidate until selected" rule from §3.2.
 

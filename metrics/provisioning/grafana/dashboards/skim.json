@@ -503,15 +503,15 @@
     },
     {
       "type": "stat",
-      "title": "Addresses not fully pinned",
-      "description": "Addresses your calls read that no subscription fully pins (see State and addresses).",
+      "title": "Addresses not fully subscribed",
+      "description": "Addresses your calls read that no subscription fully covers (see State and addresses).",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "count(skim_address_pinning{instance=~\"$instance\"} < 2) or vector(0)",
+          "expr": "count(skim_address_subscription{instance=~\"$instance\"} < 2) or vector(0)",
           "legendFormat": "",
           "refId": "A",
           "instant": true,
@@ -2333,7 +2333,7 @@
     {
       "type": "table",
       "title": "Addresses your calls read",
-      "description": "Every address eth_call executions read (top --metrics-addresses). pinned = kept current by a subscription; on demand = fetched from SNAP peers and cached briefly. Pin hot on-demand addresses in skim.yaml (skim_dashboard returns a ready-made block).",
+      "description": "Every address eth_call executions read (top --metrics-addresses). subscribed = kept current by a subscription; on demand = fetched from SNAP peers and cached briefly. Subscribe hot on-demand addresses in skim.yaml (skim_dashboard returns a ready-made block).",
       "targets": [
         {
           "datasource": {
@@ -2352,7 +2352,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max by (address) (skim_address_pinning{instance=~\"$instance\"})",
+          "expr": "max by (address) (skim_address_subscription{instance=~\"$instance\"})",
           "legendFormat": "",
           "refId": "B",
           "instant": true,
@@ -2364,7 +2364,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max by (address) (skim_address_slots{pinned=\"true\", instance=~\"$instance\"})",
+          "expr": "max by (address) (skim_address_slots{subscribed=\"true\", instance=~\"$instance\"})",
           "legendFormat": "",
           "refId": "C",
           "instant": true,
@@ -2376,7 +2376,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max by (address) (skim_address_slots{pinned=\"false\", instance=~\"$instance\"})",
+          "expr": "max by (address) (skim_address_slots{subscribed=\"false\", instance=~\"$instance\"})",
           "legendFormat": "",
           "refId": "D",
           "instant": true,
@@ -2425,8 +2425,8 @@
               "subscription": "Subscription",
               "Value #A": "Calls",
               "Value #B": "Status",
-              "Value #C": "Slots pinned",
-              "Value #D": "Slots not pinned",
+              "Value #C": "Slots subscribed",
+              "Value #D": "Slots not subscribed",
               "Value #E": "Keys fetched"
             },
             "indexByName": {
@@ -2481,12 +2481,12 @@
                     "type": "value",
                     "options": {
                       "2": {
-                        "text": "pinned",
+                        "text": "subscribed",
                         "color": "green",
                         "index": 0
                       },
                       "1": {
-                        "text": "partly pinned",
+                        "text": "partly subscribed",
                         "color": "orange",
                         "index": 1
                       },
@@ -2604,7 +2604,7 @@
     {
       "type": "timeseries",
       "title": "Keys fetched from the network per address",
-      "description": "Steady fetching means the address is read often but not pinned.",
+      "description": "Steady fetching means the address is read often but not subscribed.",
       "targets": [
         {
           "datasource": {

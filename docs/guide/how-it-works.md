@@ -65,7 +65,7 @@ Calls run in [revm](https://github.com/bluealloy/revm) with Amsterdam rules, aga
   - checks the transaction against verified head state (chain id, nonce, balance)
   - sends it straight to every connected EL peer
   - re-broadcasts it until a gossiped payload includes it
-- **Lookups by hash** (`eth_getTransactionByHash`, `eth_getTransactionReceipt`, `debug_traceTransaction`): as payloads arrive, skim indexes transaction hashes (8-byte prefixes, confirmed against the verified body on lookup) for the last `--tx-index-blocks` blocks (2,048). By default (`--tx-index pinned`) it indexes only transactions whose BAL entries change a pinned address, so it keeps nothing about the rest of the chain; `--tx-index all` indexes every transaction. Transactions sent through skim are tracked separately and always found.
+- **Lookups by hash** (`eth_getTransactionByHash`, `eth_getTransactionReceipt`, `debug_traceTransaction`): as payloads arrive, skim indexes transaction hashes (8-byte prefixes, confirmed against the verified body on lookup) for the last `--tx-index-blocks` blocks (2,048). By default (`--tx-index subscribed`) it indexes only transactions whose BAL entries change a subscribed address, so it keeps nothing about the rest of the chain; `--tx-index all` indexes every transaction. Transactions sent through skim are tracked separately and always found.
 - **Receipts:** fetched with `GetReceipts` for that one block, and accepted only if they rebuild the header's `receiptsRoot`.
 - **`eth_getLogs`:**
   - scans headers in the range

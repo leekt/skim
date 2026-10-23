@@ -28,7 +28,7 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "{{ $labels.instance }} has no SNAP state peer"
-          description: State skim doesn't hold can't be fetched; such requests wait (--state-wait) and then fail with -32002. Pin a peer with --trusted-peer.
+          description: State skim doesn't hold can't be fetched; such requests wait (--state-wait) and then fail with -32002. Keep a peer you run connected with --trusted-peer.
       - uid: skim-head-stale
         title: Head behind
         condition: C

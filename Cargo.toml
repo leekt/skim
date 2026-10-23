@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
-# Pinned to the versions reth v2.7.0 uses, so one alloy/revm graph is shared with reth crates.
+# Exactly the versions reth v2.7.0 uses, so one alloy/revm graph is shared with reth crates.
 alloy-primitives = { version = "1.6.1", features = ["serde"] }
 alloy-rlp = "0.3.16"
 alloy-eip7928 = { version = "0.4.10", features = ["rlp"] }

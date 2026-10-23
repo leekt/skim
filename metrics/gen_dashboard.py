@@ -110,8 +110,8 @@ stat("CL peers", f'skim_peers{{layer="cl", {I}}}', x=20, w=4)
 next_row(4)
 stat("Subscribed keys", f'skim_store_keys{{kind="subscribed", {I}}}', x=0, w=4)
 stat("On-demand keys", f'skim_store_keys{{kind="on_demand", {I}}}', x=4, w=4)
-stat("Addresses not fully pinned", f"count(skim_address_pinning{{{I}}} < 2) or vector(0)", x=8, w=4,
-     desc="Addresses your calls read that no subscription fully pins (see State and addresses).")
+stat("Addresses not fully subscribed", f"count(skim_address_subscription{{{I}}} < 2) or vector(0)", x=8, w=4,
+     desc="Addresses your calls read that no subscription fully covers (see State and addresses).")
 stat("RPC requests/s", f"sum(rate(skim_rpc_requests_total{{{I}}}[1m]))", "reqps", x=12, w=4, decimals=2)
 stat("Memory (RSS)", f"process_resident_memory_bytes{{{I}}}", "bytes", x=16, w=4, decimals=0)
 stat("Uptime", f"time() - process_start_time_seconds{{{I}}}", "s", x=20, w=4, decimals=0)
@@ -196,23 +196,23 @@ next_row(8)
 row("State and addresses")
 table("Addresses your calls read", [
     target(f"max by (address) (skim_address_calls_total{{{I}}})", instant=True, fmt="table"),
-    target(f"max by (address) (skim_address_pinning{{{I}}})", instant=True, fmt="table", ref="B"),
-    target(f'max by (address) (skim_address_slots{{pinned="true", {I}}})', instant=True, fmt="table", ref="C"),
-    target(f'max by (address) (skim_address_slots{{pinned="false", {I}}})', instant=True, fmt="table", ref="D"),
+    target(f"max by (address) (skim_address_subscription{{{I}}})", instant=True, fmt="table", ref="B"),
+    target(f'max by (address) (skim_address_slots{{subscribed="true", {I}}})', instant=True, fmt="table", ref="C"),
+    target(f'max by (address) (skim_address_slots{{subscribed="false", {I}}})', instant=True, fmt="table", ref="D"),
     target(f"max by (address) (skim_address_fetched_keys_total{{{I}}})", instant=True, fmt="table", ref="E"),
     target(f"max by (address, subscription) (skim_address_info{{{I}}})", instant=True, fmt="table", ref="F"),
 ], {"excludeByName": {"Time": True, "Value #F": True}, "renameByName": {"address": "Address", "subscription": "Subscription", "Value #A": "Calls",
-    "Value #B": "Status", "Value #C": "Slots pinned", "Value #D": "Slots not pinned", "Value #E": "Keys fetched"},
+    "Value #B": "Status", "Value #C": "Slots subscribed", "Value #D": "Slots not subscribed", "Value #E": "Keys fetched"},
     "indexByName": {"address": 0, "subscription": 1, "Value #B": 2, "Value #A": 3, "Value #C": 4, "Value #D": 5, "Value #E": 6}},
     w=24, h=10, sort="Calls",
-    desc="Every address eth_call executions read (top --metrics-addresses). pinned = kept current by a subscription; on demand = fetched from SNAP peers and cached briefly. "
-         "Pin hot on-demand addresses in skim.yaml (skim_dashboard returns a ready-made block).",
+    desc="Every address eth_call executions read (top --metrics-addresses). subscribed = kept current by a subscription; on demand = fetched from SNAP peers and cached briefly. "
+         "Subscribe hot on-demand addresses in skim.yaml (skim_dashboard returns a ready-made block).",
     overrides=[
         {"matcher": {"id": "byName", "options": "Status"}, "properties": [
             {"id": "custom.cellOptions", "value": {"type": "color-text"}},
             {"id": "mappings", "value": [{"type": "value", "options": {
-                "2": {"text": "pinned", "color": "green", "index": 0},
-                "1": {"text": "partly pinned", "color": "orange", "index": 1},
+                "2": {"text": "subscribed", "color": "green", "index": 0},
+                "1": {"text": "partly subscribed", "color": "orange", "index": 1},
                 "0": {"text": "on demand", "color": "red", "index": 2}}}]}]},
         {"matcher": {"id": "byName", "options": "Address"}, "properties": [{"id": "custom.width", "value": 400}]},
         {"matcher": {"id": "byRegexp", "options": "Calls|Slots.*|Keys fetched"}, "properties": [{"id": "decimals", "value": 0}]},
@@ -220,7 +220,7 @@ table("Addresses your calls read", [
 next_row(10)
 ts("Calls per address (top 10)", [target(f"topk(10, sum by (address) (rate(skim_address_calls_total{{{I}}}[$__rate_interval])))", "{{address}}")], "ops", x=0, w=12, legend_table=True)
 ts("Keys fetched from the network per address", [target(f"topk(10, sum by (address) (rate(skim_address_fetched_keys_total{{{I}}}[$__rate_interval])))", "{{address}}")], "ops", x=12, w=12, legend_table=True,
-   desc="Steady fetching means the address is read often but not pinned.")
+   desc="Steady fetching means the address is read often but not subscribed.")
 next_row(8)
 ts("Store keys", [target(f"skim_store_keys{{{I}}}", "{{kind}}")], x=0, w=8)
 ts("Store memory", [target(f"skim_store_bytes{{{I}}}", "{{kind}}")], "bytes", x=8, w=8)

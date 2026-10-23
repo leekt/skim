@@ -109,7 +109,7 @@ export const V2_DISCOVERY_EVENTS = [
   "ContenthashUpdated", "TextUpdated", "NameUpdated",
 ];
 
-// Live reads (always pinned to a block hash).
+// Live reads (always at a fixed block hash).
 export const VIEWS = {
   registry: parseAbi([
     "function owner(bytes32 node) view returns (address)",

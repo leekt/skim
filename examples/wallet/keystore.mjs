@@ -9,7 +9,7 @@
 import { createCipheriv, createDecipheriv, pbkdf2Sync, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto'
 import { bytesToHex, hexToBytes, keccak256 } from 'viem'
 import { privateKeyToAddress } from 'viem/accounts'
-// viem's own (pinned) dependency, used only for scrypt parameters OpenSSL refuses (see deriveKey).
+// viem's own (exact-version) dependency, used only for scrypt parameters OpenSSL refuses (see deriveKey).
 import { scrypt as nobleScrypt } from '@noble/hashes/scrypt'
 
 // geth's "standard" scrypt parameters: ~256 MiB and about a second per derivation, on purpose.

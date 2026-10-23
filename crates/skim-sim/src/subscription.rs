@@ -286,7 +286,7 @@ impl Subscriptions {
         self.required.read().values().map(HashSet::len).sum()
     }
 
-    /// Subscription name per address it pins (declared addresses first, then addresses of
+    /// Subscription name per address it covers (declared addresses first, then addresses of
     /// keys learned from its calls).
     pub fn labels(&self) -> std::collections::HashMap<Address, String> {
         let mut m = std::collections::HashMap::new();

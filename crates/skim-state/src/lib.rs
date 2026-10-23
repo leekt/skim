@@ -640,8 +640,8 @@ impl Store {
     }
 
     /// Addresses with any subscribed key (an account field, a slot, or whole storage): what the
-    /// dashboard calls pinned.
-    pub fn pinned_addresses(&self) -> HashSet<Address> {
+    /// dashboard calls subscribed.
+    pub fn subscribed_addresses(&self) -> HashSet<Address> {
         let st = self.inner.read();
         let mut out = st.watched_addresses.clone();
         out.extend(st.complete.keys().copied());
