@@ -855,6 +855,24 @@ impl Rpc {
                 };
                 Ok(crate::stream::next(chain, tip, self.events.subscribe(), finalized, req).await?)
             }
+            // The block's raw EIP-7928 access list, exactly the bytes its header commits to with
+            // `blockAccessListHash`. A client checks keccak256(raw) against the header itself
+            // instead of trusting the decoded `stateChanges` of skim_streamNext (which are this
+            // list, filtered by address).
+            "skim_getBlockAccessList" => {
+                let chain = self.chain()?;
+                let hash: B256 = need(params, 0)?;
+                let b = self.resolve_block(Some(BlockId::from(hash)), latest)?;
+                let h = self.header(&b)?;
+                let Some(committed) = h.block_access_list_hash else {
+                    return Err(RpcError::unavailable(format!("block {} has no access list (before Amsterdam)", b.number)));
+                };
+                if chain.cached_bal(hash).is_none() {
+                    chain.block_bal(hash, &h).await?;
+                }
+                let raw = chain.cached_bal(hash).ok_or_else(|| RpcError::unavailable(format!("block {} access list not held", b.number)))?;
+                Ok(json!({"blockHash": hash, "number": hex_u64(b.number), "blockAccessListHash": committed, "raw": raw}))
+            }
             "skim_archiveCoverage" => {
                 let a: Address = need(params, 0)?;
                 Ok(Value::Array(

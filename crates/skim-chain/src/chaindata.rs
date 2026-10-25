@@ -2004,6 +2004,26 @@ mod tests {
         assert_eq!(found(&cd, &hashes[1]), Some((100, 1)), "the block's other subscribed transaction");
     }
 
+    /// skim_getBlockAccessList serves `cached_bal`: the exact bytes the header commits to, so a
+    /// client can check keccak256(raw) == blockAccessListHash itself.
+    #[tokio::test]
+    async fn the_raw_access_list_served_is_the_one_the_header_commits_to() {
+        use alloy_primitives::U256;
+        use skim_bal::alloy_eip7928::{AccountChanges, BlockAccessIndex, SlotChanges, StorageChange};
+        let cd = ChainData::offline(100);
+        let bal = vec![AccountChanges::new(Address::repeat_byte(7))
+            .with_storage_change(SlotChanges::new(U256::from(2), vec![StorageChange::new(BlockAccessIndex(1), U256::from(42))]))];
+        let bal_raw = Bytes::from(alloy_rlp::encode(&bal));
+        let (mut h, _, raw, _) = block(100, &[legacy_tx(1, Address::repeat_byte(9))]);
+        h.block_access_list_hash = Some(alloy_primitives::keccak256(&bal_raw));
+        let hash = h.hash_slow();
+        cd.note_payload(Arc::new(h.clone()), hash, raw, vec![], HashSet::new(), Arc::new(bal.clone()), bal_raw.clone());
+        let served = cd.cached_bal(hash).expect("held");
+        assert_eq!(served, bal_raw, "exact bytes, not a re-encoding");
+        let decoded = skim_bal::decode_verified(&served, h.block_access_list_hash.unwrap()).expect("matches the header");
+        assert_eq!(decoded, bal);
+    }
+
     /// Review: included sent transactions were kept forever (they kept each other alive), and once
     /// the header window dropped their block they were answered as pending.
     #[tokio::test]
