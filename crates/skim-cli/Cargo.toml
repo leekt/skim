@@ -50,6 +50,7 @@ dhat = { version = "=0.3.3", optional = true }
 
 
 [features]
+evm2 = ["skim-sim/evm2"]
 # Heap profiling build: replaces the allocator with dhat's (slow; diagnostics only).
 dhat-heap = ["dep:dhat"]
 # Allocator comparisons (Linux; the default is mimalloc): glibc's malloc, or jemalloc.

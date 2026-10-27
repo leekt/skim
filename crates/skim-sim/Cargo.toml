@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+evm2 = ["dep:evm2"]
+# Lab harness only: resumable I/O is not enabled on the SNAP request path.
+evm2-async = ["evm2", "evm2/async"]
+
+
 [dependencies]
 revm-inspectors.workspace = true
 alloy-rpc-types-trace.workspace = true
@@ -26,6 +32,7 @@ serde_json.workspace = true
 
 parking_lot.workspace = true
 thiserror.workspace = true
+evm2 = { git = "https://github.com/alloy-rs/evm2", rev = "e06fb4b39994923a3d52ef978cf603301f6fb54c", optional = true, default-features = false, features = ["std", "map-foldhash", "asm-keccak", "secp256k1", "blst", "c-kzg", "portable"] }
 
 [dev-dependencies]
 serde_yaml_ng.workspace = true

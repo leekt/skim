@@ -139,6 +139,9 @@ pub struct Args {
     /// Don't cache `eth_call` results per (block, request) (measurements of raw execution).
     #[arg(long)]
     no_call_cache: bool,
+    /// Engine for plain eth_call/estimateGas. EVM2 requires --features evm2.
+    #[arg(long, default_value = "revm", value_parser = ["revm", "evm2"])]
+    evm_backend: String,
     /// Serve Prometheus metrics at http://<addr>/metrics (e.g. 127.0.0.1:9465; off unless set).
     /// `metrics/` has a Prometheus + Grafana stack with skim's dashboard.
     #[arg(long, value_name = "ADDR")]
@@ -420,6 +423,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             reach: Default::default(),
         },
     );
+    sim.set_backend(match args.evm_backend.as_str() {
+        "evm2" => skim_sim::Backend::Evm2,
+        _ => skim_sim::Backend::Revm,
+    })?;
+    tracing::info!(backend = ?sim.backend(), "plain-call execution engine");
     *sim.state_wait.write() = std::time::Duration::from_secs(args.state_wait);
     let mempool_probe = mempool_rx.map(|rx| {
         tracing::info!("mempool probe: measuring the pending transactions' validation state (logs once a minute)");

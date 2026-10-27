@@ -72,36 +72,35 @@ pub const CODE_CACHE_MAX: usize = 4096;
 /// sets the entry's bit under the read lock; when full, the clock hand clears bits until it
 /// finds an entry not used since its last pass and evicts that one. Hot contracts stay;
 /// previously the whole cache was dropped at the limit.
-pub struct CodeCache {
+pub struct CodeCache<B = Bytecode> {
     cap: usize,
-    inner: parking_lot::RwLock<ClockInner>,
+    inner: parking_lot::RwLock<ClockInner<B>>,
 }
 
-#[derive(Default)]
-struct ClockInner {
-    map: std::collections::HashMap<B256, (Bytecode, std::sync::atomic::AtomicBool)>,
+struct ClockInner<B> {
+    map: std::collections::HashMap<B256, (B, std::sync::atomic::AtomicBool)>,
     ring: std::collections::VecDeque<B256>,
 }
 
-impl Default for CodeCache {
+impl<B: Clone> Default for CodeCache<B> {
     fn default() -> Self {
         Self::new(CODE_CACHE_MAX)
     }
 }
 
-impl CodeCache {
+impl<B: Clone> CodeCache<B> {
     pub fn new(cap: usize) -> Self {
-        Self { cap: cap.max(1), inner: Default::default() }
+        Self { cap: cap.max(1), inner: parking_lot::RwLock::new(ClockInner { map: Default::default(), ring: Default::default() }) }
     }
 
-    pub fn get(&self, h: &B256) -> Option<Bytecode> {
+    pub fn get(&self, h: &B256) -> Option<B> {
         let g = self.inner.read();
         let (b, used) = g.map.get(h)?;
         used.store(true, std::sync::atomic::Ordering::Relaxed);
         Some(b.clone())
     }
 
-    pub fn insert(&self, h: B256, b: Bytecode) {
+    pub fn insert(&self, h: B256, b: B) {
         let mut g = self.inner.write();
         if g.map.contains_key(&h) {
             return;

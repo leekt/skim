@@ -46,7 +46,7 @@ skim builds on that:
 |---|---|
 | **New blocks + their state diffs** | CL `execution_payload` gossip. The EL header is rebuilt from the payload, so the BAL is bound to the block hash. eth/71 BAL requests fill gaps. |
 | **State it has never seen** | snap/1 + snap/2 point lookups at the parent root, **verified against the state root with Merkle proofs**, then brought to the head by replaying the BAL |
-| **Execution** | revm with Amsterdam rules over a per-key MVCC store |
+| **Execution** | revm with Amsterdam rules over a per-key MVCC store; optional EVM2 for plain calls ([experiment](docs/experiments/evm2.md)) |
 
 ## State age, history, and backfill limits
 

@@ -10,6 +10,10 @@
 
 pub mod db;
 pub mod env;
+#[cfg(feature = "evm2")]
+pub mod evm2_backend;
+#[cfg(feature = "evm2")]
+pub mod evm2_bridge;
 pub mod learned;
 pub mod multi;
 pub mod predictor;
@@ -92,6 +96,14 @@ pub struct CallOutcome {
     pub fetched_storage: Vec<(Address, U256)>,
 }
 
+/// Execution engine for plain calls. Traces and stateful simulation retain revm.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Backend {
+    #[default]
+    Revm,
+    Evm2,
+}
+
 pub struct Simulator {
     pub store: Arc<Store>,
     pub sched: Scheduler<ElTransport>,
@@ -99,6 +111,9 @@ pub struct Simulator {
     /// Headers by number, with their hash computed once on insert.
     headers: RwLock<BTreeMap<u64, (B256, Arc<Header>)>>,
     code_cache: db::CodeCache,
+    backend: std::sync::atomic::AtomicU8,
+    #[cfg(feature = "evm2")]
+    evm2_code_cache: db::CodeCache<evm2::bytecode::Bytecode>,
     /// Resolve misses at the parent root (peers may not have executed the head yet).
     pub miss_at_parent: bool,
     /// Retention for state fetched on demand (unsubscribed): `Ttl(n)` keeps it current for n
@@ -130,6 +145,9 @@ impl Simulator {
             predictor: Mutex::new(predictor),
             headers: RwLock::default(),
             code_cache: db::CodeCache::default(),
+            backend: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(feature = "evm2")]
+            evm2_code_cache: db::CodeCache::default(),
             miss_at_parent: true,
             on_demand: RwLock::new(Retention::Ttl(4)),
             max_rounds: std::sync::atomic::AtomicUsize::new(8),
@@ -137,6 +155,19 @@ impl Simulator {
             cpu: tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(2, |n| n.get())),
             header_source: RwLock::new(None),
         })
+    }
+
+    /// Selects plain-call execution; requires the `evm2` feature for EVM2.
+    pub fn set_backend(&self, backend: Backend) -> Result<(), SimError> {
+        if backend == Backend::Evm2 && !cfg!(feature = "evm2") {
+            return Err(SimError::Unsupported("evm2 backend requires the evm2 build feature"));
+        }
+        self.backend.store((backend == Backend::Evm2) as u8, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn backend(&self) -> Backend {
+        if self.backend.load(std::sync::atomic::Ordering::Relaxed) == 1 { Backend::Evm2 } else { Backend::Revm }
     }
 
     /// Installs an extra ancestor-header source, asked before the eth peers (see
@@ -221,6 +252,20 @@ impl Simulator {
 
     /// One local execution (CPU only).
     pub fn execute(&self, snap: &Snapshot, header: &Header, tx: TxEnv) -> Result<(ExecutionResult, Access), SimError> {
+        #[cfg(feature = "evm2")]
+        if self.backend() == Backend::Evm2 && evm2_backend::supports(&tx) {
+            return match evm2_backend::execute(snap, header, tx.clone(), &self.store, &self.code_cache, &self.evm2_code_cache) {
+                // Keep the reference engine's public validation/error semantics. EVM2's
+                // error enum differs, and incomplete-state placeholders can fail validation.
+                Err(SimError::Evm(_)) => self.execute_revm(snap, header, tx),
+                outcome => outcome,
+            };
+        }
+        self.execute_revm(snap, header, tx)
+    }
+
+    /// Reference interpreter, available to differential benchmarks regardless of selection.
+    pub fn execute_revm(&self, snap: &Snapshot, header: &Header, tx: TxEnv) -> Result<(ExecutionResult, Access), SimError> {
         let (store, at) = (self.store.clone(), *snap.block());
         let block_hash = move |n: u64| store.block_hash_at(&at, n);
         let db = db::SnapDb { snap, block_hash: &block_hash, access: Default::default(), code_cache: &self.code_cache };

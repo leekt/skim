@@ -33,6 +33,8 @@ async fn setup() -> (Arc<Simulator>, BlockRef, Vec<Header>, TxEnv) {
         sched,
         Predictor { learned: Learned::with_limits(8, 0.5, 256, Default::default()), v3: vec![], base_words: 2, reach: Default::default() },
     );
+    #[cfg(feature = "evm2")]
+    sim.set_backend(skim_sim::Backend::Evm2).unwrap();
     // A state wait far longer than the test may take: reaching it is the failure.
     *sim.state_wait.write() = Duration::from_secs(20);
     let coinbase = Address::repeat_byte(0xcb);

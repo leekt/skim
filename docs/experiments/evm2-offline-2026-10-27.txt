@@ -1,0 +1,18 @@
+CPU: Apple M1 Max
+Rust: rustc 1.97.0 (2d8144b78 2026-07-07)
+Dispatch: stable automatic packed backend
+Profile: release, fat LTO, codegen-units=1
+EVM2 revision: e06fb4b39994923a3d52ef978cf603301f6fb54c
+Fixture: synthetic bytecode and in-process warm MVCC Store, no RPC/proof acquisition/result cache
+Quiet sweep; coordinated no compiler/benchmark jobs from sibling agents.
+Command: /Users/leekt/workspace/web3-stack/skim/target/release/deps/evm2_parity-5799220439fc8ed6 benchmark_warm_calls_and_estimates --ignored --nocapture
+
+running 1 test
+arithmetic1000 call revm_us=31.335 evm2_us=18.998 speedup=1.649 samples=[[29.706165999999996, 29.943834, 31.145582, 31.334581999999997, 31.398750000000003, 31.484334000000004, 31.576584], [17.978583999999998, 18.6475, 18.83125, 18.99825, 19.012, 19.05275, 19.105334000000003]]
+arithmetic1000 estimate revm_us=682.499 evm2_us=413.381 speedup=1.651 samples=[[681.275, 681.425, 681.5555666666667, 682.4986000000001, 683.9125, 685.9694333333334, 688.9125], [410.7069333333333, 411.0139, 412.9444666666667, 413.38056666666665, 413.7416666666667, 415.2402666666667, 417.9069333333333]]
+sload call revm_us=2.277 evm2_us=1.747 speedup=1.303 samples=[[2.2641660000000003, 2.2725839999999997, 2.2751680000000003, 2.277, 2.294418, 2.324666, 2.388584], [1.728334, 1.7456660000000002, 1.746416, 1.747334, 1.751, 1.752168, 1.763334]]
+sload estimate revm_us=52.803 evm2_us=40.192 speedup=1.314 samples=[[52.211133333333336, 52.48473333333333, 52.55416666666667, 52.80276666666667, 52.95276666666666, 52.9861, 53.4125], [39.60693333333334, 39.87636666666666, 40.025, 40.19166666666667, 40.493066666666664, 40.77223333333334, 41.40416666666667]]
+test benchmark_warm_calls_and_estimates ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.44s
+
