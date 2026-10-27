@@ -47,6 +47,15 @@ The [review](REVIEW.md) lists every finding; these are the open ones that need d
     rounds (REVIEW R12; predicted waves are now capped, miss rounds aren't). Done when a
     request's total fetches are bounded and measured under a cold-burst load.
 
+## Execution
+36. **EVM2 as the default engine.** `--evm-backend evm2` (opt-in, `--features evm2`) runs plain
+    calls on alloy-rs/evm2 at 1.3-1.65x less CPU on synthetic fixtures; revm stays the default
+    ([experiment](experiments/evm2.md)). Done when a sampled shadow mode runs live calls on both
+    engines and logs any difference in result, gas, logs or read set, weeks of Sepolia traffic
+    show none, the gaps listed in the experiment are tested (the revm fallback, unknown code and
+    accounts, computing precompiles, header opcodes, maximum call depth on worker stacks), and
+    EVM2 is pinned to a release rather than a git revision.
+
 ## Memory
 6. **Whether RSS levels off.** Mostly, with a slow tail. Production (`--tx-index subscribed` build, mimalloc)
    stayed ~370-400 MB from ~9 h through 27.7 h. A 43 h zero-config soak plateaued by ~6 h
