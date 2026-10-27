@@ -1017,14 +1017,31 @@ fn promoting_a_code_hash_to_the_archive_also_archives_its_cached_code() {
     // archive retention; the code hash got archived coverage, the cached code never reached disk,
     // so historical calls failed once memory was gone.
     let d = tempfile::tempdir().unwrap();
-    let s = Store::with_archive(64, archive::Archive::open(d.path().join("a.redb")).unwrap()).unwrap();
+    let path = d.path().join("a.redb");
+    let s = Store::with_archive(64, archive::Archive::open(&path).unwrap()).unwrap();
     s.apply_block(blk(10, 0), writes(&[])).unwrap();
     let code = Bytes::from_static(b"learned-contract-code");
     // On demand first: the code hash and the code, neither archived.
     let h = s.insert_code(code.clone());
     s.insert_base_with(&blk(10, 0), StateKey::CodeHash(A), U256::from_be_bytes(h.0), Retention::Ttl(4)).unwrap();
     assert_eq!(s.archive().unwrap().code(&h).unwrap(), None);
-    // Then promoted to archive retention.
-    s.archive_key(StateKey::CodeHash(A));
-    assert_eq!(s.archive().unwrap().code(&h).unwrap(), Some(code));
+    // A later code version is cached from the BAL while the account is still on demand.
+    let next_code = Bytes::from_static(b"next-learned-contract-code");
+    let next_hash = keccak256(&next_code);
+    s.apply_block(blk(11, 0), Arc::new(BlockWrites {
+        writes: vec![(StateKey::CodeHash(A), next_hash.into())],
+        code: vec![(next_hash, next_code.clone())],
+        ..Default::default()
+    })).unwrap();
+    assert_eq!(s.archive().unwrap().code(&next_hash).unwrap(), None);
+    // Promotion must preserve both versions' code, not just the current one.
+    assert!(s.archive_key_checked(StateKey::CodeHash(A)));
+    drop(s);
+
+    let reopened = Store::with_archive(64, archive::Archive::open(&path).unwrap()).unwrap();
+    assert_eq!(reopened.code(&h), Some(code), "the old code survives without the memory cache");
+    assert_eq!(reopened.code(&next_hash), Some(next_code));
+    let ar = reopened.archive().unwrap();
+    assert_eq!(ar.get(&StateKey::CodeHash(A), 10).unwrap(), archive::ArchiveRead::Value(h.into()));
+    assert_eq!(ar.get(&StateKey::CodeHash(A), 11).unwrap(), archive::ArchiveRead::Value(next_hash.into()));
 }

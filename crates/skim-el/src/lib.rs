@@ -1025,10 +1025,19 @@ mod tests {
         let mut ok = Vec::new();
         alloy_rlp::Encodable::encode(&frame(3), &mut ok);
         assert_eq!(<Receipt as alloy_rlp::Decodable>::decode(&mut ok.as_slice()).unwrap(), frame(3));
+        let largest = frame(frame::MAX_FRAMES_PER_TX);
+        let mut encoded = Vec::new();
+        alloy_rlp::Encodable::encode(&largest, &mut encoded);
+        assert_eq!(<Receipt as alloy_rlp::Decodable>::decode(&mut encoded.as_slice()).unwrap(), largest, "the limit itself is accepted");
         // And the bytes they hold count: a small block can't be made to hold thousands of them.
         let mut b = ReceiptBudget::new(21_000);
         let admitted = (0..1_000).take_while(|_| b.admit(&[frame(frame::MAX_FRAMES_PER_TX)])).count();
         assert!(admitted < 40, "{admitted} frame-heavy receipts admitted for a 21k-gas block");
+        // The same metadata limit applies within one answer, not just between partial answers.
+        // This count fits the receipt-count allowance and has no logs, so only frame bytes can
+        // reject it.
+        let batch = vec![largest; (21_000 * 2 + ReceiptBudget::SLACK_GAS) as usize / 21_000];
+        assert!(!ReceiptBudget::new(21_000).admit(&batch), "frame bytes in one answer count too");
     }
 
     #[test]

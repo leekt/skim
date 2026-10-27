@@ -382,3 +382,32 @@ One node (build `d72e0ae`, `--debug-rpc`, macOS, 5+ SNAP peers), 3,600 cold read
 
 With stalls present, adaptive hedging cuts p99 from ~1.2 s to under 0.2 s at no extra request cost (hedges replace the retries fixed mode needs anyway). p95 is a little higher (hedged reads land at 150-190 ms, near the boundary), and the maximum is unchanged: a few stalls weren't rescued early, plausibly because the one hedge a job gets landed on a stalling request too. Live, the effect still waits on a soak with real stalls (TODO 27).
 
+## Second-review fixes and regression validation (2026-10-27)
+
+Validated the S1–S7 fixes in `2fe588a` and completed the remaining recovery and delivery cases.
+Re-anchoring now corroborates the target's parent at the target's height (a real parent at an
+invented height doesn't count; the target itself isn't asked about, since peers may not have
+imported a block that just arrived by gossip); verified
+stream prefixes prove ancestry to the authenticated tip in one selected-chain view. WebSocket
+delivery also remembers where to retry when a reorg removes every previously reported block.
+
+| Finding | Fix / coverage | Regression tests | Mutation checked |
+|---|---|---|---|
+| S1: invented high head | Corroborate the parent at the block's height for re-anchoring and recovery, including a fabricated block with a real parent at another height, and a replayed orphan below a fresh head | `a_known_parent_does_not_corroborate_a_made_up_height`, `a_made_up_head_with_a_real_parent_can_be_left`, `a_replayed_orphan_below_a_fresh_honest_head_is_not_followed` | Yes: parent-only corroboration restored (before the height binding) |
+| S2: verified stream changes branch | Preserve the authenticated tip hash and validate captured ancestry across memory and disk history; cover prefixes, capture-time reorgs and fork restoration | `a_verified_stream_never_returns_a_sibling_that_replaced_the_verified_block`, `a_verified_prefix_is_checked_against_the_authenticated_tip_after_capture`, `restoring_the_verified_fork_does_not_authenticate_a_prefix_captured_from_its_sibling`, `a_verified_prefix_can_continue_through_history_below_the_memory_headers` | Yes: authenticated-range check removed |
+| S3: archive promotion omits cached code | Preserve every retained code version on disk; close and reopen the archive in the test | `promoting_a_code_hash_to_the_archive_also_archives_its_cached_code` | Yes: promotion's bytecode copy removed |
+| S4: WebSocket gaps and lost retries | Seed each subscription, acknowledge delivered blocks, replay replacements at the subscription height, and preserve retry position after a complete replacement | `websocket_first_announcement_after_subscribing_delivers_the_whole_gap`, `websocket_logs_deliver_subscription_replacements_gaps_and_retries`, `replacing_every_remembered_block_reports_the_whole_replacement_branch` | Yes: seed omitted, delivery acknowledged early, and replacement restart forgotten, separately |
+| S5: stale simulated block-hash overrides | Clear the block-hash cache between simulated blocks; check both changing and removing an override | `each_simulated_block_reads_blockhash_under_its_own_overrides` | Yes: cache clear removed |
+| S6: gas verdict on missing state | Resolve misses before cumulative-gas or request-budget verdicts; compare the same cold and resolved sequences | `a_gas_verdict_waits_for_the_state_the_calls_read`, `a_gas_budget_verdict_waits_for_missing_state` | Yes: miss guard removed; both verdict paths fail |
+| S7: frame receipt metadata escapes bounds | Limit decoded frames and account for metadata bytes within and across partial answers; accept the exact frame-count limit | `frame_results_count_toward_what_a_block_can_hold` | Yes: decoder and byte-budget limits removed separately |
+
+Mutation checks ran in a temporary source copy, leaving the working tree's fixes intact.
+The WebSocket regressions use the actual HTTP upgrade and framed JSON-RPC connection; the
+receipt-fetch retry is synchronized with the failed fetch rather than a timing assumption.
+After the mutation runs, a clean rebuild of the affected packages passed
+`cargo test --workspace --profile ci --locked`: **257 passed, 0 failed, 1 ignored** (before the
+S1 height binding and its orphan test were added).
+The smallname and wallet example tests pass **10/10** and **8/8** respectively.
+`cargo clippy --workspace --all-targets --profile ci --locked` completes with style warnings.
+No new live-network soak or fuzzing was run.
+

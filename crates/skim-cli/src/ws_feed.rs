@@ -17,6 +17,9 @@ pub const KEEP: u64 = 64;
 #[derive(Debug, Default)]
 pub struct HeadTrack {
     seen: BTreeMap<u64, B256>,
+    /// Where delivery resumes when a reorg removed every remembered block and no replacement
+    /// has been delivered yet.
+    resume_from: Option<u64>,
 }
 
 /// What changed for a subscription since its last delivered block.
@@ -35,7 +38,7 @@ impl HeadTrack {
     /// A subscription made when `head` was current: blocks after it are reported, and `head`
     /// itself is reported again if a reorg replaces it.
     pub fn seeded(head: Option<(u64, B256)>) -> Self {
-        Self { seen: head.into_iter().collect() }
+        Self { seen: head.into_iter().collect(), resume_from: None }
     }
 
     /// What to report for `head`. `canon(n)` is the hash of block `n` on the selected chain, if
@@ -55,7 +58,14 @@ impl HeadTrack {
             step.removed.push((n, h));
             self.seen.remove(&n);
         }
-        let next = self.seen.last_key_value().map_or(head.0, |(n, _)| n + 1);
+        // A reorg can replace every remembered block, including the subscription's initial
+        // head. Resume at the oldest one removed, rather than treating the new tip as the
+        // subscription's first block and skipping the rest of the replacement branch.
+        let next = self.seen.last_key_value().map_or_else(
+            || step.removed.last().map(|(n, _)| *n).or(self.resume_from).unwrap_or(head.0).min(head.0),
+            |(n, _)| n + 1,
+        );
+        self.resume_from = Some(next);
         let from = next.max(head.0.saturating_sub(KEEP - 1));
         for n in from..=head.0 {
             match if n == head.0 { Some(head.1) } else { canon(n) } {
@@ -65,7 +75,7 @@ impl HeadTrack {
             }
         }
         let first = step.added.first().map_or(head.0 + 1, |(n, _)| *n);
-        if !self.seen.is_empty() && next < first {
+        if next < first {
             step.skipped = Some((next, first - 1));
         }
         step
@@ -74,6 +84,7 @@ impl HeadTrack {
     /// `n` (hash `h`) was delivered.
     pub fn mark(&mut self, n: u64, h: B256) {
         self.seen.insert(n, h);
+        self.resume_from = None;
         while self.seen.len() as u64 > KEEP {
             self.seen.pop_first();
         }
@@ -83,6 +94,7 @@ impl HeadTrack {
     pub fn skip_to(&mut self, n: u64, h: B256) {
         self.seen.clear();
         self.seen.insert(n, h);
+        self.resume_from = None;
     }
 }
 
@@ -132,6 +144,27 @@ mod tests {
         assert_eq!(s.added.len(), 2);
         let s = t.step((103, h(103, 0xa)), a);
         assert_eq!(s.added, vec![(102, h(102, 0xa)), (103, h(103, 0xa))]);
+    }
+
+    #[test]
+    fn replacing_every_remembered_block_reports_the_whole_replacement_branch() {
+        let mut t = HeadTrack::seeded(Some((100, h(100, 0xa))));
+        let s = t.step((102, h(102, 0xa)), |n| Some(h(n, 0xa)));
+        deliver(&mut t, &s);
+        let s = t.step((103, h(103, 0xb)), |n| Some(h(n, 0xb)));
+        assert_eq!(s.removed, (100..=102).rev().map(|n| (n, h(n, 0xa))).collect::<Vec<_>>());
+        assert_eq!(s.added, (100..=103).map(|n| (n, h(n, 0xb))).collect::<Vec<_>>());
+        assert_eq!(s.skipped, None);
+
+        // The first replacement's receipts failed: it is still first on the next attempt.
+        let retry = t.step((104, h(104, 0xb)), |n| Some(h(n, 0xb)));
+        assert_eq!(retry.added, (100..=104).map(|n| (n, h(n, 0xb))).collect::<Vec<_>>());
+
+        // If the replacement branch itself exceeds retention, a logs subscriber must hear
+        // about the missing range even though no old block remains in the tracker.
+        deliver(&mut t, &s);
+        let s = t.step((1000, h(1000, 0xc)), |n| Some(h(n, 0xc)));
+        assert_eq!(s.skipped, Some((100, 1000 - KEEP)));
     }
 
     #[test]

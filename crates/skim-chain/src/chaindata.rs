@@ -1579,6 +1579,71 @@ impl ChainData {
         run.first().map(|(h, _)| *h)
     }
 
+    /// Whether `block` is an ancestor of the authenticated `tip` on the selected chain. The
+    /// in-memory chain stays locked while both identities and their linkage are checked; disk
+    /// reads walk by hash from that same chain. Separate height lookups could otherwise observe
+    /// different branches during a reorg.
+    pub fn is_ancestor_on_chain(&self, block: (u64, B256), tip: (u64, B256)) -> Result<bool, DataError> {
+        /// What the in-memory part decides: an answer, or a disk read hash-linked from the
+        /// memory boundary as it was under the lock.
+        enum Next {
+            Answer(bool),
+            /// `tip` is below memory: read it, then `block`, down from (`above`, `parent`).
+            DiskTip { above: u64, parent: B256 },
+            /// The walk left memory at `above`; `block` is on disk below it, linked to `parent`.
+            DiskBlock { above: u64, parent: B256 },
+        }
+        if block.0 > tip.0 {
+            return Ok(false);
+        }
+        // Memory under the lock; disk after it's released, from the boundary values captured
+        // with it. (Review: the disk scan ran under the read lock, holding up `note_header` on
+        // the per-block path for an O(distance) walk.)
+        let next = {
+            let g = self.inner.read();
+            let Some((&mem_low, (_, oldest))) = g.headers.first_key_value() else { return Ok(false) };
+            match g.headers.get(&tip.0) {
+                None if tip.0 < mem_low => Next::DiskTip { above: mem_low, parent: oldest.parent_hash },
+                None => Next::Answer(false),
+                Some((hash, _)) if *hash != tip.1 => Next::Answer(false),
+                Some((hash, _)) if block.0 == tip.0 => Next::Answer(block.1 == *hash),
+                Some((_, header)) => {
+                    let (mut number, mut expected) = (tip.0 - 1, header.parent_hash);
+                    loop {
+                        match g.headers.get(&number) {
+                            Some((hash, _)) if *hash != expected => break Next::Answer(false),
+                            Some((hash, _)) if number == block.0 => break Next::Answer(*hash == block.1),
+                            Some((_, header)) => (number, expected) = (number - 1, header.parent_hash),
+                            None if number < mem_low => break Next::DiskBlock { above: number + 1, parent: expected },
+                            None => break Next::Answer(false),
+                        }
+                    }
+                }
+            }
+        };
+        let disk_header = |number: u64, above: u64, parent: B256| -> Result<Option<(B256, Header)>, DataError> {
+            let Some(store) = self.history.get() else { return Ok(None) };
+            Ok(store
+                .linked_range(number, number, above, parent)
+                .map_err(|e| DataError::Unavailable(e.to_string()))?
+                .and_then(|mut headers| headers.pop()))
+        };
+        match next {
+            Next::Answer(a) => Ok(a),
+            Next::DiskBlock { above, parent } => Ok(disk_header(block.0, above, parent)?.is_some_and(|(hash, _)| hash == block.1)),
+            Next::DiskTip { above, parent } => {
+                let Some((hash, header)) = disk_header(tip.0, above, parent)? else { return Ok(false) };
+                if hash != tip.1 {
+                    return Ok(false);
+                }
+                if block.0 == tip.0 {
+                    return Ok(block.1 == hash);
+                }
+                Ok(disk_header(block.0, tip.0, header.parent_hash)?.is_some_and(|(hash, _)| hash == block.1))
+            }
+        }
+    }
+
     /// Logs of `[from, to]` matching any of `filters`, grouped by block (blocks without a match
     /// are left out), plus the hash of `to`: one consistent chain (headers in memory, or on disk
     /// hash-linked to it). With `at`, the single block must be that block. Shared by

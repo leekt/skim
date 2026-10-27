@@ -22,6 +22,8 @@ const LOOP: [u8; 4] = [0x5b, 0x60, 0x00, 0x56];
 /// `BLOCKHASH(101)`, returned as one word: the first simulated block after base block 100.
 const HASH_OF_101: [u8; 11] = [0x60, 0x65, 0x40, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
 const HASHER: Address = Address::repeat_byte(0x7b);
+/// SLOAD(0); nonzero: stop; zero: loop until out of gas.
+const COLD: [u8; 12] = [0x60, 0x00, 0x54, 0x60, 0x0a, 0x57, 0x5b, 0x60, 0x06, 0x56, 0x5b, 0x00];
 
 async fn setup() -> (Arc<Simulator>, BlockRef, TxEnv) {
     let net = skim_el::ElNet::start_sepolia(0, vec![], true).await.expect("local node");
@@ -51,6 +53,15 @@ async fn setup() -> (Arc<Simulator>, BlockRef, TxEnv) {
 
 fn auto_gas(tx: &TxEnv) -> SimCall {
     SimCall { tx: tx.clone(), auto_nonce: true, auto_fee: true, auto_gas: true }
+}
+
+fn install_cold_contract(sim: &Simulator, head: &BlockRef) -> Address {
+    let cold = Address::repeat_byte(0xc0);
+    sim.store.insert_code(Bytes::from_static(&COLD));
+    for (k, v) in [(StateKey::Balance(cold), U256::ZERO), (StateKey::Nonce(cold), U256::from(1)), (StateKey::CodeHash(cold), U256::from_be_bytes(keccak256(COLD).0))] {
+        sim.store.insert_base(head, k, v).unwrap();
+    }
+    cold
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -110,11 +121,18 @@ async fn each_simulated_block_reads_blockhash_under_its_own_overrides() {
     let blocks = [
         SimBlock { block: None, state: None, calls: vec![] }, // 101
         SimBlock { block: Some(with_hash(0x11)), state: None, calls: vec![SimCall { tx: call.clone(), ..Default::default() }] },
-        SimBlock { block: Some(with_hash(0x22)), state: None, calls: vec![SimCall { tx: call, ..Default::default() }] },
+        SimBlock { block: Some(with_hash(0x22)), state: None, calls: vec![SimCall { tx: call.clone(), ..Default::default() }] },
+        SimBlock { block: None, state: None, calls: vec![SimCall { tx: call.clone(), ..Default::default() }] },
     ];
     let out = sim.simulate(&head, &blocks, Placement::NextBlocks).await.expect("simulates");
     let word = |i: usize| B256::from_slice(&out[i].calls[0].output().unwrap()[..32]);
     assert_eq!((word(1), word(2)), (B256::repeat_byte(0x11), B256::repeat_byte(0x22)));
+    // Removing an override also discards the last overridden value from the overlay's cache.
+    let unoverridden = sim.simulate(&head, &[
+        SimBlock { block: None, state: None, calls: vec![] },
+        SimBlock { block: None, state: None, calls: vec![SimCall { tx: call, ..Default::default() }] },
+    ], Placement::NextBlocks).await.expect("simulates without overrides");
+    assert_eq!(word(3).as_slice(), &unoverridden[1].calls[0].output().unwrap()[..32]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -123,29 +141,50 @@ async fn a_gas_verdict_waits_for_the_state_the_calls_read() {
     // could exceed the block's gas limit and answer -38015, though the same request fit once the
     // slot was fetched. Missing state must be fetched before any gas verdict.
     let (sim, head, tx) = setup().await;
-    *sim.state_wait.write() = std::time::Duration::from_millis(200);
-    // SLOAD(0); nonzero: stop; zero: loop until out of gas. Its slot 0 is not known locally.
-    const COLD: [u8; 12] = [0x60, 0x00, 0x54, 0x60, 0x0a, 0x57, 0x5b, 0x60, 0x06, 0x56, 0x5b, 0x00];
-    let cold = Address::repeat_byte(0xc0);
-    sim.store.insert_code(Bytes::from_static(&COLD));
-    for (k, v) in [(StateKey::Balance(cold), U256::ZERO), (StateKey::Nonce(cold), U256::from(1)), (StateKey::CodeHash(cold), U256::from_be_bytes(keccak256(COLD).0))] {
-        sim.store.insert_base(&head, k, v).unwrap();
-    }
+    *sim.state_wait.write() = std::time::Duration::ZERO;
+    let cold = install_cold_contract(&sim, &head);
     let mut tx = tx;
     tx.chain_id = Some(skim_sim::env::chain_id());
     let mut first = tx.clone();
     first.kind = TxKind::Call(cold);
+    first.gas_limit = 100_000;
     let mut second = tx.clone();
-    second.gas_limit = 20_000_000;
+    second.kind = TxKind::Call(Address::repeat_byte(0xcb)); // a known EOA
+    second.gas_limit = 29_950_000;
     let blocks = [SimBlock {
         block: None,
         state: None,
-        calls: vec![SimCall { tx: first, auto_nonce: true, auto_fee: false, auto_gas: true }, SimCall { tx: second, auto_nonce: true, auto_fee: false, auto_gas: false }],
+        calls: vec![SimCall { tx: first, auto_nonce: true, auto_fee: false, auto_gas: false }, SimCall { tx: second, auto_nonce: true, auto_fee: false, auto_gas: false }],
     }];
     let opts = skim_sim::multi::SimOptions { validation: true, ..Default::default() };
     match sim.simulate_with(&head, &blocks, Placement::NextBlocks, opts).await {
         // No peer serves the slot here: the request waits for state, never judges gas on a guess.
-        Err(SimError::NoStatePeers(_)) | Err(SimError::Incomplete(_)) => {}
+        Err(SimError::NoStatePeers(_)) => {}
         other => panic!("expected a wait for the missing slot, got {other:?}"),
     }
+    sim.store.insert_base(&head, StateKey::Storage(cold, U256::ZERO), U256::from(1)).unwrap();
+    let out = sim.simulate_with(&head, &blocks, Placement::NextBlocks, opts).await.expect("the same sequence fits once the slot is known");
+    assert!(out[0].calls.iter().all(|r| r.is_success()));
+    assert!(out[0].calls.iter().map(|r| r.tx_gas_used()).sum::<u64>() < 30_000_000);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gas_budget_verdict_waits_for_missing_state() {
+    // Each provisional zero-slot run burns gas. Together they exhaust the request budget, but
+    // with the actual slot value these calls are all cheap and fit comfortably.
+    let (sim, head, mut tx) = setup().await;
+    *sim.state_wait.write() = std::time::Duration::ZERO;
+    let cold = install_cold_contract(&sim, &head);
+    tx.kind = TxKind::Call(cold);
+    let blocks: Vec<SimBlock> = (0..10).map(|_| SimBlock {
+        block: None,
+        state: None,
+        calls: vec![auto_gas(&tx)],
+    }).collect();
+    assert!(matches!(sim.simulate(&head, &blocks, Placement::NextBlocks).await, Err(SimError::NoStatePeers(_))));
+
+    sim.store.insert_base(&head, StateKey::Storage(cold, U256::ZERO), U256::from(1)).unwrap();
+    let out = sim.simulate(&head, &blocks, Placement::NextBlocks).await.expect("the resolved sequence fits the gas budget");
+    assert_eq!(out.len(), blocks.len());
+    assert!(out.iter().all(|b| b.calls[0].is_success()));
 }

@@ -40,10 +40,10 @@ Seven findings on the fixes themselves, all fixed with regression tests (240 →
 
 | ID | Sev | Finding | Fix |
 |---|---|---|---|
-| S1 | P1 | The C2 fix re-anchored at once on a gap over 1,024 blocks, so a self-consistent envelope numbered far ahead became the head, and with N2's rule every honest block after it was "below the head": the follower was stranded. | Re-anchoring (any no-common-ancestor case) needs at least two EL peers serving the block's parent. A head whose parent no peer knows is left for a block below it whose parent peers do know (reconcile, else re-anchor): recovery from a wrong optimistic head. |
-| S2 | P1 | R7's verified stream tip kept only the number, so a sibling that replaced the verified block during capture was streamed under `--require-verified`. | The tip keeps its authenticated hash; after capture the selected chain must hold it at the tip and the range's last block at its height. |
+| S1 | P1 | The C2 fix re-anchored at once on a gap over 1,024 blocks, so a self-consistent envelope numbered far ahead became the head, and with N2's rule every honest block after it was "below the head": the follower was stranded. | Re-anchoring needs at least two distinct EL peers serving the block's parent at the block's height minus one: a made-up block can name a real parent, but not at a made-up height. The parent, not the block itself, because a block that just arrived by gossip may not be imported by peers yet (asking about it stalled re-anchoring, with nothing retrying). A head is left for a peer-backed block below it only when no peer serves the head's parent at its height, so a replayed orphan below a fresh honest head can't roll the chain back. |
+| S2 | P1 | R7's verified stream tip kept only the number, so a sibling that replaced the verified block during capture was streamed under `--require-verified`. | The tip keeps its authenticated hash. After capture, the range's endpoint must be its ancestor on one locked chain view, including prefixes and disk history; separate height lookups cannot authenticate a different branch. |
 | S3 | P2 | Promoting a key to archive retention never archived its already-cached bytecode (C5 had removed the blanket copy), so historical calls failed after a restart. | Every path that archives a code hash archives the cached code its versions point to. |
-| S4 | P2 | WebSocket logs (R2): the position advanced before delivery (a failed receipt fetch skipped the block), the tracker wasn't seeded at subscribe time (100 then 104 delivered only 104), and the `since` height excluded replacement blocks. | One tracker per subscription, seeded with the head at subscribe time, advancing per delivered block; a block that keeps failing, or a gap too long to report, ends the subscription with an error notification. |
+| S4 | P2 | WebSocket logs (R2): the position advanced before delivery (a failed receipt fetch skipped the block), the tracker wasn't seeded at subscribe time (100 then 104 delivered only 104), and the `since` height excluded replacement blocks. | One tracker per subscription, seeded with the head at subscribe time, advancing per delivered block. When a reorg replaces every remembered block, replay starts at the oldest removed height. A block that keeps failing, or a gap too long to report, ends the subscription with an error notification. |
 | S5 | P2 | `blockHash` overrides leaked across simulated blocks through the overlay's BLOCKHASH cache. | The cache is cleared per block. |
 | S6 | P2 | The cumulative-gas and budget checks (R3, R17) could answer `-38015` from gas used on unknown state. | No gas verdict while the pass has misses: the state is fetched and the pass rerun first. |
 | S7 | P2 | The receipt budget (N8) ignored frame results, and frame decoding allowed any number of frames. | At most 1,024 frames per receipt; the budget also bounds the bytes receipts hold, frames included. |
@@ -51,6 +51,11 @@ Seven findings on the fixes themselves, all fixed with regression tests (240 →
 The second review's design point stands as the next milestone: authenticated reads keep block
 identity across every asynchronous step; delivery positions advance only after delivery or an
 explicit gap; archiving keeps every dependency of a historical call.
+
+Follow-up work on `2fe588a` (third review, 2026-10-27/28) completed the verified-prefix
+validation and the complete-reorg WebSocket retry case above, and settled S1's corroboration on
+the parent at a bound height (a first version asked peers about the gossiped block itself, which
+raced its import and could stall recovery). See the [validation record](experiments/m7-gates-and-acquisition.md#second-review-fixes-and-regression-validation-2026-10-27).
 
 ## Overall
 

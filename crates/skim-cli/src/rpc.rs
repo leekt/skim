@@ -1508,6 +1508,8 @@ async fn push_heads(rpc: &Rpc, subs: &mut std::collections::HashMap<String, Sub>
                         // (Review: the block was skipped for good.)
                         other => {
                             *failures += 1;
+                            #[cfg(test)]
+                            c.run_test_hook("ws_delivery_failed");
                             if *failures >= MAX_LOG_DELIVERY_FAILURES {
                                 let why = match other {
                                     Err(e) => RpcError::from(e).message,
@@ -1549,6 +1551,222 @@ enum Sub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const WS_EMITTER: Address = Address::repeat_byte(0xe5);
+
+    fn ws_block(n: u64, parent: B256, tag: u8) -> (Header, Vec<skim_el::Receipt>, B256) {
+        let log = alloy_primitives::Log::new_unchecked(WS_EMITTER, vec![B256::repeat_byte(0x70)], Bytes::from(vec![tag, n as u8]));
+        let mut bloom = alloy_primitives::Bloom::default();
+        bloom.accrue_log(&log);
+        let header = Header {
+            number: n,
+            parent_hash: parent,
+            logs_bloom: bloom,
+            receipts_root: B256::repeat_byte(1),
+            transactions_root: B256::repeat_byte(2),
+            timestamp: n * 12,
+            extra_data: vec![tag].into(),
+            ..Default::default()
+        };
+        let receipts = vec![skim_el::Receipt { success: true, cumulative_gas_used: 21_000, logs: vec![log], ..Default::default() }];
+        (header, receipts, B256::repeat_byte(tag) ^ B256::from(U256::from(n)))
+    }
+
+    fn ws_append(rpc: &Rpc, n: u64, tag: u8, with_receipts: bool) -> BlockRef {
+        let parent = rpc.sim.store.head().map_or(B256::ZERO, |b| b.hash);
+        let (header, receipts, tx) = ws_block(n, parent, tag);
+        let b = crate::chain::block_ref(&header);
+        rpc.sim.insert_header(header.clone());
+        rpc.sim.store.apply_block(b, Default::default()).unwrap();
+        let chain = rpc.chain().unwrap();
+        chain.note_header(&header);
+        if with_receipts {
+            chain.note_receipts(n, b.hash, receipts, vec![tx]);
+        }
+        b
+    }
+
+    struct WsTest {
+        rpc: Arc<Rpc>,
+        socket: reqwest::Upgraded,
+        server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    impl Drop for WsTest {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    impl WsTest {
+        async fn start() -> Self {
+            let net = skim_el::ElNet::start_sepolia(0, vec![], true).await.unwrap();
+            let sim = Simulator::new(
+                skim_state::Store::new(256),
+                skim_snap::Scheduler::new(skim_snap::el::ElTransport::new(net), Default::default()),
+                skim_sim::predictor::Predictor {
+                    learned: skim_sim::learned::Learned::new(8, 0.5, 256),
+                    v3: vec![],
+                    base_words: 2,
+                    reach: Default::default(),
+                },
+            );
+            let rpc = Arc::new(Rpc {
+                sim,
+                subs: None,
+                chain: Some(ChainData::offline(2048)),
+                light: None,
+                require_verified: false,
+                events: tokio::sync::broadcast::channel(256).0,
+                call_cache: Default::default(),
+                cache_calls: true,
+                dash: Arc::new(Default::default()),
+                cl_stats: None,
+            });
+            ws_append(&rpc, 99, 0xa, true);
+            ws_append(&rpc, 100, 0xa, true);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(serve(rpc.clone(), listener, None));
+            let response = reqwest::Client::new()
+                .get(format!("http://{addr}/"))
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::SWITCHING_PROTOCOLS);
+            Self { rpc, socket: response.upgrade().await.unwrap(), server }
+        }
+
+        // A small RFC 6455 client keeps these transport tests on existing dependencies. Client
+        // frames are masked; these tests exchange small, unfragmented JSON text messages.
+        async fn send(&mut self, value: Value) {
+            use tokio::io::AsyncWriteExt;
+            let payload = value.to_string().into_bytes();
+            let mut frame = vec![0x81];
+            match payload.len() {
+                n @ 0..=125 => frame.push(0x80 | n as u8),
+                n => {
+                    frame.push(0x80 | 126);
+                    frame.extend_from_slice(&(n as u16).to_be_bytes());
+                }
+            }
+            let mask = [1, 2, 3, 4];
+            frame.extend_from_slice(&mask);
+            frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+            self.socket.write_all(&frame).await.unwrap();
+        }
+
+        async fn recv(&mut self) -> Value {
+            use tokio::io::AsyncReadExt;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut header = [0; 2];
+                self.socket.read_exact(&mut header).await.unwrap();
+                assert_eq!(header[0], 0x81, "expected one text frame");
+                assert_eq!(header[1] & 0x80, 0, "server frames are unmasked");
+                let len = match header[1] & 0x7f {
+                    126 => self.socket.read_u16().await.unwrap() as usize,
+                    127 => self.socket.read_u64().await.unwrap() as usize,
+                    n => n as usize,
+                };
+                let mut payload = vec![0; len];
+                self.socket.read_exact(&mut payload).await.unwrap();
+                serde_json::from_slice(&payload).unwrap()
+            }).await.expect("WebSocket delivery timed out")
+        }
+
+        async fn expect_log(&mut self, number: u64, hash: B256, removed: bool) {
+            let push = self.recv().await;
+            assert_eq!(push["method"], "eth_subscription", "{push}");
+            let log = &push["params"]["result"];
+            assert_eq!(log["blockNumber"], format!("{number:#x}"), "{push}");
+            assert_eq!(log["blockHash"], json!(hash), "{push}");
+            assert_eq!(log["removed"], removed, "{push}");
+        }
+
+        fn publish(&self, b: BlockRef) {
+            self.rpc.events.send(WsEvent::NewHead(b)).unwrap();
+        }
+
+        fn rollback(&self, number: u64) {
+            self.rpc.sim.store.note_reorg();
+            self.rpc.chain().unwrap().rollback_to(number);
+            self.rpc.sim.store.rollback_to(number);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn websocket_first_announcement_after_subscribing_delivers_the_whole_gap() {
+        let mut ws = WsTest::start().await;
+        ws.send(json!({"jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", "params": ["logs", {"address": WS_EMITTER}]})).await;
+        assert_eq!(ws.recv().await["result"], "0x1");
+        let blocks: Vec<_> = (101..=104).map(|n| ws_append(&ws.rpc, n, 0xa, true)).collect();
+        ws.publish(blocks[3]);
+        for b in blocks {
+            ws.expect_log(b.number, b.hash, false).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn websocket_logs_deliver_subscription_replacements_gaps_and_retries() {
+        let mut ws = WsTest::start().await;
+        ws.send(json!({"jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", "params": ["logs", {"address": WS_EMITTER}]})).await;
+        assert_eq!(ws.recv().await["result"], "0x1");
+
+        // A sibling of the subscription's initial tip is a new block, even at that height.
+        ws.rollback(99);
+        let b100 = ws_append(&ws.rpc, 100, 0xb, true);
+        ws.publish(b100);
+        ws.expect_log(100, b100.hash, false).await;
+
+        // Only the last block of a recovered gap is announced: every intermediate log arrives.
+        let mut branch = vec![b100];
+        for n in 101..=104 {
+            branch.push(ws_append(&ws.rpc, n, 0xb, true));
+        }
+        ws.publish(branch[4]);
+        for b in &branch[1..] {
+            ws.expect_log(b.number, b.hash, false).await;
+        }
+
+        // A receipt fetch really fails before peers make it available. The next announcement
+        // retries that block before delivering anything later.
+        let failed = Arc::new(tokio::sync::Notify::new());
+        let signal = failed.clone();
+        ws.rpc.chain().unwrap().test_hooks.lock().insert("ws_delivery_failed", Box::new(move || signal.notify_one()));
+        let b105 = ws_append(&ws.rpc, 105, 0xb, false);
+        ws.publish(b105);
+        tokio::time::timeout(std::time::Duration::from_secs(5), failed.notified()).await.unwrap();
+        let (_, receipts, tx) = ws_block(105, b105.parent_hash, 0xb);
+        ws.rpc.chain().unwrap().note_receipts(105, b105.hash, receipts, vec![tx]);
+        let b106 = ws_append(&ws.rpc, 106, 0xb, true);
+        ws.publish(b106);
+        ws.expect_log(105, b105.hash, false).await;
+        ws.expect_log(106, b106.hash, false).await;
+        branch.extend([b105, b106]);
+
+        // Replacing every remembered block must remove the old logs and then deliver the
+        // entire replacement branch, including the subscription's original height, even if
+        // fetching that first replacement fails once.
+        ws.rollback(99);
+        let failed = Arc::new(tokio::sync::Notify::new());
+        let signal = failed.clone();
+        ws.rpc.chain().unwrap().test_hooks.lock().insert("ws_delivery_failed", Box::new(move || signal.notify_one()));
+        let mut replacement: Vec<_> = (100..=107).map(|n| ws_append(&ws.rpc, n, 0xc, n != 100)).collect();
+        ws.publish(replacement[7]);
+        for b in branch.iter().rev() {
+            ws.expect_log(b.number, b.hash, true).await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), failed.notified()).await.unwrap();
+        let (_, receipts, tx) = ws_block(100, replacement[0].parent_hash, 0xc);
+        ws.rpc.chain().unwrap().note_receipts(100, replacement[0].hash, receipts, vec![tx]);
+        replacement.push(ws_append(&ws.rpc, 108, 0xc, true));
+        ws.publish(replacement[8]);
+        for b in replacement {
+            ws.expect_log(b.number, b.hash, false).await;
+        }
+    }
 
     #[test]
     fn the_call_cache_is_bounded_by_bytes_not_only_by_entries() {

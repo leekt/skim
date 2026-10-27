@@ -186,12 +186,11 @@ pub async fn next<T: Into<Tip>>(
         {
             return Err(DataError::ChainChanged("the chain reorganized during the request; retry".into()));
         }
-        // An authenticated tip: the captured range must lead to it. The selected chain holds the
-        // tip's hash at its height and the range's last block at its own, checked together after
-        // capture, so a sibling that replaced a verified block while the range was captured is
-        // refused, never streamed. (Review: only the tip's number was kept.)
+        // An authenticated tip: the captured range must lead to that exact block, including
+        // when maxBlocks returns only a prefix. Validate both identities and their ancestry
+        // against one chain view, rather than two height lookups that can span a reorg.
         if let Some(h) = tip_hash
-            && (chain.canonical_hash(tip) != Some(h) || headers.last().is_some_and(|(n, bh, _)| chain.canonical_hash(*n) != Some(*bh)))
+            && !chain.is_ancestor_on_chain(headers.last().map(|(n, bh, _)| (*n, *bh)).expect("nonempty range"), (tip, h))?
         {
             return Err(DataError::ChainChanged("the verified chain changed during the request; retry".into()));
         }
@@ -601,6 +600,61 @@ mod tests {
         let verified = || Some(Tip { number: 101, hash: Some(a[2]) });
         let r = next(&cd, verified, tokio::sync::broadcast::channel(1).1, None, req(Some(id(100, a[1])), vec![id(99, a[0])], None)).await.unwrap();
         assert_eq!(applied(&r), vec![(101, a[2], vec![0xa])], "{r}");
+    }
+
+    #[tokio::test]
+    async fn a_verified_prefix_is_checked_against_the_authenticated_tip_after_capture() {
+        for stage in ["before_capture", "after_capture"] {
+            let cd = ChainData::offline(2048);
+            let a = extend(&cd, 99, 104, B256::repeat_byte(0x99), 0xa);
+            let cd2 = cd.clone();
+            let a100 = a[1];
+            cd.test_hooks.lock().insert(stage, Box::new(move || {
+                extend(&cd2, 101, 104, a100, 0xb);
+            }));
+            let mut request = req(Some(id(100, a100)), vec![], None);
+            request.max_blocks = Some(1); // 101 is a prefix; the signed block is 104.
+            let r = next(&cd, || Some(Tip { number: 104, hash: Some(a[5]) }), tokio::sync::broadcast::channel(1).1, None, request).await;
+            assert!(matches!(r, Err(DataError::ChainChanged(_))), "{stage}: {:?}", r.map(|v| v.to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn restoring_the_verified_fork_does_not_authenticate_a_prefix_captured_from_its_sibling() {
+        let cd = ChainData::offline(2048);
+        let a = extend(&cd, 99, 104, B256::repeat_byte(0x99), 0xa);
+        let a100 = a[1];
+        for (stage, tag) in [("before_capture", 0xb), ("after_capture", 0xa)] {
+            let cd2 = cd.clone();
+            cd.test_hooks.lock().insert(stage, Box::new(move || {
+                extend(&cd2, 101, 104, a100, tag);
+            }));
+        }
+        let mut request = req(Some(id(100, a100)), vec![], None);
+        request.max_blocks = Some(1);
+        let r = next(&cd, || Some(Tip { number: 104, hash: Some(a[5]) }), tokio::sync::broadcast::channel(1).1, None, request).await;
+        assert!(matches!(r, Err(DataError::ChainChanged(_))), "{:?}", r.map(|v| v.to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_verified_prefix_can_continue_through_history_below_the_memory_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.redb");
+        let a = {
+            let old = ChainData::offline(2048);
+            old.set_history(crate::history::HeaderStore::open(&path).unwrap());
+            extend(&old, 99, 104, B256::repeat_byte(0x99), 0xa)
+        };
+        let cd = ChainData::offline(2048);
+        cd.set_history(crate::history::HeaderStore::open(&path).unwrap());
+        let tip = extend(&cd, 105, 106, a[5], 0xa);
+        let (h, receipts, tx) = block(101, a[1], 0xa);
+        cd.note_receipts(101, h.hash_slow(), receipts, vec![tx]);
+        let mut request = req(Some(id(100, a[1])), vec![], None);
+        request.max_blocks = Some(1);
+        let r = next(&cd, || Some(Tip { number: 105, hash: Some(tip[0]) }), tokio::sync::broadcast::channel(1).1, None, request).await.unwrap();
+        assert_eq!(applied(&r), vec![(101, a[2], vec![0xa])], "{r}");
+        assert_eq!(r["cursor"]["number"], 101);
     }
 
     #[tokio::test]
