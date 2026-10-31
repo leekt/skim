@@ -23,14 +23,6 @@ Items are removed from this file when they're done, and the commit that closes o
 ## From the 2026-10-23 review
 The [review](REVIEW.md) lists every finding; these are the open ones that need design work.
 
-30. **Archive coverage as intervals.** Resubscribing an archived key replaces its coverage
-    start, so history recorded before the release becomes unreadable (REVIEW C9). Done when a
-    key's coverage is a set of intervals, reads inside an earlier interval are answered and the
-    gap between intervals is refused.
-31. **No disk sync under the store lock.** Archive commits (`write_block`, `put_code`,
-    `write_base`) fsync while the store's write lock is held, stalling every read for a disk
-    sync per block (REVIEW C4). Done when archive and memory still change together but reads
-    never wait on archive I/O, and a slow-disk soak shows no read stalls per block.
 33. **Readiness as a policy.** Several unusable states only warn while `skim status` exits 0.
     Done when a readiness check takes required subscriptions, a maximum head age and required
     authentication (`--require-verified`), and fails when they aren't met.
@@ -62,4 +54,8 @@ The [review](REVIEW.md) lists every finding; these are the open ones that need d
 The last items closed: 32, browser access to the RPC: `skim_*` methods only for origins `--cors` names exactly, WebSocket upgrades checked against `--cors`; 24, a live blob-parameter fork crossed on the devnet without losing peers
 (`162eb48`, `a27a7d7`); 26, diagnostic command scope: `run` is network-configurable and the other
 diagnostic workloads are explicitly Sepolia-only (`959adcf`); 22, restart recovery without a SNAP
-peer, and 23, archived call subscriptions growing without bound (sixth soak, M7 log).
+peer, and 23, archived call subscriptions growing without bound (sixth soak, M7 log); 30, archive
+coverage as intervals (earlier history stays readable after a key is archived again; older archives
+open unchanged); 31, no disk sync under the store lock (archive commits under the lock are
+non-durable, the sync follows outside it; shown by a test that pauses the sync while a reader
+reads; no slow-disk soak yet).

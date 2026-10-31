@@ -1045,3 +1045,67 @@ fn promoting_a_code_hash_to_the_archive_also_archives_its_cached_code() {
     assert_eq!(ar.get(&StateKey::CodeHash(A), 10).unwrap(), archive::ArchiveRead::Value(h.into()));
     assert_eq!(ar.get(&StateKey::CodeHash(A), 11).unwrap(), archive::ArchiveRead::Value(next_hash.into()));
 }
+
+#[test]
+fn a_reader_never_waits_for_an_archive_sync() {
+    // TODO 31 (REVIEW C4): archive commits used to fsync under the store's write lock, so every
+    // snapshot read stalled for a disk sync per block. The sync now runs after the lock is
+    // released: pause it (redb's writer held) and read meanwhile.
+    use std::{sync::mpsc, time::Duration};
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::with_archive(64, archive::Archive::open(d.path().join("a.redb")).unwrap()).unwrap();
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    s.insert_base(&blk(1, 0), slot(1), U256::from(1)).unwrap();
+    s.archive_key(slot(1));
+    let (entered_tx, entered_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (entered_tx, release_rx) = (parking_lot::Mutex::new(entered_tx), parking_lot::Mutex::new(release_rx));
+    *s.archive().unwrap().sync_hook.lock() = Some(Box::new(move || {
+        let _ = entered_tx.lock().send(());
+        let _ = release_rx.lock().recv_timeout(Duration::from_secs(10));
+    }));
+    let s2 = s.clone();
+    let writer = std::thread::spawn(move || s2.apply_block(blk(2, 0), writes(&[(slot(1), 2)])).unwrap());
+    entered_rx.recv_timeout(Duration::from_secs(10)).expect("the block's archive sync started");
+    // The writer is inside its durable commit. A reader sees memory and archive agree on block 2.
+    let (done_tx, done_rx) = mpsc::channel();
+    let s3 = s.clone();
+    std::thread::spawn(move || {
+        let head = s3.head().unwrap();
+        let mem = known(&s3.snapshot(&head).unwrap(), slot(1));
+        let disk = s3.archive().unwrap().get_at(&slot(1), 2, blk(2, 0).hash).unwrap();
+        let _ = done_tx.send((head.number, mem, disk));
+    });
+    let read = done_rx.recv_timeout(Duration::from_secs(5));
+    release_tx.send(()).unwrap();
+    writer.join().unwrap();
+    *s.archive().unwrap().sync_hook.lock() = None;
+    let (head, mem, disk) = read.expect("a reader waited for the archive sync");
+    assert_eq!((head, mem, disk), (2, Some(2), archive::ArchiveRead::Value(U256::from(2))));
+    assert_eq!(s.archive_errors(), 0);
+}
+
+#[test]
+fn a_released_key_archived_again_keeps_its_earlier_history() {
+    // TODO 30 (REVIEW C9): re-archiving a released key replaced its coverage, so the history
+    // recorded before the release became unreadable.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::with_archive(8, archive::Archive::open(d.path().join("a.redb")).unwrap()).unwrap();
+    s.apply_block(blk(1, 0), writes(&[(slot(1), 4)])).unwrap();
+    s.archive_key(slot(1)); // base at 1
+    s.apply_block(blk(2, 0), writes(&[])).unwrap();
+    s.apply_block(blk(3, 0), writes(&[(slot(1), 5)])).unwrap();
+    assert_eq!(s.release_archived(&[slot(1)]), 1); // covered up to 3
+    for n in 4..=15 {
+        // Block 5's write happens while the key isn't archived (and leaves the BAL window).
+        s.apply_block(blk(n, 0), writes(&if n == 5 { vec![(slot(1), 6)] } else { vec![] })).unwrap();
+    }
+    assert!(s.archive_key_checked(slot(1)));
+    s.insert_base(&blk(15, 0), slot(1), U256::from(6)).unwrap();
+    let at = |n: u64| known(&s.snapshot(&blk(n, 0)).unwrap(), slot(1));
+    assert!(s.snapshot(&blk(2, 0)).unwrap().is_archived());
+    assert_eq!((at(1), at(2), at(3)), (Some(4), Some(4), Some(5)), "the earlier interval");
+    assert_eq!((at(4), at(5), at(6)), (None, None, None), "the release gap: refused");
+    assert_eq!(at(15), Some(6));
+    assert_eq!(s.archive().unwrap().intervals(&slot(1)).unwrap(), vec![(1, Some(3)), (15, None)]);
+}

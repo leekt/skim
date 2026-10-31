@@ -176,7 +176,7 @@ See [configuration](docs/guide/configuration.md) for actual YAML. Chain selectio
 
 ### 7.6 M4: selective state archiving
 
-`retention: { mode: archive }` with `--archive <path>` records an initial base and changed versions for subscribed keys in redb. Coverage is per key and linked segment. Historical calls succeed only when every dependency is covered. Unneeded archived keys are released after 64 blocks; old covered history remains, but subsequent blocks are no longer covered until tracking resumes.
+`retention: { mode: archive }` with `--archive <path>` records an initial base and changed versions for subscribed keys in redb. Coverage is per key and linked segment. Historical calls succeed only when every dependency is covered. Coverage is a set of intervals: unneeded archived keys are released after 64 blocks; old covered history remains readable, the blocks until tracking resumes are not covered, and resuming starts a new interval.
 
 Restart gaps and `--archive-backfill N` use verified linked headers/BALs from peers. BALs contain post-values, so backfill cannot infer the value before the earliest recovered write. Unchanged keys can extend back only across a complete verified scan, including their known base boundary. There is no unlimited historical reconstruction guarantee.
 

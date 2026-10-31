@@ -29,7 +29,8 @@ A historical `eth_call` runs entirely on archived keys, with that block's header
 ## How it works
 - **Writes:** each block's BAL already lists every write with its new value, so skim stores a version **only when a key changes**. A key that never changes costs one entry.
 - **Coverage:** a key is covered from the block it became known (subscribe time) onwards, within *segments* of consecutively processed blocks.
-- **Released keys:** a key no subscription needs for 64 blocks stops being archived. It stays covered up to the release block only, and archiving it again starts new coverage.
+- **Released keys:** a key no subscription needs for 64 blocks stops being archived. It stays covered up to the release block only. Archiving it again starts a new coverage *interval*: the history from before the release stays readable, and reads in the blocks between the two intervals are refused (`-32002`), because nothing recorded the key's writes there. A key can collect any number of intervals.
+- **Disk syncs:** each block's archive writes are committed together with the in-memory state, without a disk sync, so reads never wait on the disk. The sync follows right after. A crash can lose only the change being synced at that moment: the archive returns to the state just before it, as if skim had stopped a moment earlier, and a restart treats it like any other (a lost block is healed as a gap, a lost base is fetched again).
 - **Restarts:** after a restart, the gap is healed in the background from eth/71 BALs. A reloaded archived key gets its base version whichever reads it first (its subscription or an on-demand read). How far back BALs are available: see [backfill](#backfill-history-from-before-you-subscribed).
 - **Reorgs:** the archive is truncated exactly by a per-block journal.
 
@@ -40,7 +41,7 @@ A historical `eth_call` runs entirely on archived keys, with that block's header
 
 Backfill depends on a complete verified chain of headers and BALs still served by peers. EIP-7928 requires ELs to keep BALs only for the weak subjectivity period (3,533 epochs, ~15.7 days); some may keep them longer. Measured on Sepolia on 2026-10-19 (`skim probe-retention`): all 7 eth/71 peers served BALs for every sampled block back to the Glamsterdam fork block 11,856,337 (~12.7 days then). At 12 s slots, two weeks is on the order of 100k blocks; other networks have different slot durations. `--archive-backfill N` is a target, not a guarantee or an automatic clamp to the fork/retention boundary. Unavailable ranges can keep retrying. Start with a few thousand blocks. Verified live: 300 blocks backfilled, 102 historical reads matched a reference archive node, 3 were correctly refused, 0 were wrong.
 
-Inspect the per-address coverage-start summary with `skim_archiveCoverage([address])`. It reports `key`, `from` and `starts_at_write`; it does not enumerate every segment or healed gap. A successful historical read still requires coverage at that exact block. `--history local` stores headers and log matches separately and does not replace the selective state archive.
+Inspect the per-address coverage-start summary with `skim_archiveCoverage([address])`. It reports `key`, `from` and `starts_at_write` for the current interval; it does not enumerate earlier intervals, every segment or healed gaps. A successful historical read still requires coverage at that exact block. `--history local` stores headers and log matches separately and does not replace the selective state archive.
 
 ## What's covered, exactly
 | Read at block B of key K | Answer |
@@ -48,5 +49,9 @@ Inspect the per-address coverage-start summary with `skim_archiveCoverage([addre
 | B inside a processed segment, K covered at B | the archived value |
 | K was never subscribed (or not yet at B) | `-32002` |
 | B before the backfill/subscription start, or in an unhealed gap | `-32002` |
+| K was released before B and archived again after it (between two intervals) | `-32002` |
+| B inside an earlier interval of K (before a release) | the archived value |
+
+Archives written before coverage intervals open unchanged: their coverage is read as each key's current interval, and nothing on disk is rewritten.
 
 Verified against a reference archive node: 90/90 historical reads across slots, balances and quotes; 51/51 inside healed restart gaps. Details: [M4](../experiments/m4-archive.md).

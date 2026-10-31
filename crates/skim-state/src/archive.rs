@@ -11,15 +11,43 @@
 //! A read of key `K` at block `N` is answered only if:
 //! - `N` lies in a **segment**: a run of consecutive blocks whose BALs were all processed
 //!   (restarts without gap fill end a segment)
-//! - `K` is **covered** at `N`: its value was known at or before `N` within that segment
+//! - `K` is **covered** at `N`: `N` lies in one of `K`'s coverage **intervals**, and its value
+//!   was known at or before `N` within that segment
 //!
 //! Otherwise it is [`ArchiveRead::NotCovered`], never a guess. Reorgs truncate exactly what the
 //! orphaned blocks wrote, using a per-block journal.
+//!
+//! ## Coverage intervals
+//!
+//! A key's coverage is a set of intervals. Each one promises: a version exists at its start,
+//! and every write to the key in the interval, on the archived chain, is stored as a version.
+//! - The **current** interval is `COVERAGE` (start) plus, once the key is released,
+//!   `COVERAGE_END` (last block). Only it grows: writes, bases, backfill and gap fill move its
+//!   start, as before.
+//! - **Earlier** intervals are `INTERVALS` entries `(key, start) -> end`, closed when a released
+//!   key is archived again. They never grow, only shrink when a reorg or reconciliation drops
+//!   blocks they cover. A read in the gap between two intervals is refused: nothing recorded the
+//!   key's writes there.
+//!
+//! **Format.** Archives written before intervals have no `INTERVALS` table, and their
+//! `COVERAGE`/`COVERAGE_END` mean exactly what the current interval means now. [`Archive::open`]
+//! creates the empty table, which is the whole migration: no existing entry is rewritten or
+//! reinterpreted, and an older skim reading a newer archive sees only current intervals (it
+//! refuses reads in earlier ones, never misanswers them).
+//!
+//! ## Durability and the store lock
+//!
+//! A redb commit fsyncs. The store applies archive writes while holding its own write lock (so
+//! memory and archive change together), and a sync there would stall every reader once per
+//! block. Instead a writer holds the archive's [`Hold`] (taken *before* the store lock): every
+//! commit made under it is non-durable (visible to readers at once, no fsync), and the outermost
+//! `Hold` makes them durable with one commit when it is dropped, after the store lock is
+//! released. Calls made without a `Hold` (the healer, tests) commit durably as before.
 
-use std::{collections::HashSet, path::Path};
+use std::{cell::Cell, collections::HashSet, path::Path};
 
 use alloy_primitives::{Address, B256, Bytes, U256};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 
 use crate::StateKey;
 
@@ -29,6 +57,7 @@ const K: usize = 53;
 const VK: usize = K + 8;
 
 const VERSIONS: TableDefinition<&[u8; VK], &[u8; 32]> = TableDefinition::new("versions");
+/// Start of each key's current coverage interval.
 const COVERAGE: TableDefinition<&[u8; K], u64> = TableDefinition::new("coverage");
 const ARCHIVED: TableDefinition<&[u8; K], ()> = TableDefinition::new("archived");
 const HEADERS: TableDefinition<u64, &[u8]> = TableDefinition::new("headers");
@@ -36,16 +65,20 @@ const HASHES: TableDefinition<u64, &[u8; 32]> = TableDefinition::new("hashes");
 const BY_HASH: TableDefinition<&[u8; 32], u64> = TableDefinition::new("by_hash");
 const CODE: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("code");
 const JOURNAL: TableDefinition<u64, &[u8]> = TableDefinition::new("journal");
-/// Keys whose coverage starts at a BAL **write** (not a base): the value before that write is in
-/// no BAL, so their history can never be extended backwards.
+/// Keys whose current coverage starts at a BAL **write** (not a base): the value before that
+/// write is in no BAL, so their history can never be extended backwards.
 const WRITE_BOUND: TableDefinition<&[u8; K], ()> = TableDefinition::new("write_bound");
 /// Keys whose coverage-start block is known not to write them (a backfill scanned it), so the
 /// value there also held just before it. A plain base is a post-state: the base block itself
 /// may have changed the key, so extending backwards needs that block's BAL.
 const PRE_CLEAN: TableDefinition<&[u8; K], ()> = TableDefinition::new("pre_clean");
-/// Keys no longer archived: the last block their coverage reaches. Reads above it are not
-/// covered (later writes were not recorded); re-archiving starts coverage afresh.
+/// Keys no longer archived: the last block their current coverage reaches. Reads above it are
+/// not covered (later writes were not recorded). Archiving the key again closes this interval
+/// into `INTERVALS` and starts a new current one.
 const COVERAGE_END: TableDefinition<&[u8; K], u64> = TableDefinition::new("coverage_end");
+/// Earlier, closed coverage intervals: (key, first block) -> last block (inclusive). Added with
+/// the interval format; absent (so empty) in older archives.
+const INTERVALS: TableDefinition<&[u8; VK], u64> = TableDefinition::new("coverage_intervals");
 /// Segments: first block -> last block (inclusive) of each run of consecutive processed blocks.
 const SEGMENTS: TableDefinition<u64, u64> = TableDefinition::new("segments");
 
@@ -62,14 +95,15 @@ pub enum ArchiveError {
 macro_rules! db_err {
     ($($t:ty),*) => { $(impl From<$t> for ArchiveError { fn from(e: $t) -> Self { Self::Db(e.to_string()) } })* };
 }
-db_err!(redb::DatabaseError, redb::TransactionError, redb::TableError, redb::StorageError, redb::CommitError);
+db_err!(redb::DatabaseError, redb::TransactionError, redb::TableError, redb::StorageError, redb::CommitError, redb::SetDurabilityError);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveRead {
     Value(U256),
     /// The archive's block at that height is not the one asked for (a reorg replaced it).
     OtherFork,
-    /// Not answerable at this block. `from` is where this key's coverage starts, if anywhere.
+    /// Not answerable at this block. `from` is where this key's current coverage starts, if
+    /// anywhere.
     NotCovered { from: Option<u64> },
 }
 
@@ -107,6 +141,10 @@ fn vkey(k: &[u8; K], block: u64) -> [u8; VK] {
     out
 }
 
+fn vkey_block(v: &[u8; VK]) -> u64 {
+    u64::from_be_bytes(v[K..].try_into().unwrap())
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BackfillReport {
     pub new_blocks: u64,
@@ -132,17 +170,69 @@ pub struct ArchiveBlock<'a> {
     pub writes: &'a [(StateKey, U256)],
 }
 
+/// Who may write the archive, and how many of its commits still await a durable one.
+#[derive(Default)]
+struct Gate {
+    depth: Cell<u32>,
+    dirty: Cell<bool>,
+}
+
+/// Exclusive write access to the archive for the calling thread (reentrant). Commits made while
+/// a `Hold` is outstanding are non-durable; dropping the outermost one makes them durable with a
+/// single synced commit. See the module docs: the store takes this *before* its own write lock,
+/// so the sync happens after that lock is released and readers never wait on it.
+///
+/// Lock order: `Hold`, then the store lock. A thread holding the store's write lock never waits
+/// for a `Hold` (it already has one), so a sync in progress can delay only other writers.
+pub struct Hold<'a> {
+    ar: &'a Archive,
+    gate: parking_lot::ReentrantMutexGuard<'a, Gate>,
+}
+
+impl Hold<'_> {
+    fn nested(&self) -> bool {
+        self.gate.depth.get() > 1
+    }
+}
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        let d = self.gate.depth.get() - 1;
+        self.gate.depth.set(d);
+        if d == 0 && self.gate.dirty.get() {
+            match self.ar.sync() {
+                Ok(()) => self.gate.dirty.set(false),
+                Err(e) => {
+                    // Left dirty: the next outermost release retries. Until then the data is
+                    // visible but a crash may revert it (see `Archive::sync`).
+                    self.ar.sync_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(error = %e, "archive: durable commit failed");
+                }
+            }
+        }
+    }
+}
+
 pub struct Archive {
     db: Database,
+    gate: parking_lot::ReentrantMutex<Gate>,
+    sync_errors: std::sync::atomic::AtomicU64,
     /// Runs inside `backfill`'s write transaction, after its checks (tests: interleavings).
     #[cfg(test)]
     pub(crate) hook: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Runs inside the durable commit of [`Archive::sync`], with redb's writer held (tests:
+    /// readers must not wait for it).
+    #[cfg(test)]
+    pub(crate) sync_hook: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl Archive {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ArchiveError> {
         // Bounded page cache (redb's default is 1 GiB): history reads are point lookups.
         let db = Database::builder().set_cache_size(64 << 20).create(path)?;
+        // Creates any missing table. For an archive written before coverage intervals this adds
+        // the empty INTERVALS table and touches nothing else: the old layout *is* the new one
+        // with no earlier intervals (module docs, "Format").
         let tx = db.begin_write()?;
         tx.open_table(VERSIONS)?;
         tx.open_table(COVERAGE)?;
@@ -156,12 +246,64 @@ impl Archive {
         tx.open_table(WRITE_BOUND)?;
         tx.open_table(PRE_CLEAN)?;
         tx.open_table(COVERAGE_END)?;
+        tx.open_table(INTERVALS)?;
         tx.commit()?;
         Ok(Self {
             db,
+            gate: Default::default(),
+            sync_errors: Default::default(),
             #[cfg(test)]
             hook: Default::default(),
+            #[cfg(test)]
+            sync_hook: Default::default(),
         })
+    }
+
+    /// Takes the archive's write access for this thread until the guard drops (see [`Hold`]).
+    pub fn hold(&self) -> Hold<'_> {
+        let gate = self.gate.lock();
+        gate.depth.set(gate.depth.get() + 1);
+        Hold { ar: self, gate }
+    }
+
+    /// Durable commits that failed (their data stays visible, and is retried by the next one).
+    pub fn sync_errors(&self) -> u64 {
+        self.sync_errors.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Makes every earlier non-durable commit durable: an empty commit with
+    /// [`Durability::Immediate`] persists them all (redb). Until it returns, a crash reverts the
+    /// file to the last durable commit, which is the state before the writer's whole `Hold`
+    /// (each holder syncs before releasing the gate, so at most one holder's commits are ever
+    /// pending): the same as crashing a moment earlier.
+    fn sync(&self) -> Result<(), ArchiveError> {
+        let tx = self.db.begin_write()?;
+        #[cfg(test)]
+        if let Some(h) = self.sync_hook.lock().as_ref() {
+            h();
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// One write transaction. Inside an outer [`Hold`] it commits without fsync (the holder syncs
+    /// later); on its own it commits durably. An error aborts it (nothing is written).
+    fn write<T>(&self, f: impl FnOnce(&WriteTransaction) -> Result<T, ArchiveError>) -> Result<T, ArchiveError> {
+        let hold = self.hold();
+        let nested = hold.nested();
+        let out = {
+            let mut tx = self.db.begin_write()?;
+            if nested {
+                tx.set_durability(Durability::None)?;
+            }
+            let out = f(&tx)?;
+            tx.commit()?;
+            out
+        };
+        // Nested: the holder makes it durable. Alone: this commit was durable, and so is
+        // everything committed before it.
+        hold.gate.dirty.set(nested);
+        Ok(out)
     }
 
     pub fn archived_keys(&self) -> Result<HashSet<StateKey>, ArchiveError> {
@@ -177,25 +319,36 @@ impl Archive {
         Ok(out)
     }
 
+    /// Ends the key's current interval: an ended one (`[start, end]`) is kept as an earlier
+    /// interval, so its history stays readable; the current start and its flags are cleared.
+    fn close_current(tx: &WriteTransaction, ek: &[u8; K]) -> Result<(), ArchiveError> {
+        let start = tx.open_table(COVERAGE)?.remove(ek)?.map(|g| g.value());
+        let end = tx.open_table(COVERAGE_END)?.remove(ek)?.map(|g| g.value());
+        if let (Some(s), Some(e)) = (start, end)
+            && e >= s
+        {
+            tx.open_table(INTERVALS)?.insert(&vkey(ek, s), e)?;
+        }
+        tx.open_table(WRITE_BOUND)?.remove(ek)?;
+        tx.open_table(PRE_CLEAN)?.remove(ek)?;
+        Ok(())
+    }
+
     /// Marks keys as archived (idempotent). Their history starts at their first base or write.
     pub fn add_keys(&self, keys: &[StateKey]) -> Result<(), ArchiveError> {
-        let tx = self.db.begin_write()?;
-        {
-            let mut t = tx.open_table(ARCHIVED)?;
-            let mut end = tx.open_table(COVERAGE_END)?;
-            let mut cov = tx.open_table(COVERAGE)?;
+        self.write(|tx| {
             for k in keys {
                 let ek = encode_key(k);
-                t.insert(&ek, ())?;
+                tx.open_table(ARCHIVED)?.insert(&ek, ())?;
                 // Archived again after its coverage ended: the blocks since were not recorded,
-                // so coverage restarts from the next write rather than bridging that gap.
-                if end.remove(&ek)?.is_some() {
-                    cov.remove(&ek)?;
+                // so the ended interval is closed (still readable) and new coverage starts from
+                // the next write rather than bridging that gap.
+                if tx.open_table(COVERAGE_END)?.get(&ek)?.is_some() {
+                    Self::close_current(tx, &ek)?;
                 }
             }
-        }
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Last block of the open segment.
@@ -222,8 +375,7 @@ impl Archive {
     /// carries over (e.g. the first block after a restart that followed an offline reorg); the
     /// healer reconciles such boundaries.
     pub fn write_block(&self, b: &ArchiveBlock<'_>) -> Result<(), ArchiveError> {
-        let tx = self.db.begin_write()?;
-        {
+        self.write(|tx| {
             let end_hash = |end: u64| -> Result<Option<B256>, ArchiveError> {
                 Ok(tx.open_table(HASHES)?.get(end)?.map(|g| B256::from(*g.value())))
             };
@@ -242,16 +394,15 @@ impl Archive {
                     seg.insert(b.number, b.number)?;
                 }
             }
-            Self::write_entries(&tx, b)?;
-        }
-        tx.commit()?;
-        Ok(())
+            drop(seg);
+            Self::write_entries(tx, b, None)
+        })
     }
 
     /// Records that `ek` has a version at `block`, so a reorg below `block` removes it. Every
     /// version the archive stores must be journaled: BAL writes, bases, replayed writes and
     /// backfilled values alike.
-    fn journal_add(tx: &redb::WriteTransaction, block: u64, ek: &[u8; K]) -> Result<(), ArchiveError> {
+    fn journal_add(tx: &WriteTransaction, block: u64, ek: &[u8; K]) -> Result<(), ArchiveError> {
         let mut j = tx.open_table(JOURNAL)?;
         let mut cur = j.get(block)?.map(|g| g.value().to_vec()).unwrap_or_default();
         if !cur.chunks_exact(K).any(|c| c == ek) {
@@ -261,17 +412,29 @@ impl Archive {
         Ok(())
     }
 
-    fn write_entries(tx: &redb::WriteTransaction, b: &ArchiveBlock<'_>) -> Result<(), ArchiveError> {
+    /// Stores a block's writes. `gap_before`: the block fills the gap before the segment that
+    /// starts there, rather than extending the archive at its top.
+    fn write_entries(tx: &WriteTransaction, b: &ArchiveBlock<'_>, gap_before: Option<u64>) -> Result<(), ArchiveError> {
         let mut versions = tx.open_table(VERSIONS)?;
         let mut cov = tx.open_table(COVERAGE)?;
         let mut journal = Vec::with_capacity(b.writes.len() * K);
         for (k, v) in b.writes {
             let ek = encode_key(k);
             versions.insert(&vkey(&ek, b.number), &v.to_be_bytes::<32>())?;
-            // Coverage starts at the earliest block whose value is known (a gap fill can move it
-            // earlier: a write fixes the value from that block on).
             let cur = cov.get(&ek)?.map(|g| g.value());
-            if cur.is_none_or(|c| b.number < c) {
+            // Coverage starts at the earliest block whose value is known. At the top of the
+            // archive that is this write if nothing covers the key yet. A gap fill may move a
+            // start back into the gap only if the key was covered from the very start of the
+            // next segment: the gap's writes then join recorded ones. A start later than that
+            // (or none) means blocks between the gap and it were not recorded for the key (it
+            // wasn't archived, or was released), and coverage must not bridge them.
+            let start_here = match (gap_before, cur) {
+                (None, None) => true,
+                (None, Some(c)) => b.number < c,
+                (Some(ns), Some(c)) => b.number < c && c == ns,
+                (Some(_), None) => false,
+            };
+            if start_here {
                 cov.insert(&ek, b.number)?;
                 tx.open_table(WRITE_BOUND)?.insert(&ek, ())?;
                 tx.open_table(PRE_CLEAN)?.remove(&ek)?;
@@ -285,8 +448,8 @@ impl Archive {
         Ok(())
     }
 
-    /// Every archived key with its coverage start, and whether that start is a base value
-    /// (extendable backwards by a BAL scan) rather than a write (never extendable).
+    /// Every archived key with its current coverage start, and whether that start is a base
+    /// value (extendable backwards by a BAL scan) rather than a write (never extendable).
     pub fn coverages(&self) -> Result<Vec<(StateKey, u64, bool)>, ArchiveError> {
         let tx = self.db.begin_read()?;
         let t = tx.open_table(COVERAGE)?;
@@ -306,6 +469,22 @@ impl Archive {
         Ok(out)
     }
 
+    /// Every coverage interval of `key`, oldest first, as `(first, last)`; `last` is `None` for
+    /// a current interval that is still open.
+    pub fn intervals(&self, key: &StateKey) -> Result<Vec<(u64, Option<u64>)>, ArchiveError> {
+        let ek = encode_key(key);
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        for e in tx.open_table(INTERVALS)?.range::<&[u8; VK]>(&vkey(&ek, 0)..=&vkey(&ek, u64::MAX))? {
+            let (k, end) = e?;
+            out.push((vkey_block(k.value()), Some(end.value())));
+        }
+        if let Some(c) = tx.open_table(COVERAGE)?.get(&ek)? {
+            out.push((c.value(), tx.open_table(COVERAGE_END)?.get(&ek)?.map(|g| g.value())));
+        }
+        Ok(out)
+    }
+
     /// Extends history backwards from a **fully scanned** run of BALs (M4.2).
     ///
     /// `blocks` are consecutive `[from, scan_end]`, each carrying *all* of that block's writes to
@@ -313,11 +492,15 @@ impl Archive {
     /// recorded, and the last of them must be the parent of `S` (`s_parent`), so the segment
     /// grows backwards to `from`.
     ///
-    /// For each archived key whose coverage starts at `c` with `from < c <= scan_end + 1`:
+    /// For each archived key whose current coverage starts at `c` with `from < c <= scan_end + 1`:
     /// - **no write in `[from, c)`**: a BAL lists every write, so the value was constant; coverage
     ///   moves to `from` with the value at `c`
     /// - **writes**: they are recorded, and coverage moves to the first write (the value before it
     ///   isn't in any BAL)
+    ///
+    /// The scan lists every write in `[from, c)`, so this holds even across an earlier
+    /// interval's release gap; the earlier interval then overlaps the current one, harmlessly
+    /// (both promise only recorded writes).
     pub fn backfill(&self, blocks: &[ArchiveBlock<'_>], s_parent: Option<B256>, scope: &HashSet<StateKey>) -> Result<BackfillReport, ArchiveError> {
         let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else { return Ok(BackfillReport::default()) };
         if blocks.windows(2).any(|w| w[1].number != w[0].number + 1 || w[1].parent_hash != w[0].hash) {
@@ -327,56 +510,55 @@ impl Archive {
         // Every check runs inside the write transaction that commits the result. Write
         // transactions are serialized, and a rollback is one too: it lands either before (the
         // checks see it) or after (it truncates what this wrote, through the journal).
-        let tx = self.db.begin_write()?;
-        let segs: Vec<(u64, u64)> =
-            tx.open_table(SEGMENTS)?.iter()?.map(|e| e.map(|(s, e)| (s.value(), e.value()))).collect::<Result<_, _>>()?;
-        let Some(&(s, e)) = segs.first() else {
-            return Err(ArchiveError::GapMismatch("empty archive".into()));
-        };
-        // The scanned part at or after S must lie in the first segment.
-        if scan_end >= s && scan_end > e {
-            return Err(ArchiveError::GapMismatch(format!("scan end {scan_end} beyond the first segment (ends {e})")));
-        }
-        let hash_at = |n: u64| -> Result<Option<B256>, ArchiveError> { Ok(tx.open_table(HASHES)?.get(n)?.map(|g| B256::from(*g.value()))) };
-        let extends = from < s;
-        if extends {
-            if scan_end + 1 < s {
-                return Err(ArchiveError::GapMismatch(format!("scan {from}..={scan_end} does not reach the segment start {s}")));
+        self.write(|tx| {
+            let segs: Vec<(u64, u64)> =
+                tx.open_table(SEGMENTS)?.iter()?.map(|e| e.map(|(s, e)| (s.value(), e.value()))).collect::<Result<_, _>>()?;
+            let Some(&(s, e)) = segs.first() else {
+                return Err(ArchiveError::GapMismatch("empty archive".into()));
+            };
+            // The scanned part at or after S must lie in the first segment.
+            if scan_end >= s && scan_end > e {
+                return Err(ArchiveError::GapMismatch(format!("scan end {scan_end} beyond the first segment (ends {e})")));
             }
-            let link = blocks.iter().find(|b| b.number == s - 1).map(|b| b.hash);
-            if link.is_none() || link != s_parent || hash_at(s)?.is_none() {
-                return Err(ArchiveError::GapMismatch("backfill does not link to the first segment".into()));
-            }
-        }
-        // Blocks at or after S must be the ones the archive holds now.
-        for b in blocks.iter().filter(|b| b.number >= s) {
-            if hash_at(b.number)? != Some(b.hash) {
-                return Err(ArchiveError::GapMismatch(format!("block {} differs from the archived chain", b.number)));
-            }
-        }
-        let covs: Vec<(StateKey, u64, bool)> = {
-            let cov = tx.open_table(COVERAGE)?;
-            let wb = tx.open_table(WRITE_BOUND)?;
-            let ended = tx.open_table(COVERAGE_END)?;
-            let mut out = Vec::new();
-            for e in cov.iter()? {
-                let (k, c) = e?;
-                let ek = *k.value();
-                if ended.get(&ek)?.is_some() {
-                    continue;
+            let hash_at = |n: u64| -> Result<Option<B256>, ArchiveError> { Ok(tx.open_table(HASHES)?.get(n)?.map(|g| B256::from(*g.value()))) };
+            let extends = from < s;
+            if extends {
+                if scan_end + 1 < s {
+                    return Err(ArchiveError::GapMismatch(format!("scan {from}..={scan_end} does not reach the segment start {s}")));
                 }
-                if let Some(key) = decode_key(&ek) {
-                    out.push((key, c.value(), wb.get(&ek)?.is_none()));
+                let link = blocks.iter().find(|b| b.number == s - 1).map(|b| b.hash);
+                if link.is_none() || link != s_parent || hash_at(s)?.is_none() {
+                    return Err(ArchiveError::GapMismatch("backfill does not link to the first segment".into()));
                 }
             }
-            out
-        };
-        #[cfg(test)]
-        if let Some(h) = self.hook.lock().as_ref() {
-            h();
-        }
-        let mut report = BackfillReport::default();
-        {
+            // Blocks at or after S must be the ones the archive holds now.
+            for b in blocks.iter().filter(|b| b.number >= s) {
+                if hash_at(b.number)? != Some(b.hash) {
+                    return Err(ArchiveError::GapMismatch(format!("block {} differs from the archived chain", b.number)));
+                }
+            }
+            let covs: Vec<(StateKey, u64, bool)> = {
+                let cov = tx.open_table(COVERAGE)?;
+                let wb = tx.open_table(WRITE_BOUND)?;
+                let ended = tx.open_table(COVERAGE_END)?;
+                let mut out = Vec::new();
+                for e in cov.iter()? {
+                    let (k, c) = e?;
+                    let ek = *k.value();
+                    if ended.get(&ek)?.is_some() {
+                        continue;
+                    }
+                    if let Some(key) = decode_key(&ek) {
+                        out.push((key, c.value(), wb.get(&ek)?.is_none()));
+                    }
+                }
+                out
+            };
+            #[cfg(test)]
+            if let Some(h) = self.hook.lock().as_ref() {
+                h();
+            }
+            let mut report = BackfillReport::default();
             if extends {
                 let mut headers = tx.open_table(HEADERS)?;
                 let mut hashes = tx.open_table(HASHES)?;
@@ -438,14 +620,14 @@ impl Archive {
                         continue;
                     };
                     versions.insert(&vkey(&ek, from), &v)?;
-                    Self::journal_add(&tx, from, &ek)?;
+                    Self::journal_add(tx, from, &ek)?;
                     cov.insert(&ek, from)?;
                     clean.insert(&ek, ())?; // `from` was scanned and doesn't write k
                     report.keys_unchanged += 1;
                 } else {
                     for (n, v) in &writes {
                         versions.insert(&vkey(&ek, *n), &v.to_be_bytes::<32>())?;
-                        Self::journal_add(&tx, *n, &ek)?;
+                        Self::journal_add(tx, *n, &ek)?;
                     }
                     cov.insert(&ek, writes[0].0)?;
                     wb.insert(&ek, ())?;
@@ -458,9 +640,8 @@ impl Archive {
                 seg.remove(s)?;
                 seg.insert(from, e)?;
             }
-        }
-        tx.commit()?;
-        Ok(report)
+            Ok(report)
+        })
     }
 
     /// Fills the gap between two segments with the missing blocks (in order) and merges them.
@@ -473,75 +654,73 @@ impl Archive {
             return Err(ArchiveError::GapMismatch("gap blocks are not a linked chain".into()));
         }
         // Checks inside the committing write transaction (see `backfill`).
-        let tx = self.db.begin_write()?;
-        let segs: Vec<(u64, u64)> =
-            tx.open_table(SEGMENTS)?.iter()?.map(|e| e.map(|(s, e)| (s.value(), e.value()))).collect::<Result<_, _>>()?;
-        let prev = segs.iter().find(|(_, e)| *e + 1 == first.number).copied();
-        let next = segs.iter().find(|(s, _)| *s == last.number + 1).copied();
-        let (Some((ps, _)), Some((ns, ne))) = (prev, next) else {
-            return Err(ArchiveError::GapMismatch(format!("{}..={} is not between two segments", first.number, last.number)));
-        };
-        let hash_at = |n: u64| -> Result<Option<B256>, ArchiveError> { Ok(tx.open_table(HASHES)?.get(n)?.map(|g| B256::from(*g.value()))) };
-        if hash_at(first.number - 1)? != Some(first.parent_hash) {
-            return Err(ArchiveError::GapMismatch("first block does not link to the previous segment".into()));
-        }
-        let next_rlp = tx.open_table(HEADERS)?.get(ns)?.map(|g| g.value().to_vec());
-        let next_parent =
-            next_rlp.and_then(|r| <alloy_consensus::Header as alloy_rlp::Decodable>::decode(&mut r.as_slice()).ok()).map(|h| h.parent_hash);
-        if next_parent != Some(last.hash) {
-            return Err(ArchiveError::GapMismatch("last block does not link to the next segment".into()));
-        }
-        // The blocks carry the writes of the keys archived when the scan started. A key archived
-        // since and covered from before the end of the gap would get no versions for it: retry
-        // with a fresh scope instead of merging.
-        // Keys whose coverage ended are outside the scan too: their coverage must stop before
-        // the gap (its blocks carry none of their writes).
-        Self::clamp_ended(&tx, first.number)?;
-        {
-            let cov = tx.open_table(COVERAGE)?;
-            let ended = tx.open_table(COVERAGE_END)?;
-            for e in cov.iter()? {
-                let (k, c) = e?;
-                if ended.get(k.value())?.is_some() {
-                    continue;
-                }
-                if c.value() <= last.number && decode_key(k.value()).is_some_and(|key| !scope.contains(&key)) {
-                    return Err(ArchiveError::GapMismatch("archived key set changed during the scan; retry".into()));
+        self.write(|tx| {
+            let segs: Vec<(u64, u64)> =
+                tx.open_table(SEGMENTS)?.iter()?.map(|e| e.map(|(s, e)| (s.value(), e.value()))).collect::<Result<_, _>>()?;
+            let prev = segs.iter().find(|(_, e)| *e + 1 == first.number).copied();
+            let next = segs.iter().find(|(s, _)| *s == last.number + 1).copied();
+            let (Some((ps, _)), Some((ns, ne))) = (prev, next) else {
+                return Err(ArchiveError::GapMismatch(format!("{}..={} is not between two segments", first.number, last.number)));
+            };
+            let hash_at = |n: u64| -> Result<Option<B256>, ArchiveError> { Ok(tx.open_table(HASHES)?.get(n)?.map(|g| B256::from(*g.value()))) };
+            if hash_at(first.number - 1)? != Some(first.parent_hash) {
+                return Err(ArchiveError::GapMismatch("first block does not link to the previous segment".into()));
+            }
+            let next_rlp = tx.open_table(HEADERS)?.get(ns)?.map(|g| g.value().to_vec());
+            let next_parent =
+                next_rlp.and_then(|r| <alloy_consensus::Header as alloy_rlp::Decodable>::decode(&mut r.as_slice()).ok()).map(|h| h.parent_hash);
+            if next_parent != Some(last.hash) {
+                return Err(ArchiveError::GapMismatch("last block does not link to the next segment".into()));
+            }
+            // The blocks carry the writes of the keys archived when the scan started. A key
+            // archived since and covered from before the end of the gap would get no versions
+            // for it: retry with a fresh scope instead of merging.
+            // Keys whose coverage ended (and earlier intervals) are outside the scan too: an
+            // interval spanning the gap must stop before it (its blocks carry none of their
+            // writes).
+            Self::clamp_intervals(tx, first.number, last.number)?;
+            {
+                let cov = tx.open_table(COVERAGE)?;
+                let ended = tx.open_table(COVERAGE_END)?;
+                for e in cov.iter()? {
+                    let (k, c) = e?;
+                    if ended.get(k.value())?.is_some() {
+                        continue;
+                    }
+                    if c.value() <= last.number && decode_key(k.value()).is_some_and(|key| !scope.contains(&key)) {
+                        return Err(ArchiveError::GapMismatch("archived key set changed during the scan; retry".into()));
+                    }
                 }
             }
-        }
-        for b in blocks {
-            Self::write_entries(&tx, b)?;
-        }
-        {
+            for b in blocks {
+                Self::write_entries(tx, b, Some(ns))?;
+            }
             let mut seg = tx.open_table(SEGMENTS)?;
             seg.remove(ns)?;
             seg.insert(ps, ne)?;
-        }
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Reconciliation after a fork the archive missed (e.g. a reorg while skim was offline):
     /// forgets blocks `lo..=hi`, the tail of the segment that holds them, which then ends at
-    /// `lo - 1` (or disappears). A key whose coverage started in those blocks keeps coverage only
-    /// from its next archived version above them (write-bound), if any.
+    /// `lo - 1` (or disappears). A key whose current coverage started in those blocks keeps
+    /// coverage only from its next archived version above them (write-bound), if any.
     pub fn truncate_range(&self, lo: u64, hi: u64) -> Result<(), ArchiveError> {
-        let tx = self.db.begin_write()?;
-        {
-            let mut seg = tx.open_table(SEGMENTS)?;
-            let owner = seg.range(..=lo)?.next_back().transpose()?.map(|(s, e)| (s.value(), e.value()));
-            let Some((s, _)) = owner.filter(|(_, e)| *e == hi) else {
-                return Err(ArchiveError::GapMismatch(format!("{lo}..={hi} is not the tail of a segment")));
-            };
-            if s >= lo {
-                seg.remove(s)?;
-            } else {
-                seg.insert(s, lo - 1)?;
+        self.write(|tx| {
+            {
+                let mut seg = tx.open_table(SEGMENTS)?;
+                let owner = seg.range(..=lo)?.next_back().transpose()?.map(|(s, e)| (s.value(), e.value()));
+                let Some((s, _)) = owner.filter(|(_, e)| *e == hi) else {
+                    return Err(ArchiveError::GapMismatch(format!("{lo}..={hi} is not the tail of a segment")));
+                };
+                if s >= lo {
+                    seg.remove(s)?;
+                } else {
+                    seg.insert(s, lo - 1)?;
+                }
             }
-        }
-        Self::clamp_ended(&tx, lo)?;
-        {
+            Self::clamp_intervals(tx, lo, hi)?;
             let mut journal = tx.open_table(JOURNAL)?;
             let mut versions = tx.open_table(VERSIONS)?;
             let mut cov = tx.open_table(COVERAGE)?;
@@ -568,7 +747,7 @@ impl Archive {
                     .range::<&[u8; VK]>(&vkey(&ek, hi + 1)..=&vkey(&ek, u64::MAX))?
                     .next()
                     .transpose()?
-                    .map(|(k, _)| u64::from_be_bytes(k.value()[K..].try_into().unwrap()));
+                    .map(|(k, _)| vkey_block(k.value()));
                 match next {
                     Some(n) => {
                         cov.insert(&ek, n)?;
@@ -580,18 +759,17 @@ impl Archive {
                     }
                 }
             }
-        }
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Stops archiving `key`: its history stays readable up to `last` (the last block whose
     /// writes were recorded for it), and reads above that are not covered. With `last` before
-    /// the coverage start (or `None`), nothing remains covered.
+    /// the coverage start (or `None`), nothing remains covered by the current interval (earlier
+    /// intervals stay).
     pub fn end_coverage(&self, key: &StateKey, last: Option<u64>) -> Result<(), ArchiveError> {
         let ek = encode_key(key);
-        let tx = self.db.begin_write()?;
-        {
+        self.write(|tx| {
             tx.open_table(ARCHIVED)?.remove(&ek)?;
             let mut cov = tx.open_table(COVERAGE)?;
             let start = cov.get(&ek)?.map(|g| g.value());
@@ -604,27 +782,51 @@ impl Archive {
                     tx.open_table(COVERAGE_END)?.remove(&ek)?;
                 }
             }
-        }
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
-    /// Ended coverage must never reach blocks whose writes weren't recorded for the key: lowers
-    /// every end at or above `first` to `first - 1` (dropping coverage that would be empty).
-    fn clamp_ended(tx: &redb::WriteTransaction, first: u64) -> Result<(), ArchiveError> {
-        let mut end = tx.open_table(COVERAGE_END)?;
-        let mut cov = tx.open_table(COVERAGE)?;
-        let hit: Vec<([u8; K], u64)> =
-            end.iter()?.filter_map(|e| e.ok()).filter(|(_, l)| l.value() >= first).map(|(k, l)| (*k.value(), l.value())).collect();
-        for (ek, _) in hit {
-            let c = cov.get(&ek)?.map(|g| g.value());
-            match (c, first.checked_sub(1)) {
-                (Some(c), Some(l)) if l >= c => {
-                    end.insert(&ek, l)?;
+    /// Blocks `lo..=hi` are being dropped or replaced, and the intervals that don't grow (ended
+    /// current ones and earlier ones) won't get their writes recorded there: an interval that
+    /// reaches into them now ends at `lo - 1`, or is dropped if it starts in them. Intervals
+    /// entirely above `hi` are untouched.
+    fn clamp_intervals(tx: &WriteTransaction, lo: u64, hi: u64) -> Result<(), ArchiveError> {
+        let clamp = |s: u64, e: u64| -> Option<Option<u64>> {
+            // None: untouched; Some(None): dropped; Some(Some(l)): ends at l.
+            (s <= hi && e >= lo).then(|| (s < lo).then(|| lo - 1))
+        };
+        {
+            let mut end = tx.open_table(COVERAGE_END)?;
+            let mut cov = tx.open_table(COVERAGE)?;
+            let ended: Vec<([u8; K], u64)> =
+                end.iter()?.map(|e| e.map(|(k, l)| (*k.value(), l.value()))).collect::<Result<_, _>>()?;
+            for (ek, l) in ended {
+                let Some(c) = cov.get(&ek)?.map(|g| g.value()) else {
+                    end.remove(&ek)?; // an end without a start covers nothing
+                    continue;
+                };
+                match clamp(c, l) {
+                    None => {}
+                    Some(Some(l)) => {
+                        end.insert(&ek, l)?;
+                    }
+                    Some(None) => {
+                        end.remove(&ek)?;
+                        cov.remove(&ek)?;
+                    }
                 }
-                _ => {
-                    end.remove(&ek)?;
-                    cov.remove(&ek)?;
+            }
+        }
+        let mut iv = tx.open_table(INTERVALS)?;
+        let all: Vec<([u8; VK], u64)> = iv.iter()?.map(|e| e.map(|(k, l)| (*k.value(), l.value()))).collect::<Result<_, _>>()?;
+        for (k, e) in all {
+            match clamp(vkey_block(&k), e) {
+                None => {}
+                Some(Some(l)) => {
+                    iv.insert(&k, l)?;
+                }
+                Some(None) => {
+                    iv.remove(&k)?;
                 }
             }
         }
@@ -637,51 +839,53 @@ impl Archive {
     /// fork is never stored under this fork's header. Coverage starts at the earliest such block.
     pub fn write_base(&self, key: &StateKey, block: u64, hash: B256, value: U256, later: &[(u64, B256, U256)]) -> Result<(), ArchiveError> {
         let ek = encode_key(key);
-        let tx = self.db.begin_write()?;
-        {
-            let hashes = tx.open_table(HASHES)?;
-            for (n, h) in std::iter::once((block, hash)).chain(later.iter().map(|(n, h, _)| (*n, *h))) {
-                if hashes.get(n)?.map(|g| B256::from(*g.value())) != Some(h) {
-                    return Err(ArchiveError::GapMismatch(format!("block {n} ({h}) is not the archived block at that height")));
+        self.write(|tx| {
+            {
+                let hashes = tx.open_table(HASHES)?;
+                for (n, h) in std::iter::once((block, hash)).chain(later.iter().map(|(n, h, _)| (*n, *h))) {
+                    if hashes.get(n)?.map(|g| B256::from(*g.value())) != Some(h) {
+                        return Err(ArchiveError::GapMismatch(format!("block {n} ({h}) is not the archived block at that height")));
+                    }
                 }
             }
-        }
-        let later: Vec<(u64, U256)> = later.iter().map(|(n, _, v)| (*n, *v)).collect();
-        let later = later.as_slice();
-        {
-            let mut versions = tx.open_table(VERSIONS)?;
-            // A BAL write at `block` is authoritative; don't overwrite it with the base.
-            if versions.get(&vkey(&ek, block))?.is_none() {
-                versions.insert(&vkey(&ek, block), &value.to_be_bytes::<32>())?;
+            let later: Vec<(u64, U256)> = later.iter().map(|(n, _, v)| (*n, *v)).collect();
+            {
+                let mut versions = tx.open_table(VERSIONS)?;
+                // A BAL write at `block` is authoritative; don't overwrite it with the base.
+                if versions.get(&vkey(&ek, block))?.is_none() {
+                    versions.insert(&vkey(&ek, block), &value.to_be_bytes::<32>())?;
+                }
+                for (n, v) in &later {
+                    versions.insert(&vkey(&ek, *n), &v.to_be_bytes::<32>())?;
+                }
             }
-            for (n, v) in later {
-                versions.insert(&vkey(&ek, *n), &v.to_be_bytes::<32>())?;
+            Self::journal_add(tx, block, &ek)?;
+            for (n, _) in &later {
+                Self::journal_add(tx, *n, &ek)?;
             }
-            drop(versions);
-            Self::journal_add(&tx, block, &ek)?;
-            for (n, _) in later {
-                Self::journal_add(&tx, *n, &ek)?;
+            // Coverage that had ended restarts here: the blocks between were not recorded. The
+            // ended interval is kept as an earlier one.
+            let restart = tx.open_table(COVERAGE_END)?.get(&ek)?.is_some();
+            if restart {
+                Self::close_current(tx, &ek)?;
             }
             let mut cov = tx.open_table(COVERAGE)?;
-            // Coverage that had ended restarts here: the blocks between were not recorded.
-            let restart = tx.open_table(COVERAGE_END)?.remove(&ek)?.is_some();
             let cur = cov.get(&ek)?.map(|g| g.value());
-            if restart || cur.is_none_or(|c| block < c) {
+            if cur.is_none_or(|c| block < c) {
                 cov.insert(&ek, block)?;
                 tx.open_table(WRITE_BOUND)?.remove(&ek)?;
                 tx.open_table(PRE_CLEAN)?.remove(&ek)?;
             }
             tx.open_table(ARCHIVED)?.insert(&ek, ())?;
-        }
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn put_code(&self, hash: B256, code: &[u8]) -> Result<(), ArchiveError> {
-        let tx = self.db.begin_write()?;
-        tx.open_table(CODE)?.insert(&hash.0, code)?;
-        tx.commit()?;
-        Ok(())
+        self.write(|tx| {
+            tx.open_table(CODE)?.insert(&hash.0, code)?;
+            Ok(())
+        })
     }
 
     pub fn code(&self, hash: &B256) -> Result<Option<Bytes>, ArchiveError> {
@@ -729,20 +933,18 @@ impl Archive {
     /// Reorg: forget blocks above `n` (their versions, headers, journal) and end the segment at
     /// `n`. Coverage that started in a forgotten block is withdrawn.
     pub fn truncate_above(&self, n: u64) -> Result<(), ArchiveError> {
-        let tx = self.db.begin_write()?;
-        // The blocks above `n` get replaced, and an ended key's writes in them won't be recorded.
-        Self::clamp_ended(&tx, n + 1)?;
-        {
+        self.write(|tx| {
+            // The blocks above `n` get replaced, and an ended key's writes in them won't be
+            // recorded (nor an earlier interval's).
+            Self::clamp_intervals(tx, n + 1, u64::MAX)?;
             let mut journal = tx.open_table(JOURNAL)?;
             let mut versions = tx.open_table(VERSIONS)?;
             let mut cov = tx.open_table(COVERAGE)?;
             let mut headers = tx.open_table(HEADERS)?;
             let mut hashes = tx.open_table(HASHES)?;
             let mut by_hash = tx.open_table(BY_HASH)?;
-            let blocks: Vec<(u64, Vec<u8>)> = journal
-                .range((n + 1)..)?
-                .map(|e| e.map(|(b, j)| (b.value(), j.value().to_vec())))
-                .collect::<Result<_, _>>()?;
+            let blocks: Vec<(u64, Vec<u8>)> =
+                journal.range((n + 1)..)?.map(|e| e.map(|(b, j)| (b.value(), j.value().to_vec()))).collect::<Result<_, _>>()?;
             for (b, j) in &blocks {
                 for ek in j.chunks_exact(K) {
                     let ek: &[u8; K] = ek.try_into().unwrap();
@@ -758,12 +960,8 @@ impl Archive {
                 }
             }
             // Coverage that starts above `n` describes forgotten blocks, whatever wrote it.
-            let stale: Vec<[u8; K]> = cov
-                .iter()?
-                .filter_map(|e| e.ok())
-                .filter(|(_, c)| c.value() > n)
-                .map(|(k, _)| *k.value())
-                .collect();
+            let stale: Vec<[u8; K]> =
+                cov.iter()?.filter_map(|e| e.ok()).filter(|(_, c)| c.value() > n).map(|(k, _)| *k.value()).collect();
             for ek in &stale {
                 cov.remove(ek)?;
             }
@@ -776,9 +974,8 @@ impl Archive {
                     seg.insert(s, n)?;
                 }
             }
-        }
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// The value of `key` at block `number`, if the archive covers it.
@@ -801,39 +998,48 @@ impl Archive {
             return Ok(ArchiveRead::OtherFork);
         }
         let from = tx.open_table(COVERAGE)?.get(&ek)?.map(|g| g.value());
-        if tx.open_table(COVERAGE_END)?.get(&ek)?.is_some_and(|l| number > l.value()) {
+        // The interval holding `number`: the current one, else an earlier one.
+        let current = from.filter(|c| *c <= number);
+        let current = match current {
+            Some(_) if tx.open_table(COVERAGE_END)?.get(&ek)?.is_some_and(|l| number > l.value()) => None,
+            c => c,
+        };
+        let start = match current {
+            Some(c) => Some(c),
+            None => {
+                let iv = tx.open_table(INTERVALS)?;
+                let r = iv.range::<&[u8; VK]>(&vkey(&ek, 0)..=&vkey(&ek, number))?.next_back().transpose()?;
+                r.map(|(k, e)| (vkey_block(k.value()), e.value())).filter(|(_, e)| number <= *e).map(|(s, _)| s)
+            }
+        };
+        let Some(start) = start else {
             return Ok(ArchiveRead::NotCovered { from });
-        }
-        let in_segment = {
+        };
+        let seg_start = {
             let seg = tx.open_table(SEGMENTS)?;
             let r = seg.range(..=number)?.next_back().transpose()?;
-            r.map(|(s, e)| (s.value(), e.value()))
+            r.map(|(s, e)| (s.value(), e.value())).filter(|(_, e)| number <= *e).map(|(s, _)| s)
         };
-        let Some((seg_start, seg_end)) = in_segment.filter(|(_, e)| number <= *e) else {
+        let Some(seg_start) = seg_start else {
             return Ok(ArchiveRead::NotCovered { from });
         };
-        let _ = seg_end;
-        // The newest version at or below `number`, and it must lie within this segment.
+        // The newest version at or below `number`, and it must lie within this segment and this
+        // interval (an interval starts at a version, so within the interval it is always found).
         let v = tx.open_table(VERSIONS)?;
-        let (lo, hi) = (vkey(&ek, 0), vkey(&ek, number));
-        let found = v.range::<&[u8; VK]>(&lo..=&hi)?.next_back().transpose()?;
-        match (from, found) {
-            (Some(c), Some((k, val))) if c <= number => {
-                let at = u64::from_be_bytes(k.value()[K..].try_into().unwrap());
-                if at < seg_start {
-                    // The last known version predates a gap: writes in the gap are unknown.
-                    return Ok(ArchiveRead::NotCovered { from });
-                }
-                Ok(ArchiveRead::Value(U256::from_be_bytes(*val.value())))
-            }
+        let found = v.range::<&[u8; VK]>(&vkey(&ek, 0)..=&vkey(&ek, number))?.next_back().transpose()?;
+        match found {
+            // A version before the segment predates a gap: writes in the gap are unknown.
+            Some((k, val)) if vkey_block(k.value()) >= seg_start.max(start) => Ok(ArchiveRead::Value(U256::from_be_bytes(*val.value()))),
             _ => Ok(ArchiveRead::NotCovered { from }),
         }
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redb::{ReadableTableMetadata, TableHandle};
 
     const A: Address = Address::repeat_byte(0xaa);
 
@@ -1194,12 +1400,15 @@ mod tests {
         assert_eq!(val(&a, slot(1), 100), Some(10));
         assert_eq!(val(&a, slot(1), 101), Some(11));
         assert_eq!(val(&a, slot(1), 102), None, "past the end: refused, not the stale 11");
-        // Archived again from a base at 103: coverage restarts there, the gap is never bridged.
+        // Archived again from a base at 103: a new interval starts there. The earlier one stays
+        // readable (TODO 30, REVIEW C9: it used to be replaced), and the gap is never bridged.
         blk(&a, 103, &[]);
         a.write_base(&slot(1), 103, B256::with_last_byte(103), U256::from(30), &[]).unwrap();
-        assert_eq!(val(&a, slot(1), 101), None);
-        assert_eq!(val(&a, slot(1), 102), None);
+        assert_eq!(val(&a, slot(1), 100), Some(10));
+        assert_eq!(val(&a, slot(1), 101), Some(11));
+        assert_eq!(val(&a, slot(1), 102), None, "between the intervals: refused");
         assert_eq!(val(&a, slot(1), 103), Some(30));
+        assert!(matches!(a.get(&slot(1), 102).unwrap(), ArchiveRead::NotCovered { from: Some(103) }));
         // Or archived again with coverage from its next write.
         a.end_coverage(&slot(1), Some(103)).unwrap();
         a.add_keys(&[slot(1)]).unwrap();
@@ -1207,6 +1416,8 @@ mod tests {
         assert_eq!(val(&a, slot(1), 104), None);
         blk(&a, 105, &[(slot(1), 50)]);
         assert_eq!(val(&a, slot(1), 105), Some(50));
+        assert_eq!(a.intervals(&slot(1)).unwrap(), vec![(100, Some(101)), (103, Some(103)), (105, None)]);
+        assert_eq!((val(&a, slot(1), 101), val(&a, slot(1), 102), val(&a, slot(1), 103), val(&a, slot(1), 104)), (Some(11), None, Some(30), None));
     }
 
     #[test]
@@ -1249,5 +1460,226 @@ mod tests {
         assert_eq!(val(&a, slot(1), 13), Some(5));
         assert_eq!(val(&a, slot(2), 11), Some(6));
         assert_eq!(val(&a, slot(2), 13), None, "the gap carried none of its writes");
+    }
+
+    // ---- TODO 30: coverage as intervals ---------------------------------------------------------
+
+    #[test]
+    fn earlier_intervals_survive_restarts_and_shrink_only_with_reorgs() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("a.redb");
+        {
+            let a = Archive::open(&path).unwrap();
+            blk(&a, 100, &[]);
+            a.write_base(&slot(1), 100, B256::with_last_byte(100), U256::from(10), &[]).unwrap();
+            blk(&a, 101, &[(slot(1), 11)]);
+            blk(&a, 102, &[]);
+            a.end_coverage(&slot(1), Some(102)).unwrap();
+            blk(&a, 103, &[]); // released: a write here would not be recorded
+            blk(&a, 104, &[]);
+            a.write_base(&slot(1), 104, B256::with_last_byte(104), U256::from(14), &[]).unwrap();
+            blk(&a, 105, &[(slot(1), 15)]);
+        }
+        let a = Archive::open(&path).unwrap(); // restart: intervals are on disk
+        assert_eq!(a.intervals(&slot(1)).unwrap(), vec![(100, Some(102)), (104, None)]);
+        let reads: Vec<Option<u64>> = (99..=106).map(|n| val(&a, slot(1), n)).collect();
+        assert_eq!(reads, vec![None, Some(10), Some(11), Some(11), None, Some(14), Some(15), None]);
+        // A reorg into the earlier interval shortens it and withdraws the current one.
+        a.truncate_above(101).unwrap();
+        assert_eq!(a.intervals(&slot(1)).unwrap(), vec![(100, Some(101))]);
+        blk(&a, 102, &[]); // the new 102 is not recorded for the key
+        assert_eq!((val(&a, slot(1), 101), val(&a, slot(1), 102)), (Some(11), None));
+        // A reorg below an earlier interval's start drops it.
+        a.truncate_above(99).unwrap();
+        assert!(a.intervals(&slot(1)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reconciliation_shortens_only_the_intervals_that_reach_into_the_dropped_blocks() {
+        let d = tempfile::tempdir().unwrap();
+        let a = Archive::open(d.path().join("a.redb")).unwrap();
+        for n in 10..=12 {
+            blk(&a, n, &[]);
+        }
+        for k in [slot(1), slot(2)] {
+            a.write_base(&k, 10, B256::with_last_byte(10), U256::from(5), &[]).unwrap();
+        }
+        a.end_coverage(&slot(1), Some(11)).unwrap();
+        a.end_coverage(&slot(2), Some(12)).unwrap();
+        // After a restart: a new segment at 20, where both keys are archived again.
+        let h20 = header(20, B256::with_last_byte(19));
+        a.write_block(&ArchiveBlock { number: 20, hash: B256::with_last_byte(20), parent_hash: B256::with_last_byte(19), header_rlp: &h20, writes: &[] }).unwrap();
+        for k in [slot(1), slot(2)] {
+            a.write_base(&k, 20, B256::with_last_byte(20), U256::from(7), &[]).unwrap();
+        }
+        // Block 12 turns out to be orphaned.
+        a.truncate_range(12, 12).unwrap();
+        assert_eq!(a.intervals(&slot(1)).unwrap(), vec![(10, Some(11)), (20, None)], "doesn't reach 12: untouched");
+        assert_eq!(a.intervals(&slot(2)).unwrap(), vec![(10, Some(11)), (20, None)], "reached 12: ends before it");
+        assert_eq!((val(&a, slot(2), 11), val(&a, slot(2), 20)), (Some(5), Some(7)));
+    }
+
+    #[test]
+    fn a_gap_fill_never_bridges_blocks_not_recorded_for_a_key() {
+        // Segments [10, 11] and [15, 17]. Slot 1 was archived at 16 (block 15 wasn't recorded for
+        // it); slot 2 was covered from 15, the next segment's start. The gap 12..=14 writes both.
+        let d = tempfile::tempdir().unwrap();
+        let a = Archive::open(d.path().join("a.redb")).unwrap();
+        blk(&a, 10, &[]);
+        blk(&a, 11, &[]);
+        let h15 = header(15, B256::with_last_byte(14));
+        a.write_block(&ArchiveBlock { number: 15, hash: B256::with_last_byte(15), parent_hash: B256::with_last_byte(14), header_rlp: &h15, writes: &[] }).unwrap();
+        blk(&a, 16, &[]);
+        blk(&a, 17, &[]);
+        a.write_base(&slot(1), 16, B256::with_last_byte(16), U256::from(6), &[]).unwrap();
+        a.write_base(&slot(2), 15, B256::with_last_byte(15), U256::from(6), &[]).unwrap();
+        let w13 = [(slot(1), U256::from(3)), (slot(2), U256::from(3))];
+        let gap: Vec<ArchiveBlock<'_>> = (12..=14u64)
+            .map(|n| ArchiveBlock { number: n, hash: B256::with_last_byte(n as u8), parent_hash: B256::with_last_byte((n - 1) as u8), header_rlp: &[0xc0], writes: if n == 13 { &w13 } else { &[] } })
+            .collect();
+        a.fill_gap(&gap, &a.archived_keys().unwrap()).unwrap();
+        assert_eq!(a.segments().unwrap(), vec![(10, 17)]);
+        // Slot 1: block 15 may have changed it unrecorded, so 13..=15 stay refused.
+        assert_eq!((val(&a, slot(1), 13), val(&a, slot(1), 15), val(&a, slot(1), 16)), (None, None, Some(6)));
+        // Slot 2: every block from the gap's write on is recorded.
+        assert_eq!((val(&a, slot(2), 12), val(&a, slot(2), 13), val(&a, slot(2), 14), val(&a, slot(2), 15)), (None, Some(3), Some(3), Some(6)));
+    }
+
+    /// Copies an archive into the layout written before coverage intervals: the same tables,
+    /// written directly, with no `coverage_intervals` table.
+    fn write_pre_interval_layout(src: &Archive, dst: &Path, extra: impl FnOnce(&WriteTransaction)) {
+        let db = Database::create(dst).unwrap();
+        let r = src.db.begin_read().unwrap();
+        assert!(r.open_table(INTERVALS).unwrap().is_empty().unwrap(), "the source holds no intervals");
+        let w = db.begin_write().unwrap();
+        macro_rules! copy {
+            ($($t:expr),*) => {$({
+                let from = r.open_table($t).unwrap();
+                let mut to = w.open_table($t).unwrap();
+                for e in from.iter().unwrap() {
+                    let (k, v) = e.unwrap();
+                    to.insert(k.value(), v.value()).unwrap();
+                }
+            })*};
+        }
+        copy!(VERSIONS, COVERAGE, ARCHIVED, HEADERS, HASHES, BY_HASH, CODE, JOURNAL, SEGMENTS, WRITE_BOUND, PRE_CLEAN, COVERAGE_END);
+        extra(&w);
+        w.commit().unwrap();
+    }
+
+    fn assert_same_archive(a: &Archive, b: &Archive, keys: &[StateKey], blocks: std::ops::RangeInclusive<u64>) {
+        for k in keys {
+            for n in blocks.clone() {
+                assert_eq!(a.get(k, n).unwrap(), b.get(k, n).unwrap(), "{k:?} at {n}");
+                let h = B256::with_last_byte(n as u8);
+                assert_eq!(a.get_at(k, n, h).unwrap(), b.get_at(k, n, h).unwrap(), "{k:?} at {n} ({h})");
+            }
+            assert_eq!(a.intervals(k).unwrap(), b.intervals(k).unwrap(), "{k:?}");
+        }
+        assert_eq!(a.coverages().unwrap(), b.coverages().unwrap());
+        assert_eq!(a.segments().unwrap(), b.segments().unwrap());
+        assert_eq!(a.archived_keys().unwrap(), b.archived_keys().unwrap());
+        for n in blocks {
+            assert_eq!(a.hash(n).unwrap(), b.hash(n).unwrap());
+            assert_eq!(a.header_rlp(n).unwrap(), b.header_rlp(n).unwrap());
+        }
+    }
+
+    #[test]
+    fn an_archive_in_the_pre_interval_layout_opens_and_reads_identically() {
+        let d = tempfile::tempdir().unwrap();
+        let reference = Archive::open(d.path().join("ref.redb")).unwrap();
+        // Every kind of coverage the old format holds: a base extended by backfill (pre-clean),
+        // a write-bound key, an ended key, a key archived with nothing covered yet, two segments.
+        let a = &reference;
+        blk(a, 10, &[]);
+        a.write_base(&slot(1), 10, B256::with_last_byte(10), U256::from(1), &[]).unwrap();
+        a.add_keys(&[slot(2), slot(5)]).unwrap();
+        blk(a, 11, &[(slot(1), 2)]);
+        blk(a, 12, &[(slot(2), 5)]);
+        a.write_base(&slot(3), 12, B256::with_last_byte(12), U256::from(7), &[]).unwrap();
+        blk(a, 13, &[(slot(3), 8)]);
+        a.end_coverage(&slot(3), Some(13)).unwrap();
+        blk(a, 14, &[]);
+        blk(a, 17, &[]); // a restart without gap fill: new segment
+        a.write_base(&slot(1), 17, B256::with_last_byte(17), U256::from(3), &[]).unwrap();
+        blk(a, 18, &[(slot(2), 6)]);
+        a.put_code(B256::repeat_byte(0xc0), &[0x60, 0x00]).unwrap();
+        let scan: Vec<ArchiveBlock<'_>> = (5..=10u64)
+            .map(|n| ArchiveBlock { number: n, hash: B256::with_last_byte(n as u8), parent_hash: B256::with_last_byte((n - 1) as u8), header_rlp: &[0xc0], writes: &[] })
+            .collect();
+        let r = a.backfill(&scan, Some(B256::with_last_byte(9)), &a.archived_keys().unwrap()).unwrap();
+        assert_eq!((r.keys_unchanged, r.keys_write_bound), (1, 1));
+
+        let old = d.path().join("old.redb");
+        // Old releases also left versions of a re-archived key outside any coverage (its start
+        // was deleted on re-archiving): slot 5 has one, and it must stay unanswered.
+        write_pre_interval_layout(&reference, &old, |w| {
+            let ek = encode_key(&slot(5));
+            w.open_table(VERSIONS).unwrap().insert(&vkey(&ek, 11), &U256::from(9).to_be_bytes::<32>()).unwrap();
+        });
+        let before: Vec<String> = Database::open(&old).unwrap().begin_read().unwrap().list_tables().unwrap().map(|t| t.name().to_string()).collect();
+        assert!(before.contains(&"coverage".to_string()) && !before.contains(&"coverage_intervals".to_string()));
+
+        let migrated = Archive::open(&old).unwrap();
+        assert!(tables_of(&migrated).contains(&"coverage_intervals".to_string()));
+        let keys = [slot(1), slot(2), slot(3), slot(4), slot(5)];
+        assert_same_archive(&reference, &migrated, &keys, 0..=20);
+        assert_eq!(migrated.code(&B256::repeat_byte(0xc0)).unwrap(), Some(Bytes::from_static(&[0x60, 0x00])));
+        // Spot checks against what the old code answered.
+        assert_eq!(val(&migrated, slot(1), 5), Some(1));
+        assert_eq!(val(&migrated, slot(1), 15), None);
+        assert_eq!(val(&migrated, slot(2), 11), None);
+        assert_eq!(val(&migrated, slot(2), 12), Some(5));
+        assert_eq!(val(&migrated, slot(3), 13), Some(8));
+        assert_eq!(val(&migrated, slot(3), 14), None);
+        assert_eq!(val(&migrated, slot(5), 11), None);
+        drop(migrated);
+
+        // Reopened again (already migrated), and then used: the same operations give the same
+        // archive, including a first earlier interval for the ended key.
+        let migrated = Archive::open(&old).unwrap();
+        for ar in [&reference, &migrated] {
+            ar.add_keys(&[slot(3)]).unwrap();
+            blk(ar, 19, &[(slot(3), 9)]);
+            ar.truncate_above(19).unwrap();
+        }
+        assert_same_archive(&reference, &migrated, &keys, 0..=20);
+        assert_eq!(migrated.intervals(&slot(3)).unwrap(), vec![(12, Some(13)), (19, None)]);
+        assert_eq!((val(&migrated, slot(3), 13), val(&migrated, slot(3), 18), val(&migrated, slot(3), 19)), (Some(8), None, Some(9)));
+    }
+
+    fn tables_of(a: &Archive) -> Vec<String> {
+        a.db.begin_read().unwrap().list_tables().unwrap().map(|t| t.name().to_string()).collect()
+    }
+
+    // ---- TODO 31: durability outside the store lock ---------------------------------------------
+
+    #[test]
+    fn commits_under_a_hold_are_visible_at_once_and_durable_after_it() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("a.redb");
+        {
+            let a = Archive::open(&path).unwrap();
+            let synced = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let c = synced.clone();
+            *a.sync_hook.lock() = Some(Box::new(move || {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+            {
+                let _h = a.hold();
+                blk(&a, 1, &[]);
+                a.write_base(&slot(1), 1, B256::with_last_byte(1), U256::from(10), &[]).unwrap();
+                blk(&a, 2, &[(slot(1), 20)]);
+                assert_eq!(val(&a, slot(1), 2), Some(20), "visible before the sync");
+                assert_eq!(synced.load(std::sync::atomic::Ordering::SeqCst), 0);
+            }
+            assert_eq!(synced.load(std::sync::atomic::Ordering::SeqCst), 1, "one sync for the whole hold");
+            blk(&a, 3, &[]); // alone: durable by itself, no extra sync
+            assert_eq!(synced.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(a.sync_errors(), 0);
+        }
+        let a = Archive::open(&path).unwrap();
+        assert_eq!((val(&a, slot(1), 1), val(&a, slot(1), 3)), (Some(10), Some(20)));
     }
 }
