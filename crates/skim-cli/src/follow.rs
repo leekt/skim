@@ -413,7 +413,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     tracing::info!(calls = ctx.calls.len(), "follow: waiting for envelopes and SNAP peers");
     let chain = crate::chain::Chain {
         store: ctx.store.clone(),
-        net: ctx.net.clone(),
+        el: std::sync::Arc::new(ctx.net.clone()),
         on_header: Box::new(|_| {}),
         on_applied: Box::new(|_| {}),
         on_rollback: Box::new(|_| {}),
