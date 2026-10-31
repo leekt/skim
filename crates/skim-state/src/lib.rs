@@ -54,6 +54,9 @@ pub enum StateError {
     LimitReached(usize),
 }
 
+/// Key values and the bytecode their code hashes point to (a restart snapshot's contents).
+pub type StateAndCode = (Vec<(StateKey, U256)>, Vec<(B256, Bytes)>);
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StoreSizes {
     pub chain: usize,
@@ -733,11 +736,10 @@ impl Store {
         };
         let ready = {
             let mut st = self.write_archiving();
-            if let Some(h) = st.head() {
-                if block.parent_hash != h.hash || block.number != h.number + 1 {
+            if let Some(h) = st.head()
+                && (block.parent_hash != h.hash || block.number != h.number + 1) {
                     return Err(StateError::NotChild(block.hash, h.hash));
                 }
-            }
             let mut changed = Vec::new();
             let max = self.max_subscribed.load(std::sync::atomic::Ordering::Relaxed);
             let mut over_budget: Vec<Address> = Vec::new();
@@ -1243,10 +1245,9 @@ impl Store {
         self.archive.as_ref().and_then(|a| a.number_of(hash).ok().flatten())
     }
 
-    /// Tracked keys that are known at `block`.
     /// Subscribed keys known at `block`, with the bytecode their code hashes point to: what
     /// a restart snapshot keeps.
-    pub fn subscribed_at(&self, block: &BlockRef) -> (Vec<(StateKey, U256)>, Vec<(B256, Bytes)>) {
+    pub fn subscribed_at(&self, block: &BlockRef) -> StateAndCode {
         let st = self.inner.read();
         let values: Vec<(StateKey, U256)> = st
             .watched_keys

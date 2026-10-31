@@ -59,7 +59,7 @@ fn untracked_writes_are_indexed_not_tracked() {
     s.apply_block(blk(1, 0), writes(&[(slot(1), 5)])).unwrap();
     // Known from the recent BAL (the block's own post-state), without becoming tracked.
     assert_eq!(known(&s.snapshot(&blk(1, 0)).unwrap(), slot(1)), Some(5));
-    assert!(s.inner.read().versions.get(&slot(1)).is_none());
+    assert!(!s.inner.read().versions.contains_key(&slot(1)));
     assert_eq!(s.sizes().resolved_from_bal, 1);
 }
 
@@ -180,12 +180,12 @@ fn on_demand_keys_stay_current_during_ttl_then_expire() {
     // Past head+TTL it is evicted: no stored versions. Reads still get the true value from the
     // recent BAL (written at 2, untouched since), never the stale fetched one.
     s.apply_block(blk(4, 0), writes(&[])).unwrap();
-    assert!(s.inner.read().versions.get(&slot(4)).is_none());
+    assert!(!s.inner.read().versions.contains_key(&slot(4)));
     assert_eq!(known(&s.snapshot(&blk(4, 0)).unwrap(), slot(4)), Some(2));
     assert_eq!(known(&s.snapshot(&blk(1, 0)).unwrap(), slot(4)), None); // the fetched base is gone
     // No longer tracked: a later write is not stored, only indexed.
     s.apply_block(blk(5, 0), writes(&[(slot(4), 5)])).unwrap();
-    assert!(s.inner.read().versions.get(&slot(4)).is_none());
+    assert!(!s.inner.read().versions.contains_key(&slot(4)));
     assert_eq!(known(&s.snapshot(&blk(5, 0)).unwrap(), slot(4)), Some(5));
     assert_eq!(s.sizes().temp_keys, 0);
 }
@@ -439,7 +439,7 @@ fn complete_storage_answers_every_slot_and_follows_writes() {
     s.drop_complete_storage(&A);
     assert_eq!(s.complete_storage_len(&A), None);
     s.apply_block(blk(5, 0), writes(&[])).unwrap();
-    assert!(s.inner.read().versions.get(&slot(7)).is_none());
+    assert!(!s.inner.read().versions.contains_key(&slot(7)));
     // Other contracts are unaffected: unknown stays unknown.
     assert_eq!(known(&at2, StateKey::Storage(Address::repeat_byte(0xcc), U256::from(1))), None);
 }
@@ -729,7 +729,7 @@ fn archiving_a_long_unchanged_key_keeps_its_value_from_a_known_block() {
     // Seventh review, P2: K = 10 since block 1, unchanged and tracked past both the state window
     // and the hash ring, then promoted to archive retention.
     let d = tempfile::tempdir().unwrap();
-    let s = Store::with_archive(64, archive::Archive::open(&d.path().join("a.redb")).unwrap()).unwrap();
+    let s = Store::with_archive(64, archive::Archive::open(d.path().join("a.redb")).unwrap()).unwrap();
     s.watch_key(slot(5));
     s.apply_block(blk(1, 0), writes(&[])).unwrap();
     s.insert_base(&blk(1, 0), slot(5), U256::from(10)).unwrap();
@@ -903,7 +903,7 @@ fn the_based_cache_follows_coverage_through_release_and_reorgs() {
     // Review (to verify): the cache of written bases must agree with the archive's coverage
     // when a segment ends and restarts, and across reorgs below and above a base.
     let d = tempfile::tempdir().unwrap();
-    let s = Store::with_archive(8, archive::Archive::open(&d.path().join("a.redb")).unwrap()).unwrap();
+    let s = Store::with_archive(8, archive::Archive::open(d.path().join("a.redb")).unwrap()).unwrap();
     s.apply_block(blk(1, 0), writes(&[(slot(1), 4)])).unwrap();
     s.archive_key(slot(1)); // base at 1
     for n in 2..=5 {

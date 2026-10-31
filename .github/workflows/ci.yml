@@ -27,9 +27,12 @@ jobs:
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8 (commit)
       - name: Test
         run: cargo test --workspace --profile ci --locked
-      - name: Clippy (report only)
-        run: cargo clippy --workspace --profile ci --locked
-        continue-on-error: true
+      - name: Clippy
+        # Warning-free since 2026-10-31: keep it that way.
+        run: cargo clippy --workspace --all-targets --profile ci --locked -- -D warnings
+      - name: EVM2 experiment builds and is lint-clean
+        # Opt-in (`--features evm2`), so the default test run never compiles it.
+        run: cargo clippy -p skim-sim -p skim-cli --features skim-cli/evm2 --all-targets --profile ci --locked -- -D warnings
 
   smallname:
     # examples/smallname's own tests (no network): the stream consumer's transactions.
@@ -66,6 +69,11 @@ jobs:
           workspaces: fuzz
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
+      - name: Build every target
+        # Replaying builds only the targets that have regression inputs; a target without any
+        # (light_client) once stopped compiling unnoticed.
+        working-directory: fuzz
+        run: cargo +nightly fuzz build -O
       - name: Replay
         working-directory: fuzz
         run: |
