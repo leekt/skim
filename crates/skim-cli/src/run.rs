@@ -560,7 +560,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let cd3 = chaindata.clone();
     let chain = Chain {
         store: store.clone(),
-        net: net.clone(),
+        el: Arc::new(net.clone()),
         on_header: Box::new(move |h| {
             sim2.insert_header(h.clone());
             store2.note_header(h.hash_slow(), alloy_rlp::encode(h));

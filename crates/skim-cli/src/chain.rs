@@ -34,7 +34,8 @@ pub enum Placed {
 
 pub struct Chain {
     pub store: Arc<Store>,
-    pub net: ElNet,
+    /// EL peers for reconciling: headers and BALs ([`ElNet`] in production).
+    pub el: Arc<dyn ElFetch>,
     /// Called for every header about to be applied (gossip or EL replay), before its BAL is:
     /// what executing the block's state needs (header caches). Not a commitment: the apply can
     /// still fail.
@@ -57,6 +58,29 @@ pub struct Chain {
     /// independent evidence a re-anchor or a switch to a lower branch needs, since a gossiped
     /// envelope is only self-consistent, not signed.
     pub peers_know: PeersKnow,
+}
+
+/// What reconciling asks EL peers for. [`ElNet`] in production; a simulated network in tests
+/// (`chain/sim.rs`).
+pub trait ElFetch: Send + Sync {
+    /// Peers that serve BALs (eth/71).
+    fn bal_peers(&self) -> Vec<skim_el::Peer>;
+    /// Up to `limit` headers from `start`, rising; `None` if the request failed.
+    fn fetch_headers(&self, peer: skim_el::Peer, start: u64, limit: u64) -> futures::future::BoxFuture<'_, Option<Vec<Header>>>;
+    /// BALs by block hash (`None` entries: unavailable); `None` if the request failed.
+    fn fetch_bals(&self, peer: skim_el::Peer, hashes: Vec<B256>) -> futures::future::BoxFuture<'_, Option<Vec<Option<alloy_primitives::Bytes>>>>;
+}
+
+impl ElFetch for ElNet {
+    fn bal_peers(&self) -> Vec<skim_el::Peer> {
+        self.peers().into_iter().filter(|(_, p)| p.eth_version >= 71).map(|(id, _)| id).collect()
+    }
+    fn fetch_headers(&self, peer: skim_el::Peer, start: u64, limit: u64) -> futures::future::BoxFuture<'_, Option<Vec<Header>>> {
+        Box::pin(async move { self.headers(peer, BlockHashOrNumber::Number(start), limit).await.0.ok() })
+    }
+    fn fetch_bals(&self, peer: skim_el::Peer, hashes: Vec<B256>) -> futures::future::BoxFuture<'_, Option<Vec<Option<alloy_primitives::Bytes>>>> {
+        Box::pin(async move { self.bals(peer, hashes).await.0.ok().map(|b| b.0) })
+    }
 }
 
 /// See [`Chain::peers_know`].
@@ -192,12 +216,14 @@ impl Chain {
         b.number > 0 && (self.peers_know)(b.parent_hash, b.number - 1).await >= CORROBORATION
     }
 
-    /// Whether `b`'s parent is corroborated while no peer serves the head's parent at the head's
-    /// height: then the head is made up, and `b` leads back to the peers' chain. An honest head's
-    /// parent is known (a fresh head itself may not be), so a replayed orphan below an honest
-    /// head never triggers this.
+    /// Whether `b`'s parent is corroborated while the head's parent (at the head's height) isn't:
+    /// then the head is made up, and `b` leads back to the peers' chain. An honest head's parent
+    /// is known (a fresh head itself may not be), so a replayed orphan below an honest head never
+    /// triggers this. "Isn't" is fewer than [`CORROBORATION`] peers, not none: one lying peer
+    /// that serves a forged head's parent kept the follower on that head for good (found by the
+    /// network simulation, `chain/sim.rs`: a forged start vouched for by one peer).
     async fn head_left_behind(&self, head: &BlockRef, b: &BlockRef) -> bool {
-        self.parent_corroborated(b).await && head.number > 0 && (self.peers_know)(head.parent_hash, head.number - 1).await == 0
+        self.parent_corroborated(b).await && head.number > 0 && (self.peers_know)(head.parent_hash, head.number - 1).await < CORROBORATION
     }
 
     /// Makes the store's head the EL-canonical parent of `b`. Returns the common ancestor and
@@ -214,7 +240,14 @@ impl Chain {
         if b.number.saturating_sub(head.number) > MAX_RECONCILE {
             return Err(Reconcile::NoAncestor);
         }
-        let peers: Vec<_> = self.net.peers().into_iter().filter(|(_, p)| p.eth_version >= 71).map(|(id, _)| id).collect();
+        // One EL peer's linked header chain is that peer's word alone: unless enough peers serve
+        // b's parent at its height (the chain below it is then fixed by the hash links), a lying
+        // peer could serve a forged chain up to a forged envelope, rolling the store back to the
+        // fork point (up to the lookback) and replaying its blocks. (Network simulation,
+        // `chain/sim.rs`: one lying peer plus one forged envelope made a forged chain the head,
+        // and, the liar vouching for it, stranded the follower there.) Consensus peers below
+        // stay the fallback.
+        let peers = if self.parent_corroborated(b).await { self.el.bal_peers() } else { vec![] };
         for peer in peers {
             // In chunks: peers cap headers and BALs per response, so one request for the whole
             // gap failed on every peer once the gap was large, and following stalled for good.
@@ -270,7 +303,7 @@ impl Chain {
         while (hs.len() as u64) < count {
             let start = from + hs.len() as u64;
             let n = (count - hs.len() as u64).min(CHUNK);
-            let part = self.net.headers(peer, BlockHashOrNumber::Number(start), n).await.0.ok()?;
+            let part = self.el.fetch_headers(peer, start, n).await?;
             if part.is_empty() || part.len() as u64 > n || part[0].number != start {
                 return None;
             }
@@ -284,7 +317,7 @@ impl Chain {
     async fn bals_chunked(&self, peer: skim_el::Peer, hashes: &[B256]) -> Option<Vec<Option<alloy_primitives::Bytes>>> {
         let mut out = Vec::with_capacity(hashes.len());
         for c in hashes.chunks(CHUNK as usize) {
-            let got = self.net.bals(peer, c.to_vec()).await.0.ok()?.0;
+            let got = self.el.fetch_bals(peer, c.to_vec()).await?;
             if got.len() != c.len() {
                 return None;
             }
@@ -347,20 +380,23 @@ enum Reconcile {
 }
 
 #[cfg(test)]
+mod sim;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::U256;
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    const GENESIS: u64 = skim_cl::node::SEPOLIA_GENESIS_TIME;
+    pub(super) const GENESIS: u64 = skim_cl::node::SEPOLIA_GENESIS_TIME;
     /// Block `n` sits in slot `SLOT0 + n`.
-    const SLOT0: u64 = 1_000_000;
+    pub(super) const SLOT0: u64 = 1_000_000;
 
     /// A `SignedExecutionPayloadEnvelope` (SSZ, Gloas layout) for block `number` on top of
     /// `parent`, with an empty BAL; its `block_hash` is what `verify_payload` rebuilds. Returns
     /// the rebuilt header and the bytes.
-    fn envelope(parent: B256, number: u64, salt: u8) -> (Header, Vec<u8>) {
+    pub(super) fn envelope(parent: B256, number: u64, salt: u8) -> (Header, Vec<u8>) {
         let slot = SLOT0 + number;
         let timestamp = GENESIS + slot * 12;
         let bal: &[u8] = &[0xc0]; // RLP of an empty list: an empty, valid BAL
@@ -399,7 +435,7 @@ mod tests {
     }
 
     /// `count` linked blocks from `from`, on top of `parent`.
-    fn fork(parent: B256, from: u64, count: u64, salt: u8) -> Vec<(Header, Vec<u8>)> {
+    pub(super) fn fork(parent: B256, from: u64, count: u64, salt: u8) -> Vec<(Header, Vec<u8>)> {
         let mut out = Vec::new();
         let mut p = parent;
         for n in from..from + count {
@@ -411,7 +447,7 @@ mod tests {
     }
 
     /// Consensus peers that serve these envelopes by slot (nothing else, no network).
-    struct Envelopes(BTreeMap<u64, Vec<u8>>);
+    pub(super) struct Envelopes(BTreeMap<u64, Vec<u8>>);
 
     impl crate::persist::EnvelopeSource for Envelopes {
         fn envelopes_by_range_from(
@@ -422,6 +458,21 @@ mod tests {
         ) -> futures::future::BoxFuture<'_, (Option<String>, anyhow::Result<Vec<Vec<u8>>>)> {
             let out = self.0.range(start_slot..start_slot + count).map(|(_, b)| b.clone()).collect();
             Box::pin(async move { (Some("test".into()), Ok(out)) })
+        }
+    }
+
+    /// No EL peer is ever connected.
+    pub(super) struct NoElPeers;
+
+    impl ElFetch for NoElPeers {
+        fn bal_peers(&self) -> Vec<skim_el::Peer> {
+            vec![]
+        }
+        fn fetch_headers(&self, _: skim_el::Peer, _: u64, _: u64) -> futures::future::BoxFuture<'_, Option<Vec<Header>>> {
+            Box::pin(async { None })
+        }
+        fn fetch_bals(&self, _: skim_el::Peer, _: Vec<B256>) -> futures::future::BoxFuture<'_, Option<Vec<Option<alloy_primitives::Bytes>>>> {
+            Box::pin(async { None })
         }
     }
 
@@ -437,12 +488,10 @@ mod tests {
     async fn chain_at(head: &Header, envelopes: &[(Header, Vec<u8>)], with_cl: bool) -> Chain {
         let store = Store::new(64);
         store.apply_block(block_ref(head), Default::default()).unwrap();
-        // A real node restricted to trusted peers with none trusted: never any EL peer.
-        let net = ElNet::start_sepolia(0, vec![], true).await.expect("local node");
         let source = Envelopes(envelopes.iter().map(|(h, b)| (h.slot_number.unwrap(), b.clone())).collect());
         Chain {
             store,
-            net,
+            el: Arc::new(NoElPeers),
             on_header: Box::new(|_| {}),
             on_applied: Box::new(|_| {}),
             on_rollback: Box::new(|_| {}),
