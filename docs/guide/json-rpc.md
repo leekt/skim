@@ -90,7 +90,7 @@ Stable identifiers, so an app can decide what to do without parsing messages:
 | `fork_unsupported` | no | `latest`/`pending` after the chain passed a fork skim doesn't implement ([Hegota](hegota.md)): skim's head is frozen before it. Explicit blocks and `safe`/`finalized` still answer |
 | `unavailable` | yes | anything else |
 
-`eth_accounts` and `eth_requestAccounts` return `[]`: skim holds no keys. Browser pages can call skim directly: responses carry `Access-Control-Allow-Origin` per `--cors` (default `*`).
+`eth_accounts` and `eth_requestAccounts` return `[]`: skim holds no keys. Browser pages can call skim directly: responses carry `Access-Control-Allow-Origin` per `--cors` (default `*`). A page (a request with an `Origin` header) gets `skim_*` methods, and the `skim_subscriptions` subscription, only from an origin `--cors` names exactly, never through `*` (`-32004` otherwise): they reveal subscription names, watched addresses and peer ids. A WebSocket upgrade from an origin `--cors` doesn't allow is refused (`403`).
 
 ## Not yet
 `flatCallTracer`, JS tracers, `newPendingTransactions`, blob fee fields in `eth_feeHistory`, tracing transactions older than `--window`.

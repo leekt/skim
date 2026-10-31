@@ -26,7 +26,9 @@ pub struct Args {
     #[arg(long, default_value = "127.0.0.1:8545")]
     rpc: SocketAddr,
     /// `Access-Control-Allow-Origin` for browser dapps calling skim directly: an origin
-    /// (`https://app.example`), `*` (any page in this machine's browser may call it), or `none`.
+    /// (`https://app.example`), `*` (any page in this machine's browser may call the standard
+    /// methods), or `none`. `skim_*` methods reveal what the node watches: a page gets them only
+    /// from an origin named here exactly. WebSocket upgrades from pages are checked against it.
     /// skim holds no keys, and listens on localhost by default.
     #[arg(long, default_value = "*")]
     cors: String,

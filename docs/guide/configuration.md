@@ -107,7 +107,7 @@ Only `skim run` follows networks other than Sepolia (`--network`). The other sub
 | `--cl-peer <multiaddr>` | none | CL peers to dial directly and keep (`/ip4/…/tcp/…/p2p/<peer id>`), e.g. a devnet's beacon nodes (repeatable) |
 | `--hub <url>` | none | attach to a skim-hub: **not supported yet**, skim refuses to start with it |
 | `--rpc <addr>` | `127.0.0.1:8545` | JSON-RPC listen address (HTTP and WebSocket; single and batch requests) |
-| `--cors <origin\|*\|none>` | `*` | `Access-Control-Allow-Origin` for browser pages calling skim directly. `*` lets any page in this machine's browser call it; skim holds no keys and listens on localhost by default. Set an origin, or `none`, if the RPC is exposed beyond this machine |
+| `--cors <origin\|*\|none>` | `*` | `Access-Control-Allow-Origin` for browser pages calling skim directly. `*` lets any page in this machine's browser call the standard methods; skim holds no keys and listens on localhost by default. `skim_*` methods (and the `skim_subscriptions` WebSocket subscription) reveal what the node watches, so a page gets them only from an origin named here exactly, never through `*`. WebSocket upgrades from a page are checked against this too (`403` for an origin it doesn't allow). Requests without an `Origin` header (curl, servers, Node) are not affected. Set an origin, or `none`, if the RPC is exposed beyond this machine |
 | `--cl-port <port>` | `9130` | consensus-layer libp2p TCP + discv5 UDP; QUIC on port+1 |
 | `--el-port <port>` | `30388` | execution-layer RLPx TCP + discovery UDP |
 | `--window <blocks>` | `256` | in-memory history for reads at recent blocks and reorgs |

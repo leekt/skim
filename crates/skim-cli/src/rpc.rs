@@ -897,17 +897,22 @@ impl Rpc {
         self.sim.store.reorg_epoch()
     }
 
-    async fn batch<'a>(&'a self, reqs: Vec<&'a Value>, latest: &'a Option<BlockRef>, epoch: u64) -> Vec<Value> {
+    async fn batch<'a>(&'a self, reqs: Vec<&'a Value>, latest: &'a Option<BlockRef>, epoch: u64, caller: Caller) -> Vec<Value> {
         use futures::StreamExt;
-        let calls: Vec<_> = reqs.into_iter().map(|r| self.one(r, latest, epoch)).collect();
+        let calls: Vec<_> = reqs.into_iter().map(|r| self.one(r, latest, epoch, caller.clone())).collect();
         futures::stream::iter(calls).buffered(BATCH_CONCURRENCY).collect().await
     }
 
-    async fn one(&self, req: &Value, latest: &Option<BlockRef>, epoch: u64) -> Value {
+    async fn one(&self, req: &Value, latest: &Option<BlockRef>, epoch: u64, caller: Caller) -> Value {
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         let Some(method) = req.get("method").and_then(Value::as_str) else {
             return json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": "invalid request"}});
         };
+        if let Caller::Page(origin) = &caller
+            && method.starts_with("skim_")
+        {
+            return json!({"jsonrpc": "2.0", "id": id, "error": page_refused(method, &origin)});
+        }
         let params = req.get("params").cloned().unwrap_or(json!([]));
         let t = std::time::Instant::now();
         let res = guarded(method, epoch, self.dispatch(method, &params, latest), || self.reorg_epoch()).await;
@@ -1249,7 +1254,8 @@ impl Rpc {
     }
 }
 
-async fn handle(State(rpc): State<Arc<Rpc>>, Json(body): Json<Value>) -> Json<Value> {
+async fn handle(State(rpc): State<Arc<Rpc>>, axum::Extension(policy): axum::Extension<Arc<OriginPolicy>>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Json<Value> {
+    let caller = policy.caller(&headers);
     // The epoch before `latest`: a reorg between the two shows up as a changed epoch.
     let epoch = rpc.reorg_epoch();
     let latest = rpc.latest();
@@ -1257,10 +1263,53 @@ async fn handle(State(rpc): State<Arc<Rpc>>, Json(body): Json<Value>) -> Json<Va
         Value::Array(reqs) if reqs.len() > MAX_BATCH => Json(batch_too_large()),
         Value::Array(reqs) => {
             let mut out = Vec::with_capacity(reqs.len());
-            out.extend(rpc.batch(reqs.iter().collect(), &latest, epoch).await);
+            out.extend(rpc.batch(reqs.iter().collect(), &latest, epoch, caller.clone()).await);
             Json(Value::Array(out))
         }
-        req => Json(rpc.one(&req, &latest, epoch).await),
+        req => Json(rpc.one(&req, &latest, epoch, caller).await),
+    }
+}
+
+/// Who is calling, for what a browser page may see. `skim_*` methods expose what this node is
+/// used for (subscription names and addresses, the addresses calls read, peer ids): a page
+/// gets them only from an origin `--cors` names exactly, never through `*`. Everything else
+/// follows `--cors` as before. A request without an `Origin` header (curl, a server, viem in
+/// Node) is not a page. (Review R6: with the default `--cors *`, any web page the user opened
+/// could read `skim_status` and `skim_dashboard` from a local node.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Caller {
+    /// No `Origin`, or an origin `--cors` names exactly.
+    Trusted,
+    /// A browser page from another origin; `skim_*` methods are refused.
+    Page(Arc<str>),
+}
+
+fn page_refused(method: &str, origin: &str) -> Value {
+    json!({"code": -32004, "message": format!("{method} is not available to web pages ({origin}): skim_* methods reveal what this node watches; allow this origin with --cors {origin}")})
+}
+
+/// `--cors` as a policy: the origin browser pages may call from (`*` for any), or none.
+#[derive(Debug, Clone, Default)]
+pub struct OriginPolicy {
+    pub cors: Option<String>,
+}
+
+impl OriginPolicy {
+    pub fn caller(&self, headers: &axum::http::HeaderMap) -> Caller {
+        match headers.get(axum::http::header::ORIGIN).and_then(|o| o.to_str().ok()) {
+            None => Caller::Trusted,
+            Some(o) if self.cors.as_deref() == Some(o) => Caller::Trusted,
+            Some(o) => Caller::Page(Arc::from(o)),
+        }
+    }
+
+    /// Whether a page from `origin` may open a WebSocket: browsers don't apply CORS to
+    /// WebSocket upgrades, so the server checks the `Origin` itself, against `--cors`.
+    pub fn websocket_allowed(&self, headers: &axum::http::HeaderMap) -> bool {
+        match headers.get(axum::http::header::ORIGIN).and_then(|o| o.to_str().ok()) {
+            None => true,
+            Some(o) => matches!(self.cors.as_deref(), Some("*")) || self.cors.as_deref() == Some(o),
+        }
     }
 }
 
@@ -1280,9 +1329,11 @@ fn batch_too_large() -> Value {
 pub async fn serve(rpc: Arc<Rpc>, listener: tokio::net::TcpListener, cors: Option<String>) -> anyhow::Result<()> {
     use axum::http::{HeaderValue, header};
     // HTTP POST and WebSocket on the same address; OPTIONS answers CORS preflights.
+    let policy = Arc::new(OriginPolicy { cors: cors.clone() });
     let mut app = Router::new()
         .route("/", post(handle).get(ws_upgrade).options(|| async { axum::http::StatusCode::NO_CONTENT }))
-        .with_state(rpc);
+        .with_state(rpc)
+        .layer(axum::Extension(policy));
     if let Some(origin) = cors {
         let origin = HeaderValue::from_str(&origin)?;
         app = app.layer(axum::middleware::map_response(move |mut r: axum::response::Response| {
@@ -1303,8 +1354,18 @@ pub async fn serve(rpc: Arc<Rpc>, listener: tokio::net::TcpListener, cors: Optio
     Ok(())
 }
 
-async fn ws_upgrade(State(rpc): State<Arc<Rpc>>, ws: axum::extract::ws::WebSocketUpgrade) -> axum::response::Response {
-    ws.on_upgrade(move |socket| ws_session(rpc, socket))
+async fn ws_upgrade(
+    State(rpc): State<Arc<Rpc>>,
+    axum::Extension(policy): axum::Extension<Arc<OriginPolicy>>,
+    headers: axum::http::HeaderMap,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !policy.websocket_allowed(&headers) {
+        return (axum::http::StatusCode::FORBIDDEN, "origin not allowed by --cors").into_response();
+    }
+    let caller = policy.caller(&headers);
+    ws.on_upgrade(move |socket| ws_session(rpc, socket, caller))
 }
 
 /// One WebSocket connection: ordinary JSON-RPC requests (single or batch), plus
@@ -1312,7 +1373,7 @@ async fn ws_upgrade(State(rpc): State<Arc<Rpc>>, ws: axum::extract::ws::WebSocke
 /// - `newHeads`: each block whose state is ready
 /// - `logs` (with a filter): that block's matching logs
 /// - `skim_subscriptions`: readiness and the latest `on_block` results after each block
-async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
+async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket, caller: Caller) {
     use axum::extract::ws::Message;
     use futures::{SinkExt, StreamExt};
     let (mut tx, mut rx) = socket.split();
@@ -1346,7 +1407,10 @@ async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
                             }
                             let sub = match kind {
                                 "newHeads" => Sub::NewHeads { track: crate::ws_feed::HeadTrack::seeded(latest.map(|b| (b.number, b.hash))) },
-                                "skim_subscriptions" => Sub::Skim,
+                                "skim_subscriptions" => match &caller {
+                                    Caller::Page(origin) => return Some(json!({"jsonrpc": "2.0", "id": id, "error": page_refused("skim_subscriptions", &origin)})),
+                                    Caller::Trusted => Sub::Skim,
+                                },
                                 "logs" => match serde_json::from_value::<alloy_rpc_types_eth::Filter>(params.get(1).cloned().unwrap_or(json!({}))) {
                                     // Logs from blocks after the one current now (or replacing it).
                                     Ok(f) => Sub::Logs {
@@ -1378,7 +1442,7 @@ async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
                         // other requests concurrently.
                         let mut out: Vec<Option<Value>> = reqs.iter().map(&mut one).collect();
                         let rest: Vec<&Value> = reqs.iter().zip(&out).filter(|(_, o)| o.is_none()).map(|(r, _)| r).collect();
-                        let mut answered = rpc.batch(rest, &latest, epoch).await.into_iter();
+                        let mut answered = rpc.batch(rest, &latest, epoch, caller.clone()).await.into_iter();
                         for o in out.iter_mut().filter(|o| o.is_none()) {
                             *o = answered.next();
                         }
@@ -1386,7 +1450,7 @@ async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
                     }
                     req => match one(req) {
                         Some(v) => v,
-                        None => rpc.one(req, &latest, epoch).await,
+                        None => rpc.one(req, &latest, epoch, caller.clone()).await,
                     },
                 };
                 if tx.send(Message::Text(reply.to_string().into())).await.is_err() {
@@ -1598,7 +1662,114 @@ mod tests {
         }
     }
 
+    async fn test_rpc() -> Arc<Rpc> {
+        let net = skim_el::ElNet::start_sepolia(0, vec![], true).await.unwrap();
+        let sim = Simulator::new(
+            skim_state::Store::new(256),
+            skim_snap::Scheduler::new(skim_snap::el::ElTransport::new(net), Default::default()),
+            skim_sim::predictor::Predictor {
+                learned: skim_sim::learned::Learned::new(8, 0.5, 256),
+                v3: vec![],
+                base_words: 2,
+                reach: Default::default(),
+            },
+        );
+        Arc::new(Rpc {
+            sim,
+            subs: None,
+            chain: Some(ChainData::offline(2048)),
+            light: None,
+            require_verified: false,
+            events: tokio::sync::broadcast::channel(256).0,
+            call_cache: Default::default(),
+            cache_calls: true,
+            dash: Arc::new(Default::default()),
+            cl_stats: None,
+        })
+    }
+
+    /// A server with `cors`, and a POST helper sending `Origin` when given.
+    async fn origin_server(cors: Option<&str>) -> (std::net::SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        (addr, tokio::spawn(serve(test_rpc().await, listener, cors.map(String::from))))
+    }
+
+    async fn post_from(addr: std::net::SocketAddr, origin: Option<&str>, method: &str) -> Value {
+        let mut req = reqwest::Client::new().post(format!("http://{addr}/")).json(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": []}));
+        if let Some(o) = origin {
+            req = req.header("origin", o);
+        }
+        req.send().await.unwrap().json().await.unwrap()
+    }
+
+    async fn upgrade_from(addr: std::net::SocketAddr, origin: Option<&str>) -> reqwest::StatusCode {
+        let mut req = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+        if let Some(o) = origin {
+            req = req.header("origin", o);
+        }
+        req.send().await.unwrap().status()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn web_pages_get_skim_methods_only_from_an_origin_cors_names() {
+        // Review R6: with the default `--cors *`, any web page the user opened could read
+        // skim_status / skim_dashboard (watched addresses, subscription names, peer ids) from a
+        // local node, over HTTP or a WebSocket (browsers apply no CORS to WebSocket upgrades).
+        let refused = |r: &Value| r["error"]["code"] == -32004 && r["error"]["message"].as_str().is_some_and(|m| m.contains("web pages"));
+        let (addr, server) = origin_server(Some("*")).await;
+        let evil = Some("https://evil.example");
+        assert!(refused(&post_from(addr, evil, "skim_status").await));
+        assert!(refused(&post_from(addr, evil, "skim_dashboard").await));
+        assert_eq!(post_from(addr, evil, "eth_chainId").await["result"], "0xaa36a7", "dapps keep eth_* under --cors *");
+        assert!(!refused(&post_from(addr, None, "skim_status").await), "no Origin: curl, servers, viem in Node");
+        assert_eq!(upgrade_from(addr, evil).await, reqwest::StatusCode::SWITCHING_PROTOCOLS, "--cors * allows the WebSocket");
+        server.abort();
+        // An origin named exactly is trusted with everything; others can't even open a WebSocket.
+        let (addr, server) = origin_server(Some("https://app.example")).await;
+        assert!(!refused(&post_from(addr, Some("https://app.example"), "skim_status").await));
+        assert!(refused(&post_from(addr, evil, "skim_status").await));
+        assert_eq!(upgrade_from(addr, evil).await, reqwest::StatusCode::FORBIDDEN);
+        assert_eq!(upgrade_from(addr, Some("https://app.example")).await, reqwest::StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(upgrade_from(addr, None).await, reqwest::StatusCode::SWITCHING_PROTOCOLS);
+        server.abort();
+        // --cors none: no page at all over WebSocket.
+        let (addr, server) = origin_server(None).await;
+        assert_eq!(upgrade_from(addr, evil).await, reqwest::StatusCode::FORBIDDEN);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_websocket_cannot_subscribe_to_skim_subscriptions() {
+        let (addr, server) = origin_server(Some("*")).await;
+        let mut ws = WsTest::connect(addr, server, test_rpc().await, Some("https://evil.example")).await;
+        ws.send(json!({"jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", "params": ["skim_subscriptions"]})).await;
+        assert_eq!(ws.recv().await["error"]["code"], -32004);
+        ws.send(json!({"jsonrpc": "2.0", "id": 2, "method": "skim_status", "params": []})).await;
+        assert_eq!(ws.recv().await["error"]["code"], -32004);
+    }
+
     impl WsTest {
+        async fn connect(addr: std::net::SocketAddr, server: tokio::task::JoinHandle<anyhow::Result<()>>, rpc: Arc<Rpc>, origin: Option<&str>) -> Self {
+            let mut req = reqwest::Client::new()
+                .get(format!("http://{addr}/"))
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+            if let Some(o) = origin {
+                req = req.header("origin", o);
+            }
+            let response = req.send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::SWITCHING_PROTOCOLS);
+            Self { rpc, socket: response.upgrade().await.unwrap(), server }
+        }
+
         async fn start() -> Self {
             let net = skim_el::ElNet::start_sepolia(0, vec![], true).await.unwrap();
             let sim = Simulator::new(
