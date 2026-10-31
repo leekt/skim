@@ -303,6 +303,39 @@ pub struct Store {
     pub(crate) test_hook: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
+/// The store's write lock, taken by a mutation that may write the archive: the archive's
+/// [`archive::Hold`] first, then the lock (TODO 31, REVIEW C4).
+///
+/// Archive commits made meanwhile are non-durable but immediately visible to every reader, so
+/// memory and archive still change together exactly as before: each mutation's archive writes
+/// and memory changes happen inside one critical section, in the same order as ever. What moves
+/// is only the fsync: fields drop in declaration order, so the lock is released first and the
+/// `Hold` then makes the archive durable with one synced commit, outside the lock. Readers never
+/// wait for it. The next archive writer waits for it (on the `Hold`, before taking the lock).
+///
+/// Lock order is always `Hold` -> store lock, and every path that writes the archive under the
+/// store lock goes through here, so no thread ever waits for the `Hold` while holding the lock.
+/// What a crash can lose: at most the one mutation whose sync was in flight, all of it (redb
+/// reverts to the last durable commit). That is the archive as it was just before that mutation,
+/// a state restart recovery already handles (it is what a crash a moment earlier leaves).
+struct ArchivingLock<'a> {
+    st: parking_lot::RwLockWriteGuard<'a, Inner>,
+    _hold: Option<archive::Hold<'a>>,
+}
+
+impl std::ops::Deref for ArchivingLock<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.st
+    }
+}
+
+impl std::ops::DerefMut for ArchivingLock<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        &mut self.st
+    }
+}
+
 /// Default cap on on-demand keys (each holds a few versions within the window).
 pub const DEFAULT_MAX_ON_DEMAND: usize = 200_000;
 /// Rough bytes per entry of a block's write list (key + value + vector overhead).
@@ -366,6 +399,12 @@ impl Store {
         self.archive.as_ref()
     }
 
+    /// The write lock for a mutation that may write the archive (see [`ArchivingLock`]).
+    fn write_archiving(&self) -> ArchivingLock<'_> {
+        let hold = self.archive.as_ref().map(|a| a.hold());
+        ArchivingLock { st: self.inner.write(), _hold: hold }
+    }
+
     /// Archive coverage of an address's archived keys: (key, first covered block, whether that
     /// start is a write).
     pub fn archive_coverage(&self, a: &Address) -> Vec<(StateKey, u64, bool)> {
@@ -379,7 +418,7 @@ impl Store {
     }
 
     pub fn archive_errors(&self) -> u64 {
-        self.archive_errors.load(std::sync::atomic::Ordering::Relaxed)
+        self.archive_errors.load(std::sync::atomic::Ordering::Relaxed) + self.archive.as_ref().map_or(0, |a| a.sync_errors())
     }
 
     fn archive_try<T>(&self, r: Result<T, archive::ArchiveError>) -> Option<T> {
@@ -441,7 +480,7 @@ impl Store {
         let Some(ar) = &self.archive else {
             return if check { self.watch_key(k) } else { self.watch_key_unchecked(k) };
         };
-        let mut st = self.inner.write();
+        let mut st = self.write_archiving();
         if check && !self.admit(&st, &k) {
             return false;
         }
@@ -564,10 +603,11 @@ impl Store {
 
     /// Stops archiving `keys` and frees their subscribed slots: their archive history stays
     /// readable up to the current head, reads above that are refused, and archiving one again
-    /// later starts its coverage afresh. Returns how many were released.
+    /// later starts a new coverage interval (the earlier one stays readable; the blocks between
+    /// are refused). Returns how many were released.
     pub fn release_archived(&self, keys: &[StateKey]) -> usize {
         // Archive and memory change under one lock, as everywhere else.
-        let mut st = self.inner.write();
+        let mut st = self.write_archiving();
         let head = st.head().map(|h| h.number);
         let mut n = 0;
         for k in keys {
@@ -616,7 +656,7 @@ impl Store {
                 return;
             }
         }
-        let mut st = self.inner.write();
+        let mut st = self.write_archiving();
         let Some(head) = st.head().map(|h| h.number) else { return };
         for k in keys {
             if let Some(e) = st.temp.get_mut(k) {
@@ -692,7 +732,7 @@ impl Store {
             Arc::new(w)
         };
         let ready = {
-            let mut st = self.inner.write();
+            let mut st = self.write_archiving();
             if let Some(h) = st.head() {
                 if block.parent_hash != h.hash || block.number != h.number + 1 {
                     return Err(StateError::NotChild(block.hash, h.hash));
@@ -820,7 +860,7 @@ impl Store {
     fn rollback(&self, number: u64, archive_to: u64) {
         self.note_reorg();
         // Archive and memory roll back under the same lock as every other mutation of either.
-        let mut st = self.inner.write();
+        let mut st = self.write_archiving();
         if let Some(ar) = &self.archive {
             let r = ar.truncate_above(archive_to);
             self.archive_try(r);
@@ -857,7 +897,7 @@ impl Store {
             }
         }
         let Some((last, _)) = blocks.last() else { return Ok(0) };
-        let mut st = self.inner.write();
+        let mut st = self.write_archiving();
         if st.hashes.get(&last.number) != Some(&last.hash) {
             return Err(StateError::Reorged { number: last.number, hash: last.hash });
         }
@@ -904,7 +944,7 @@ impl Store {
     /// write lock: the chain check, the replay of later BAL writes and the archive writes happen
     /// together for all of them, as one step (a rollback can't land in between).
     pub fn insert_bases_with(&self, at: &BlockRef, values: &[(StateKey, U256)], retention: Retention) -> Result<(), StateError> {
-        let mut st = self.inner.write();
+        let mut st = self.write_archiving();
         if st.chain.get(&at.number).map(|b| b.hash) != Some(at.hash) {
             return Err(StateError::Reorged { number: at.number, hash: at.hash });
         }
@@ -1001,7 +1041,7 @@ impl Store {
 
     pub fn insert_code(&self, code: Bytes) -> B256 {
         let h = keccak256(&code);
-        let mut st = self.inner.write();
+        let mut st = self.write_archiving();
         // Archived only if an archived account's code hash is (or was) this code. (Review:
         // every contract any call fetched was archived forever, one commit each.) A code
         // fetched before its account's base is archived when that base is.
