@@ -50,6 +50,11 @@ impl Rejections {
 
 type AccountCell = Arc<OnceCell<Option<AccountState>>>;
 
+/// Account lookups in flight or answered, by (state root, address, peer).
+type AccountCells = HashMap<(B256, Address, PeerId), AccountCell>;
+/// Proven account values by (state root, address), whichever peer proved them.
+type VerifiedAccounts = HashMap<(B256, Address), Option<AccountState>>;
+
 #[derive(Clone)]
 pub struct ElTransport {
     pub net: ElNet,
@@ -58,11 +63,11 @@ pub struct ElTransport {
     pub rejections: Arc<Rejections>,
     /// Verified accounts by (state root, address, peer), shared by concurrent slot lookups to
     /// the same peer. Per peer, so one slow peer never blocks lookups routed to others.
-    accounts: Arc<Mutex<HashMap<(B256, Address, PeerId), AccountCell>>>,
+    accounts: Arc<Mutex<AccountCells>>,
     /// Verified account values by (state root, address), whichever peer proved them: a value
     /// proven against the root is the same for every peer, so a slot request placed on another
     /// peer reuses it instead of fetching (and proving) the account again.
-    verified: Arc<Mutex<HashMap<(B256, Address), Option<AccountState>>>>,
+    verified: Arc<Mutex<VerifiedAccounts>>,
 }
 
 /// A contract's whole storage at a root.

@@ -481,11 +481,10 @@ impl Simulator {
                     return Err(SimError::Invalid { code: -38026, message: format!("simulation gas budget ({} gas over all calls) exhausted", cap.saturating_mul(SIM_GAS_BUDGET_CALLS)) });
                 }
                 tx.gas_limit = tx.gas_limit.min(cap).min(budget);
-                if opts.validation {
-                    if call.auto_nonce {
+                if opts.validation
+                    && call.auto_nonce {
                         tx.nonce = cache.basic(tx.caller).map_err(|e| SimError::Evm(format!("{e:?}")))?.map_or(0, |a| a.nonce);
                     }
-                }
                 // EIP-7708 (Amsterdam): ETH transfers already emit native logs, which is what
                 // traceTransfers asks for; geth's synthetic logs would duplicate them.
                 let synthetic_transfers = opts.trace_transfers && !env::SPEC.is_enabled_in(revm::primitives::hardfork::SpecId::AMSTERDAM);

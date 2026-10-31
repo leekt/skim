@@ -236,13 +236,16 @@ const CATCHUP_PARALLEL: usize = 8;
 
 /// Payload envelopes by slot range from consensus peers: `ClNode` in production, a stand-in in
 /// tests. Returns the peer that was asked (if any) and the raw SSZ envelopes.
+/// A range answer: which peer answered (if any), and the envelopes' SSZ or why there are none.
+pub type EnvelopesAnswer<'a> = futures::future::BoxFuture<'a, (Option<String>, anyhow::Result<Vec<Vec<u8>>>)>;
+
 pub trait EnvelopeSource: Send + Sync {
     fn envelopes_by_range_from(
         &self,
         start_slot: u64,
         count: u64,
         timeout: std::time::Duration,
-    ) -> futures::future::BoxFuture<'_, (Option<String>, anyhow::Result<Vec<Vec<u8>>>)>;
+    ) -> EnvelopesAnswer<'_>;
 }
 
 impl EnvelopeSource for skim_cl::ClNode {
@@ -437,6 +440,31 @@ pub fn verify_and_replay(saved: &Saved, blocks: &[(alloy_consensus::Header, Bloc
     Ok(skim_state::persist::replay(saved, blocks.iter().map(|(_, w)| w)))
 }
 
+/// How long restored values stay cached before a subscription must claim them.
+const RESTORED_TTL_BLOCKS: u64 = 64;
+
+fn install(store: &Arc<Store>, at: &BlockRef, values: &[(skim_bal::StateKey, alloy_primitives::U256)], code: &[(B256, alloy_primitives::Bytes)]) -> anyhow::Result<usize> {
+    for (_, c) in code {
+        store.insert_code(c.clone());
+    }
+    // The restore runs alongside the first subscription passes, which fetch fresh state: a
+    // key already known at `at` came from a verified fetch (or a BAL) and is left alone.
+    let snap = store.snapshot(at)?;
+    let mut n = 0;
+    for (k, v) in values {
+        if matches!(snap.get(k), Ok(skim_state::StateValue::Known(_))) {
+            continue;
+        }
+        // `at` must still be in the window; insert_base replays any later blocks itself.
+        // Provisional: the next subscription pass re-subscribes the keys the current config
+        // still needs, and the rest (keys of removed subscriptions, anything subscribed by an
+        // older version) expire instead of staying subscribed forever.
+        store.insert_base_with(at, *k, *v, Retention::Ttl(RESTORED_TTL_BLOCKS))?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,29 +541,4 @@ mod tests {
         assert_eq!(snap.get(&fetched).unwrap(), skim_state::StateValue::Known(U256::from(20)));
         assert_eq!(snap.get(&slot()).unwrap(), skim_state::StateValue::Known(U256::from(7)));
     }
-}
-
-/// How long restored values stay cached before a subscription must claim them.
-const RESTORED_TTL_BLOCKS: u64 = 64;
-
-fn install(store: &Arc<Store>, at: &BlockRef, values: &[(skim_bal::StateKey, alloy_primitives::U256)], code: &[(B256, alloy_primitives::Bytes)]) -> anyhow::Result<usize> {
-    for (_, c) in code {
-        store.insert_code(c.clone());
-    }
-    // The restore runs alongside the first subscription passes, which fetch fresh state: a
-    // key already known at `at` came from a verified fetch (or a BAL) and is left alone.
-    let snap = store.snapshot(at)?;
-    let mut n = 0;
-    for (k, v) in values {
-        if matches!(snap.get(k), Ok(skim_state::StateValue::Known(_))) {
-            continue;
-        }
-        // `at` must still be in the window; insert_base replays any later blocks itself.
-        // Provisional: the next subscription pass re-subscribes the keys the current config
-        // still needs, and the rest (keys of removed subscriptions, anything subscribed by an
-        // older version) expire instead of staying subscribed forever.
-        store.insert_base_with(at, *k, *v, Retention::Ttl(RESTORED_TTL_BLOCKS))?;
-        n += 1;
-    }
-    Ok(n)
 }

@@ -57,7 +57,7 @@ async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket, caller:
                             let sub = match kind {
                                 "newHeads" => Sub::NewHeads { track: crate::ws_feed::HeadTrack::seeded(latest.map(|b| (b.number, b.hash))) },
                                 "skim_subscriptions" => match &caller {
-                                    Caller::Page(origin) => return Some(json!({"jsonrpc": "2.0", "id": id, "error": page_refused("skim_subscriptions", &origin)})),
+                                    Caller::Page(origin) => return Some(json!({"jsonrpc": "2.0", "id": id, "error": page_refused("skim_subscriptions", origin)})),
                                     Caller::Trusted => Sub::Skim,
                                 },
                                 "logs" => match serde_json::from_value::<alloy_rpc_types_eth::Filter>(params.get(1).cloned().unwrap_or(json!({}))) {

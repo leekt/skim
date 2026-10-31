@@ -71,7 +71,7 @@ impl Mock {
                 if n % fail_every == fail_every / 2 {
                     Err(TransportError::Timeout)
                 } else {
-                    tokio::time::sleep(Duration::from_millis(if n % stall_every == 0 { stall_ms } else { ms })).await;
+                    tokio::time::sleep(Duration::from_millis(if n.is_multiple_of(stall_every) { stall_ms } else { ms })).await;
                     Ok(ok())
                 }
             }
@@ -108,8 +108,8 @@ impl Transport for Mock {
             .map(|c| Bytes::from_static(c))
             .collect();
         let (none, none2): (Vec<Bytes>, Vec<Bytes>) = (Vec::new(), Vec::new());
-        let r = self.serve(peer, move || have, none, none2).await;
-        r
+        
+        self.serve(peer, move || have, none, none2).await
     }
 }
 
@@ -152,7 +152,7 @@ async fn respects_per_peer_inflight_cap() {
     let s = Scheduler::new(m.clone(), Config { per_peer_inflight: 4, adaptive: false, ..cfg() });
     let keys: Vec<_> = (0..64).map(slot).collect();
     assert!(s.fetch(&keys).await.iter().all(|x| x.is_ok()));
-    for (_, (_, max)) in m.inflight.lock().iter() {
+    for (_, max) in m.inflight.lock().values() {
         assert!(*max <= 4, "max in flight {max}");
     }
 }

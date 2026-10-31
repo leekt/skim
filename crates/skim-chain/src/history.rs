@@ -412,6 +412,11 @@ impl HeaderStore {
         let tx = self.db.begin_read()?;
         Ok(tx.open_table(HEADERS)?.len()?)
     }
+
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn is_empty(&self) -> Result<bool, StoreError> {
+        Ok(self.len()? == 0)
+    }
 }
 
 #[cfg(test)]
@@ -451,8 +456,11 @@ mod tests {
         c.iter().map(|(x, h)| (*x, h)).collect()
     }
 
+    /// A store with two forks, and each fork's (hash, header)s.
+    type Forked = (tempfile::TempDir, HeaderStore, Vec<(B256, Header)>, Vec<(B256, Header)>);
+
     /// A98 -> A99 -> A100 on disk; B99 -> B100 -> B101 forked from A98.
-    fn forked() -> (tempfile::TempDir, HeaderStore, Vec<(B256, Header)>, Vec<(B256, Header)>) {
+    fn forked() -> Forked {
         let d = tempfile::tempdir().unwrap();
         let s = HeaderStore::open(d.path().join("h.redb")).unwrap();
         let a = chain(98, 100, 0);

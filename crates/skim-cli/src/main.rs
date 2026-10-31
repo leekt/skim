@@ -110,6 +110,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once at startup; boxing `run`'s args buys nothing
 enum Cmd {
     /// M0 Spike B (Sepolia only): EL peers, eth/71 BALs, snap/2 point lookups, root-servable lag.
     ProbeEl(probe_el::Args),

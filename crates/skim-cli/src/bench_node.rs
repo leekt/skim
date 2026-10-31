@@ -136,8 +136,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 let give_up = Instant::now() + Duration::from_secs(60);
                 while Instant::now() < give_up {
                     let r = rpc(&client, &url, "eth_getBlockByNumber", serde_json::json!([format!("{next:#x}"), false])).await;
-                    if let Ok(v) = r {
-                        if let Some(t) = v["result"]["timestamp"].as_str() {
+                    if let Ok(v) = r
+                        && let Some(t) = v["result"]["timestamp"].as_str() {
                             let bts = u64::from_str_radix(t.trim_start_matches("0x"), 16).unwrap_or(0);
                             let ready = now_ms() - bts as f64 * 1e3;
                             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&out_path) {
@@ -145,7 +145,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                             }
                             return;
                         }
-                    }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             });
@@ -196,7 +195,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         let _ = out.flush();
 
         // Concurrency sweep.
-        if args.throughput_every > 0 && done % args.throughput_every == 0 {
+        if args.throughput_every > 0 && done.is_multiple_of(args.throughput_every) {
             let all = Arc::new(all);
             for (name, url) in &eps {
                 for &conc in &args.sweep_levels {
@@ -216,7 +215,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 }
             }
         }
-        if done % 25 == 0 {
+        if done.is_multiple_of(25) {
             for (name, st) in &stats {
                 tracing::info!(endpoint = %name, done, ok = st.ok, err = st.err, "eth_call {}", st.latency.summary());
             }
@@ -226,13 +225,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // Readiness summary from the side file.
     if let Ok(s) = std::fs::read_to_string(format!("{}.ready", args.out)) {
         for l in s.lines() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
-                if let (Some(n), Some(ms)) = (v["endpoint"].as_str(), v["ready_ms"].as_f64()) {
-                    if let Some(st) = stats.get_mut(n) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(l)
+                && let (Some(n), Some(ms)) = (v["endpoint"].as_str(), v["ready_ms"].as_f64())
+                    && let Some(st) = stats.get_mut(n) {
                         st.readiness.push_ms(ms);
                     }
-                }
-            }
         }
     }
     let summary: HashMap<_, _> = stats

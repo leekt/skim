@@ -953,7 +953,9 @@ async fn heal_gap(store: &Store, net: &ElNet, from: u64, to: u64) -> anyhow::Res
         anyhow::bail!("no EL peers yet");
     }
     // Collect (header, writes, code) for the whole gap, verified, before touching the archive.
-    let mut collected: Vec<(alloy_consensus::Header, Vec<(skim_bal::StateKey, alloy_primitives::U256)>, Vec<u8>)> = Vec::new();
+    // (header, the archived keys' writes, the header's RLP) per block.
+    type Collected = Vec<(alloy_consensus::Header, Vec<(skim_bal::StateKey, alloy_primitives::U256)>, Vec<u8>)>;
+    let mut collected: Collected = Vec::new();
     let mut next = from;
     'outer: while next <= to {
         let count = (to - next + 1).min(64);
@@ -1065,7 +1067,9 @@ async fn backfill_archive(store: &Store, net: &ElNet, from: u64) -> anyhow::Resu
     };
     let peers: Vec<_> = net.peers().into_iter().filter(|(_, p)| p.eth_version >= 71).map(|(id, _)| id).collect();
     anyhow::ensure!(!peers.is_empty(), "no EL peers yet");
-    let mut collected: Vec<(u64, alloy_primitives::B256, Vec<u8>, Vec<(skim_bal::StateKey, alloy_primitives::U256)>, alloy_primitives::B256)> = Vec::new();
+    // (number, hash, header RLP, the scoped keys' writes, parent hash) per block.
+    type Collected = Vec<(u64, alloy_primitives::B256, Vec<u8>, Vec<(skim_bal::StateKey, alloy_primitives::U256)>, alloy_primitives::B256)>;
+    let mut collected: Collected = Vec::new();
     let mut next = from;
     'outer: while next <= scan_end {
         let count = (scan_end - next + 1).min(32);

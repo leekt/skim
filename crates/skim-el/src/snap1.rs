@@ -62,11 +62,14 @@ struct Command {
 }
 
 /// Live snap/1 sessions, keyed by peer.
+/// Live snap/1 sessions: per peer, the session id and its command channel.
+type Registry = HashMap<PeerId, (u64, mpsc::UnboundedSender<Command>)>;
+
 #[derive(Default, Clone)]
 pub(crate) struct Snap1Peers {
     /// Peer -> (session id, command channel). The session id keeps a closing old session from
     /// unregistering a newer one for the same peer.
-    inner: Arc<Mutex<HashMap<PeerId, (u64, mpsc::UnboundedSender<Command>)>>>,
+    inner: Arc<Mutex<Registry>>,
     next_id: Arc<AtomicU64>,
 }
 

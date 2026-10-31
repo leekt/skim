@@ -320,11 +320,10 @@ async fn resolve_round(
                     code: None,
                     ..Default::default()
                 });
-                if let Some(i) = &info {
-                    if i.code_hash != KECCAK_EMPTY && !st.code.contains_key(&i.code_hash) {
+                if let Some(i) = &info
+                    && i.code_hash != KECCAK_EMPTY && !st.code.contains_key(&i.code_hash) {
                         chained.push(Key::Code(i.code_hash));
                     }
-                }
                 st.accounts.insert(*address, info);
             }
             (Key::Storage { address, slot, .. }, Value::Storage(v)) => {
@@ -486,13 +485,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         let hash = h.hash_slow();
         let snap_peers = net.peers().iter().filter(|(_, p)| p.snap2 || p.snap1).count();
         tracing::info!(iteration = it, number = h.number, snap_peers, "measuring");
-        if args.drop_top_after == Some(it) {
-            if let Some((top, ps)) = sched.peer_stats().into_iter().max_by_key(|(_, p)| p.ok) {
+        if args.drop_top_after == Some(it)
+            && let Some((top, ps)) = sched.peer_stats().into_iter().max_by_key(|(_, p)| p.ok) {
                 sched.transport().exclude(top);
                 tracing::warn!(peer = %top, served = ps.ok, ewma_ms = ps.ewma_ms, "EXPERIMENT: excluded the top-serving peer");
                 dropped = Some(format!("{top}"));
             }
-        }
         let window = if dropped.is_some() { "after" } else { "before" };
         log(serde_json::json!({"ev": "peers", "it": it, "window": window, "peers": sched.peer_stats().into_iter()
             .map(|(id, p)| serde_json::json!({"peer": format!("{id:.10}"), "ok": p.ok, "ewma_ms": p.ewma_ms, "limit": p.limit}))

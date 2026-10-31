@@ -454,11 +454,10 @@ impl Rpc {
         if let Some(al) = req.access_list {
             b = b.access_list(al);
         }
-        if let Some(auth) = req.authorization_list {
-            if !auth.is_empty() {
+        if let Some(auth) = req.authorization_list
+            && !auth.is_empty() {
                 b = b.authorization_list_signed(auth);
             }
-        }
         b.build().map_err(|e| RpcError::params(format!("invalid call: {e:?}")))
     }
 
@@ -911,7 +910,7 @@ impl Rpc {
         if let Caller::Page(origin) = &caller
             && method.starts_with("skim_")
         {
-            return json!({"jsonrpc": "2.0", "id": id, "error": page_refused(method, &origin)});
+            return json!({"jsonrpc": "2.0", "id": id, "error": page_refused(method, origin)});
         }
         let params = req.get("params").cloned().unwrap_or(json!([]));
         let t = std::time::Instant::now();

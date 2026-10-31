@@ -77,19 +77,19 @@ impl BlockWrites {
         for acc in bal {
             let a = acc.address;
             out.touched.push(a);
-            if let Some(c) = acc.balance_changes().iter().filter(|c| take(c.block_access_index.0 as u64)).max_by_key(|c| c.block_access_index.0) {
+            if let Some(c) = acc.balance_changes().iter().filter(|c| take(c.block_access_index.0)).max_by_key(|c| c.block_access_index.0) {
                 out.writes.push((StateKey::Balance(a), c.post_balance));
             }
-            if let Some(c) = acc.nonce_changes().iter().filter(|c| take(c.block_access_index.0 as u64)).max_by_key(|c| c.block_access_index.0) {
+            if let Some(c) = acc.nonce_changes().iter().filter(|c| take(c.block_access_index.0)).max_by_key(|c| c.block_access_index.0) {
                 out.writes.push((StateKey::Nonce(a), U256::from(c.new_nonce)));
             }
-            if let Some(c) = acc.code_changes().iter().filter(|c| take(c.block_access_index.0 as u64)).max_by_key(|c| c.block_access_index.0) {
+            if let Some(c) = acc.code_changes().iter().filter(|c| take(c.block_access_index.0)).max_by_key(|c| c.block_access_index.0) {
                 let hash = alloy_primitives::keccak256(&c.new_code);
                 out.writes.push((StateKey::CodeHash(a), hash.into()));
                 out.code.push((hash, c.new_code.clone()));
             }
             for sc in acc.storage_changes() {
-                if let Some(c) = sc.changes.iter().filter(|c| take(c.block_access_index.0 as u64)).max_by_key(|c| c.block_access_index.0) {
+                if let Some(c) = sc.changes.iter().filter(|c| take(c.block_access_index.0)).max_by_key(|c| c.block_access_index.0) {
                     out.writes.push((StateKey::Storage(a, sc.slot), c.new_value));
                 }
             }

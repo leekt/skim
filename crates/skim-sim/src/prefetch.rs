@@ -55,6 +55,7 @@ pub async fn resolve(
 }
 
 /// [`resolve_with`] that commits values with an explicit retention (on-demand TTL vs subscribed).
+#[allow(clippy::too_many_arguments)] // each is a distinct input of one fetch wave; a struct would only rename them
 pub async fn resolve_retained(
     store: &Store,
     sched: &Scheduler<ElTransport>,

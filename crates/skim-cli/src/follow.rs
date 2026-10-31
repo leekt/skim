@@ -490,10 +490,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             _ => {}
         }
         followed += 1;
-        if followed % 10 == 0 {
+        if followed.is_multiple_of(10) {
             write_health(&ctx, &b);
         }
-        if (b.number + 1) % ctx.infura_every == 0 {
+        if (b.number + 1).is_multiple_of(ctx.infura_every) {
             spawn_poller(&ctx, b.number + 1, b.timestamp + 12);
         }
         spawn_prefetch(&ctx, b);
@@ -849,7 +849,7 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
         }
     };
     let (mut warm_ms, mut matches, mut mismatches) = (None, 0, 0);
-    if let (Some((client, url)), true) = (&ctx.infura, b.number % ctx.infura_every == 0) {
+    if let (Some((client, url)), true) = (&ctx.infura, b.number.is_multiple_of(ctx.infura_every)) {
         for (call, ours) in calls.iter().zip(&outputs) {
             let t = Instant::now();
             match infura_call(client, url, b.hash, call).await {
@@ -873,7 +873,7 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
         s.misses_resolved += resolved;
         s.match_ok += matches;
         s.match_fail += mismatches;
-        s.oracle_checked += (matches + mismatches) as u64;
+        s.oracle_checked += matches + mismatches;
         if let Some(p) = poll {
             s.infura_polled += 1;
             s.infura_ready.push_ms(p.first_ok_sent_ms - slot0);

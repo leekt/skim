@@ -151,12 +151,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                         let lag = recv_ms - slot_start_ms(b.slot);
                         stats.block_lag.push_ms(lag);
                         blocks.insert(b.slot, (recv_ms, b.bid.clone()));
-                        if let Some(dir) = &args.capture_dir {
-                            if captured.1 < args.capture_n {
+                        if let Some(dir) = &args.capture_dir
+                            && captured.1 < args.capture_n {
                                 captured.1 += 1;
                                 std::fs::write(dir.join(format!("{}.block.ssz", b.slot)), &*data)?;
                             }
-                        }
                         tracing::info!(slot = b.slot, lag_ms = lag as i64, "beacon block");
                         log(serde_json::json!({
                             "ev": "block", "slot": b.slot, "lag_ms": lag, "recv_unix_ms": recv_ms,
@@ -218,12 +217,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 if let Some(d) = block_to_env {
                     stats.block_to_envelope.push_ms(d);
                 }
-                if let Some(dir) = &args.capture_dir {
-                    if captured.0 < args.capture_n {
+                if let Some(dir) = &args.capture_dir
+                    && captured.0 < args.capture_n {
                         captured.0 += 1;
                         std::fs::write(dir.join(format!("{slot}.envelope.ssz")), &*data)?;
                     }
-                }
                 if !v.ok {
                     tracing::warn!(slot, computed = %v.computed_hash, expected = %p.block_hash, "EL header rebuild mismatch");
                 }

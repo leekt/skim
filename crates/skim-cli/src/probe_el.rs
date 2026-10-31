@@ -102,12 +102,11 @@ impl Ctx {
     fn card<R>(&self, peer: Peer, f: impl FnOnce(&mut PeerCard) -> R) -> R {
         let mut cards = self.cards.lock();
         let c = cards.entry(peer).or_default();
-        if c.client.is_empty() {
-            if let Some((_, p)) = self.net.peers().into_iter().find(|(id, _)| *id == peer) {
+        if c.client.is_empty()
+            && let Some((_, p)) = self.net.peers().into_iter().find(|(id, _)| *id == peer) {
                 c.client = p.client;
                 c.enode = format!("enode://{}@{}", hex(peer.as_slice()), p.remote_addr);
             }
-        }
         f(c)
     }
 
@@ -201,15 +200,14 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         ctx.stats.lock().header_req.push(took);
 
         for h in headers {
-            if let Some(prev) = &head {
-                if h.parent_hash != prev.hash_slow() {
+            if let Some(prev) = &head
+                && h.parent_hash != prev.hash_slow() {
                     // Probe-level handling only: the real chain tracker keeps a DAG (§4).
                     ctx.stats.lock().reorgs_or_gaps += 1;
                     tracing::warn!(number = h.number, "parent mismatch; re-anchoring head");
                     head = None;
                     break;
                 }
-            }
             let lag = now_ms() - (h.timestamp as f64) * 1e3;
             {
                 let mut s = ctx.stats.lock();

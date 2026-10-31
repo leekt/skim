@@ -20,6 +20,7 @@
 //!   with its `block_access_index` (blocks with neither are skipped; `cursor` says how far the
 //!   scan went). Logs and state changes are separate channels: a block in a logs gap still gets
 //!   its state changes, marked `logsAvailable: false`.
+//!
 //! Everything in a response (logs, state changes, the cursor) comes from one hash-linked range
 //! of headers that continues the module's cursor.
 //! Each response also reports `finalized` (verified by the light client), so a module can hold

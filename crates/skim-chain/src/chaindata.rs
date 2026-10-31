@@ -288,8 +288,12 @@ pub struct ChainData {
     /// Tests: run once by a block stream at a named point (`before_capture`, `after_capture` of
     /// its header range, `after_scan` of its logs), e.g. to reorganize the chain mid-request.
     #[cfg(any(test, feature = "testkit"))]
-    pub test_hooks: Mutex<HashMap<&'static str, Box<dyn Fn() + Send>>>,
+    pub test_hooks: Mutex<TestHooks>,
 }
+
+/// Code tests run at named points of a scan (see [`ChainData::run_test_hook`]).
+#[cfg(any(test, feature = "testkit"))]
+pub type TestHooks = HashMap<&'static str, Box<dyn Fn() + Send>>;
 
 fn topics_def(f: &Filter) -> String {
     f.topics
@@ -2175,7 +2179,7 @@ mod tests {
         cd.rollback_to(19);
         assert!(cd.inner.read().sent.contains_key(&t), "pending again");
         assert_eq!(found(&cd, &h20[1]), None, "block 20's index is gone");
-        assert!(cd.inner.read().headers.get(&20).is_none());
-        assert!(cd.inner.read().headers.get(&19).is_some(), "the common ancestor stays");
+        assert!(!cd.inner.read().headers.contains_key(&20));
+        assert!(cd.inner.read().headers.contains_key(&19), "the common ancestor stays");
     }
 }

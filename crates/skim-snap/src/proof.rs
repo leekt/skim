@@ -42,10 +42,10 @@ pub fn lookup_path(root: B256, key: B256, proof: &[Bytes]) -> Result<(Option<Vec
 /// a small storage trie a peer returned whole. Callers check the root first ([`root_of`]).
 pub fn proof_from_leaves(mut leaves: Vec<(B256, Bytes)>, key: B256) -> Vec<Bytes> {
     use alloy_trie::proof::ProofRetainer;
-    leaves.sort_by(|a, b| a.0.cmp(&b.0));
+    leaves.sort_by_key(|a| a.0);
     leaves.dedup_by(|a, b| a.0 == b.0);
     let target = Nibbles::unpack(key);
-    let mut hb = HashBuilder::default().with_proof_retainer(ProofRetainer::new(vec![target.clone()]));
+    let mut hb = HashBuilder::default().with_proof_retainer(ProofRetainer::new(vec![target]));
     for (k, v) in &leaves {
         hb.add_leaf(Nibbles::unpack(k), v);
     }
@@ -114,7 +114,7 @@ fn lookup_inner(root: B256, key: B256, proof: &[Bytes], walked: &mut Vec<Bytes>)
 /// `None` if a key repeats: peers control these keys, and a repeated key is never a valid trie
 /// (the hash builder would panic on it).
 pub fn root_of(mut leaves: Vec<(B256, Bytes)>) -> Option<B256> {
-    leaves.sort_by(|a, b| a.0.cmp(&b.0));
+    leaves.sort_by_key(|a| a.0);
     if leaves.windows(2).any(|w| w[0].0 == w[1].0) {
         return None;
     }
@@ -136,7 +136,7 @@ mod tests {
         let mut leaves: Vec<(B256, Bytes)> = (1..=n)
             .map(|i| (keccak256(U256::from(i).to_be_bytes::<32>()), alloy_rlp::encode(U256::from(i * 7)).into()))
             .collect();
-        leaves.sort_by(|a, b| a.0.cmp(&b.0));
+        leaves.sort_by_key(|a| a.0);
         let retainer = ProofRetainer::new(targets.iter().map(|t| Nibbles::unpack(t)).collect());
         let mut hb = HashBuilder::default().with_proof_retainer(retainer);
         for (k, v) in &leaves {

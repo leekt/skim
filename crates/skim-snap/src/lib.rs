@@ -485,13 +485,12 @@ impl<T: Transport> Inner<T> {
     }
 
     fn requeue(st: &mut State, key: Key) {
-        if let Some(job) = st.jobs.get_mut(&key) {
-            if !job.queued && job.inflight == 0 {
+        if let Some(job) = st.jobs.get_mut(&key)
+            && !job.queued && job.inflight == 0 {
                 job.queued = true;
                 if job.low { st.queue_lo.push_back(key) } else { st.queue.push_front(key) }
                 st.stats.requeued += 1;
             }
-        }
     }
 
     fn pick_peer(&self, st: &State, key: &Key, job: &Job) -> Option<PeerId> {
