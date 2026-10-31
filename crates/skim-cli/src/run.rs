@@ -378,9 +378,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     if let Some(s) = &saved {
         tracing::info!(block = s.number, keys = s.values.len(), "restart snapshot found; will verify and replay it to the head");
     }
-    let mut saved = saved;
-    // The recent-BAL index before the first applied block is filled once, after it applies.
-    let mut bals_seeded = false;
     let transport = ElTransport::new(net.clone());
     for p in &args.exclude_snap_peer {
         transport.exclude(*p);
@@ -579,9 +576,31 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     tracing::info!(network = %cl_net.name, "following the chain from CL gossip; RPC answers once the first block is applied");
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut stop_logged = false;
-    let mut deferred_in_a_row = 0u64;
-    let lc_slots = Arc::new(tokio::sync::Semaphore::new(4));
+    let mut follower = Follower {
+        chain,
+        store,
+        sim,
+        chaindata,
+        net,
+        cl,
+        light,
+        ws_events,
+        dash,
+        maint_tx,
+        persist,
+        saved,
+        v3,
+        v3_state,
+        mempool_probe,
+        forks,
+        serve_envelopes: !args.no_serve,
+        window: args.window,
+        lc_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+        deferred_in_a_row: 0,
+        stop_logged: false,
+        // The recent-BAL index before the first applied block is filled once, after it applies.
+        bals_seeded: false,
+    };
     loop {
         let ev = tokio::select! {
             ev = rx.recv() => match ev { Some(ev) => ev, None => break },
@@ -590,38 +609,88 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         };
         let ClEvent::Gossip { topic, data, received, .. } = ev else { continue };
         if topic.starts_with("light_client_") {
-            // Each costs a BLS check under the committee lock. Honest peers send about two per
-            // slot; with every slot busy, the rest are dropped rather than queued, so a flood
-            // of well-sized junk can't build a backlog that delays the real updates. (Review:
-            // a task per message, without bound.)
-            let Ok(permit) = lc_slots.clone().try_acquire_owned() else {
-                metrics::counter!("skim_light_client_gossip_dropped_total").increment(1);
-                continue;
-            };
-            let (light, store) = (light.clone(), store.clone());
-            tokio::spawn(async move {
-                light.on_gossip(&topic, &data, &store).await;
-                drop(permit);
-            });
-            continue;
+            follower.on_light_client_gossip(topic, data);
+        } else if topic == "execution_payload" {
+            follower.on_payload(&data, received).await;
         }
-        if topic != "execution_payload" {
-            continue;
-        }
-        let Ok(env) = Envelope::parse(&data) else { continue };
+    }
+    follower.shutdown();
+    Ok(())
+}
+
+/// The follower's event loop state: what each gossip message and each new head acts on. Every
+/// per-block side effect lives in [`Follower::on_head`], the one place an applied block and a
+/// re-anchor both go through. (Review: these ran inline in `run`, and the first block of a run,
+/// a re-anchor, skipped them.)
+struct Follower {
+    chain: Chain,
+    store: Arc<Store>,
+    sim: Arc<Simulator>,
+    chaindata: Arc<crate::chaindata::ChainData>,
+    net: ElNet,
+    cl: ClNode,
+    light: Arc<crate::light::Light>,
+    ws_events: tokio::sync::broadcast::Sender<crate::rpc::WsEvent>,
+    dash: Arc<crate::dashboard::Dashboard>,
+    maint_tx: tokio::sync::watch::Sender<Option<skim_state::BlockRef>>,
+    persist: Option<Arc<skim_state::persist::Persist>>,
+    /// The restart snapshot, restored once the first block is applied.
+    saved: Option<skim_state::persist::Saved>,
+    v3: Option<Arc<V3Config>>,
+    v3_state: Arc<V3State>,
+    mempool_probe: Option<Arc<crate::mempool_probe::MempoolProbe>>,
+    forks: crate::forks::ForkPlan,
+    serve_envelopes: bool,
+    window: u64,
+    /// Light-client checks in flight (see [`Self::on_light_client_gossip`]).
+    lc_slots: Arc<tokio::sync::Semaphore>,
+    deferred_in_a_row: u64,
+    stop_logged: bool,
+    bals_seeded: bool,
+}
+
+/// What [`Follower::on_head`] needs from the payload that made the head.
+struct Arrival {
+    number: u64,
+    arrival_ms: f64,
+    writes: Arc<BlockWrites>,
+    probe_hashes: Vec<alloy_primitives::B256>,
+    served: Option<(u64, skim_cl::serve::Served)>,
+}
+
+impl Follower {
+    /// Each costs a BLS check under the committee lock. Honest peers send about two per slot;
+    /// with every slot busy, the rest are dropped rather than queued, so a flood of well-sized
+    /// junk can't build a backlog that delays the real updates. (Review: a task per message,
+    /// without bound.)
+    fn on_light_client_gossip(&self, topic: String, data: Arc<Vec<u8>>) {
+        let Ok(permit) = self.lc_slots.clone().try_acquire_owned() else {
+            metrics::counter!("skim_light_client_gossip_dropped_total").increment(1);
+            return;
+        };
+        let (light, store) = (self.light.clone(), self.store.clone());
+        tokio::spawn(async move {
+            light.on_gossip(&topic, &data, &store).await;
+            drop(permit);
+        });
+    }
+
+    /// A gossiped execution payload: verified, recorded, and placed on the chain.
+    async fn on_payload(&mut self, data: &Arc<Vec<u8>>, received: std::time::SystemTime) {
+        let Ok(env) = Envelope::parse(data) else { return };
         let v = verify::verify_payload(&env);
         if !v.ok {
             tracing::warn!(number = env.payload.block_number, "payload hash mismatch; ignored");
-            continue;
+            return;
         }
-        if let Some(fork) = forks.stops(v.header.timestamp) {
-            if !stop_logged {
-                stop_logged = true;
+        if let Some(fork) = self.forks.stops(v.header.timestamp) {
+            if !self.stop_logged {
+                self.stop_logged = true;
                 tracing::error!(number = v.header.number, fork, "reached a fork skim doesn't implement: no block from here on is applied; state answers stay at the last block before it");
             }
-            continue;
+            return;
         }
-        let Ok(bal) = skim_bal::decode(env.payload.block_access_list) else { continue };
+        let Ok(bal) = skim_bal::decode(env.payload.block_access_list) else { return };
         let number = v.header.number;
         // Payload arrival relative to the start of its slot (the block timestamp).
         let arrival_ms = received
@@ -630,8 +699,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             .unwrap_or(f64::NAN);
         let writes = Arc::new(BlockWrites::from_bal(&bal));
         let probe_hashes: Vec<alloy_primitives::B256> =
-            if mempool_probe.is_some() { env.payload.transactions.iter().map(alloy_primitives::keccak256).collect() } else { Vec::new() };
-        let served = (!args.no_serve).then(|| {
+            if self.mempool_probe.is_some() { env.payload.transactions.iter().map(alloy_primitives::keccak256).collect() } else { Vec::new() };
+        let served = self.serve_envelopes.then(|| {
             (env.payload.slot_number, skim_cl::serve::Served {
                 root: env.beacon_block_root,
                 block_hash: v.computed_hash,
@@ -639,7 +708,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 ssz: data.clone(),
             })
         });
-        chaindata.note_payload(
+        self.chaindata.note_payload(
             Arc::new(v.header.clone()),
             v.computed_hash,
             env.payload.transactions.iter().map(|t| alloy_primitives::Bytes::copy_from_slice(t)).collect(),
@@ -657,12 +726,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             Arc::new(bal),
             alloy_primitives::Bytes::copy_from_slice(env.payload.block_access_list),
         );
-        let had_head = store.head().is_some();
+        let had_head = self.store.head().is_some();
         // A re-anchor (and the very first block, which anchors the empty store) is a new head
         // like any applied block. (Review: it only logged a warning, so the first block of every
         // run had no `NewHead`, no maintenance pass, no `light.on_block`, and restore and BAL
         // seeding waited for the second block.)
-        let placed = match chain.place(v.header, writes.clone()).await {
+        let placed = match self.chain.place(v.header, writes.clone()).await {
             Placed::Reanchored(ready) => {
                 if had_head {
                     tracing::warn!(number, "re-anchored: no common ancestor with the chain in the window; in-memory state starts afresh");
@@ -672,64 +741,75 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             p => p,
         };
         if matches!(placed, Placed::Deferred(_)) {
-            deferred_in_a_row += 1;
+            self.deferred_in_a_row += 1;
         } else {
-            deferred_in_a_row = 0;
+            self.deferred_in_a_row = 0;
         }
         match placed {
             Placed::Applied { ready, reorged_to, filled } => {
-                if let Some(p) = &mempool_probe {
-                    p.on_block(&probe_hashes, &writes.writes);
-                }
-                if let Some((slot, e)) = served {
-                    cl.serve_envelope(slot, e);
-                }
-                if let Some(h) = chaindata.cached_header(ready.block.number.into()) {
-                    net.set_head(&h);
-                }
-                tracing::info!(number, arrival_ms = arrival_ms as i64, changed = ready.changed_keys.len(), ?reorged_to, filled, "state ready");
-                dash.record_block(crate::dashboard::BlockStat { number, arrival_ms, changed: ready.changed_keys.len() });
-                if arrival_ms.is_finite() {
-                    metrics::histogram!("skim_block_arrival_seconds").record(arrival_ms / 1e3);
-                }
-                metrics::gauge!("skim_block_changed_keys").set(ready.changed_keys.len() as f64);
-                light.on_block(&store);
-                let _ = ws_events.send(crate::rpc::WsEvent::NewHead(ready.block));
-                if !bals_seeded {
-                    bals_seeded = true;
-                    let (store, cl, b, w) = (store.clone(), cl.clone(), ready.block, args.window);
-                    tokio::spawn(async move { crate::persist::seed_recent_bals(store, &cl, b, w).await });
-                }
-                if let Some(s) = saved.take() {
-                    // Runs alongside subscription maintenance (see the maintenance task).
-                    let (store, net, cl, b) = (store.clone(), net.clone(), cl.clone(), ready.block);
-                    tokio::spawn(crate::persist::restore(store, net, cl, s, b));
-                }
-                if let Some(p) = &persist
-                    && number % 4 == 0
-                {
-                    crate::persist::save_now(p, &store, &ready.block);
-                }
-                if let Some(v) = &v3 {
-                    tokio::spawn(v3_tick(sim.clone(), v.clone(), v3_state.clone(), ready.block));
-                }
-                // Keep subscriptions current and their readiness fresh (one pass at a time).
-                let _ = maint_tx.send(Some(ready.block));
+                self.on_head(ready, reorged_to, filled, Arrival { number, arrival_ms, writes, probe_hashes, served });
             }
             Placed::Reanchored(_) | Placed::Duplicate => {}
             // One deferral is routine (a late sibling, peers a moment behind); a run of them means
             // `latest` has stopped moving, which an operator must see. (Review: always debug.)
-            Placed::Deferred(why) if deferred_in_a_row % 8 == 3 => {
-                tracing::warn!(number, in_a_row = deferred_in_a_row, "blocks can't be placed on the chain; `latest` is not advancing: {why}")
+            Placed::Deferred(why) if self.deferred_in_a_row % 8 == 3 => {
+                tracing::warn!(number, in_a_row = self.deferred_in_a_row, "blocks can't be placed on the chain; `latest` is not advancing: {why}")
             }
             Placed::Deferred(why) => tracing::debug!(number, "deferred: {why}"),
         }
     }
-    if let (Some(p), Some(head)) = (&persist, store.head()) {
-        crate::persist::save_now(p, &store, &head);
-        tracing::info!(block = head.number, "shutting down; restart snapshot saved");
+
+    /// Everything a new head sets off: serving, peers' view of our head, metrics, the light
+    /// client, WebSocket pushes, one-time seeding and restore, the restart snapshot, prefetch
+    /// and subscription maintenance.
+    fn on_head(&mut self, ready: skim_state::StateReady, reorged_to: Option<u64>, filled: u64, a: Arrival) {
+        let Arrival { number, arrival_ms, writes, probe_hashes, served } = a;
+        if let Some(p) = &self.mempool_probe {
+            p.on_block(&probe_hashes, &writes.writes);
+        }
+        if let Some((slot, e)) = served {
+            self.cl.serve_envelope(slot, e);
+        }
+        if let Some(h) = self.chaindata.cached_header(ready.block.number.into()) {
+            self.net.set_head(&h);
+        }
+        tracing::info!(number, arrival_ms = arrival_ms as i64, changed = ready.changed_keys.len(), ?reorged_to, filled, "state ready");
+        self.dash.record_block(crate::dashboard::BlockStat { number, arrival_ms, changed: ready.changed_keys.len() });
+        if arrival_ms.is_finite() {
+            metrics::histogram!("skim_block_arrival_seconds").record(arrival_ms / 1e3);
+        }
+        metrics::gauge!("skim_block_changed_keys").set(ready.changed_keys.len() as f64);
+        self.light.on_block(&self.store);
+        let _ = self.ws_events.send(crate::rpc::WsEvent::NewHead(ready.block));
+        if !self.bals_seeded {
+            self.bals_seeded = true;
+            let (store, cl, b, w) = (self.store.clone(), self.cl.clone(), ready.block, self.window);
+            tokio::spawn(async move { crate::persist::seed_recent_bals(store, &cl, b, w).await });
+        }
+        if let Some(s) = self.saved.take() {
+            // Runs alongside subscription maintenance (see the maintenance task).
+            let (store, net, cl, b) = (self.store.clone(), self.net.clone(), self.cl.clone(), ready.block);
+            tokio::spawn(crate::persist::restore(store, net, cl, s, b));
+        }
+        if let Some(p) = &self.persist
+            && number % 4 == 0
+        {
+            crate::persist::save_now(p, &self.store, &ready.block);
+        }
+        if let Some(v) = &self.v3 {
+            tokio::spawn(v3_tick(self.sim.clone(), v.clone(), self.v3_state.clone(), ready.block));
+        }
+        // Keep subscriptions current and their readiness fresh (one pass at a time).
+        let _ = self.maint_tx.send(Some(ready.block));
     }
-    Ok(())
+
+    /// The restart snapshot at the head, on the way out.
+    fn shutdown(&self) {
+        if let (Some(p), Some(head)) = (&self.persist, self.store.head()) {
+            crate::persist::save_now(p, &self.store, &head);
+            tracing::info!(block = head.number, "shutting down; restart snapshot saved");
+        }
+    }
 }
 
 #[derive(Default)]
